@@ -1,0 +1,11 @@
+node_modules/
+target/
+out/
+cache/
+packages/contracts/lib/
+next-env.d.ts
+*.log
+.omo/evidence/
+.omo/
+lcov.info
+.DS_Store
