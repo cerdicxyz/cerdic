@@ -1,0 +1,17 @@
+{
+  "lib/chainlink": {
+    "rev": "19bc7447bbe1d7d686d37d532927c458adb8ca2f"
+  },
+  "lib/chainlink-evm": {
+    "rev": "d3fb34ccc58bb81436e1812952030165293f50e0"
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+    }
+  },
+  "lib/pyth-sdk-solidity": {
+    "rev": "d7dd6e149936552198c12fac1273997cefc03ceb"
+  }
+}
