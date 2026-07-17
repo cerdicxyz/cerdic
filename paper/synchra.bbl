@@ -1,0 +1,51 @@
+\begin{thebibliography}{1}
+
+\bibitem{cctp}
+{Circle Internet Financial}.
+\newblock Cross-chain transfer protocol (cctp).
+\newblock \url{https://circle.com/cctp}, 2024.
+
+\bibitem{arc_technical}
+{Circle Internet Financial}.
+\newblock Arc technical architecture: Malachite consensus and reth execution.
+\newblock \url{https://circle.com/arc/technical}, 2025.
+
+\bibitem{circlearc}
+{Circle Internet Financial}.
+\newblock Circle arc: Programmable settlement for financial applications.
+\newblock \url{https://circle.com/arc}, 2025.
+
+\bibitem{circle_agent_stack}
+{Circle Internet Financial}.
+\newblock Agent stack: Building autonomous agents on arc.
+\newblock \url{https://circle.com/agent-stack}, 2026.
+
+\bibitem{circle_nanopayments}
+{Circle Internet Financial}.
+\newblock Nanopayments: Gas-free sub-cent usdc transfers powered by circle
+  gateway.
+\newblock \url{https://circle.com/nanopayments}, 2026.
+
+\bibitem{usyc}
+{Circle Internet Financial}.
+\newblock Usyc: Tokenized money market fund.
+\newblock \url{https://circle.com/usyc}, 2026.
+
+\bibitem{circle_usyc}
+{Circle Internet Financial}.
+\newblock Usyc: Tokenized money market fund.
+\newblock \url{https://circle.com/usyc}, 2026.
+
+\bibitem{mev}
+Philip Daian, Steven Goldfeder, Tyler Kell, Yunqi Li, Xueyuan Zhao, Iddo
+  Bentov, Lorenz Breidenbach, and Ari Juels.
+\newblock Flash boys 2.0: Frontrunning, transaction reordering, and consensus
+  instability in decentralized exchanges.
+\newblock {\em arXiv preprint arXiv:1904.05234}, 2019.
+
+\bibitem{marlin_kalypso}
+{Marlin Protocol}.
+\newblock Kalypso: Tee attestation verification via zk proofs on symbiotic.
+\newblock \url{https://marlin.org/kalypso}, 2026.
+
+\end{thebibliography}

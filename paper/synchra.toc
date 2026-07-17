@@ -1,0 +1,98 @@
+\contentsline {section}{\numberline {1}Introduction}{5}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Thesis}{6}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Paper organization}{6}{subsection.1.2}%
+\contentsline {section}{\numberline {2}Background and Motivation}{7}{section.2}%
+\contentsline {subsection}{\numberline {2.1}The Arc ecosystem gap}{7}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Evolution of decentralized markets}{7}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Lessons from clearing-focused architectures}{7}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Architectural principles}{8}{subsection.2.4}%
+\contentsline {subsection}{\numberline {2.5}Limitations of current architectures}{9}{subsection.2.5}%
+\contentsline {subsection}{\numberline {2.6}Research contribution}{9}{subsection.2.6}%
+\contentsline {section}{\numberline {3}System Model}{10}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Actors}{10}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Threat model}{10}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Design goals}{10}{subsection.3.3}%
+\contentsline {section}{\numberline {4}Synchra Architecture}{11}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Architectural philosophy}{11}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Layer responsibilities}{12}{subsection.4.2}%
+\contentsline {section}{\numberline {5}Clearing Kernel}{12}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Account model}{13}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Collateral engine}{13}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Position engine}{13}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}Settlement engine}{14}{subsection.5.4}%
+\contentsline {section}{\numberline {6}Portfolio Margin Engine}{14}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Motivation}{14}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Margin model}{15}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Risk scenario generation}{16}{subsection.6.3}%
+\contentsline {subsection}{\numberline {6.4}Liquidation mechanism}{16}{subsection.6.4}%
+\contentsline {subsection}{\numberline {6.5}Insurance fund}{17}{subsection.6.5}%
+\contentsline {section}{\numberline {7}Programmable Market Extensions}{17}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Extension interface}{17}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Privacy-preserving perpetual module}{17}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}FX perpetual module}{18}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}Tokenized RWA and rate module}{18}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Strategy vault module}{19}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Repo and basis module}{19}{subsection.7.6}%
+\contentsline {section}{\numberline {8}Execution Layer}{19}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Public CLOB}{19}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Request-for-quote (RFQ)}{19}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Batch auctions}{20}{subsection.8.3}%
+\contentsline {section}{\numberline {9}Privacy Architecture}{20}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Privacy dimensions}{20}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Privacy modes}{20}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}Private order flow}{21}{subsection.9.3}%
+\contentsline {section}{\numberline {10}Trusted Execution Environment}{21}{section.10}%
+\contentsline {subsection}{\numberline {10.1}TEE architecture}{21}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}TEE security model}{21}{subsection.10.2}%
+\contentsline {section}{\numberline {11}Zero-Knowledge Layer}{22}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Solvency proof}{22}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}Periodic batch verification}{22}{subsection.11.2}%
+\contentsline {subsection}{\numberline {11.3}ZK for TEE attestation verification}{22}{subsection.11.3}%
+\contentsline {subsection}{\numberline {11.4}Implementation}{22}{subsection.11.4}%
+\contentsline {subsection}{\numberline {11.5}Limitations}{23}{subsection.11.5}%
+\contentsline {section}{\numberline {12}Agent-Native Financial Markets}{23}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Agent accounts}{23}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}Agent types}{24}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}Agent security}{24}{subsection.12.3}%
+\contentsline {section}{\numberline {13}Yield and Strategy Vaults}{24}{section.13}%
+\contentsline {subsection}{\numberline {13.1}Yield-bearing collateral tiers}{24}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Programmable strategy vaults}{25}{subsection.13.2}%
+\contentsline {subsection}{\numberline {13.3}Example strategies}{25}{subsection.13.3}%
+\contentsline {subsection}{\numberline {13.4}Repo and securities lending module}{26}{subsection.13.4}%
+\contentsline {subsection}{\numberline {13.5}Structured product vaults}{26}{subsection.13.5}%
+\contentsline {section}{\numberline {14}Economic Model}{27}{section.14}%
+\contentsline {subsection}{\numberline {14.1}Fee structure}{27}{subsection.14.1}%
+\contentsline {subsection}{\numberline {14.2}Protocol sustainability}{27}{subsection.14.2}%
+\contentsline {subsection}{\numberline {14.3}Economic security}{28}{subsection.14.3}%
+\contentsline {subsection}{\numberline {14.4}Incentive alignment}{28}{subsection.14.4}%
+\contentsline {subsection}{\numberline {14.5}Value proposition}{28}{subsection.14.5}%
+\contentsline {section}{\numberline {15}Arc Ecosystem Alignment}{28}{section.15}%
+\contentsline {subsection}{\numberline {15.1}Alignment with Arc's philosophy}{28}{subsection.15.1}%
+\contentsline {subsection}{\numberline {15.2}Filling Arc's infrastructure gaps}{29}{subsection.15.2}%
+\contentsline {subsection}{\numberline {15.3}Stablecoin-native settlement}{29}{subsection.15.3}%
+\contentsline {subsection}{\numberline {15.4}Tokenized collateral via USYC}{29}{subsection.15.4}%
+\contentsline {subsection}{\numberline {15.5}Nanopayments for agent-to-agent settlement}{30}{subsection.15.5}%
+\contentsline {subsection}{\numberline {15.6}Agent Stack integration}{30}{subsection.15.6}%
+\contentsline {subsection}{\numberline {15.7}CCTP interoperability}{30}{subsection.15.7}%
+\contentsline {subsection}{\numberline {15.8}Restricted product access}{30}{subsection.15.8}%
+\contentsline {section}{\numberline {16}Security Analysis}{30}{section.16}%
+\contentsline {subsection}{\numberline {16.1}Oracle manipulation}{30}{subsection.16.1}%
+\contentsline {subsection}{\numberline {16.2}Liquidation cascades}{31}{subsection.16.2}%
+\contentsline {subsection}{\numberline {16.3}Smart contract risk}{31}{subsection.16.3}%
+\contentsline {subsection}{\numberline {16.4}Privacy assumptions}{31}{subsection.16.4}%
+\contentsline {subsection}{\numberline {16.5}ZK assumptions}{31}{subsection.16.5}%
+\contentsline {section}{\numberline {17}Related Work}{31}{section.17}%
+\contentsline {subsection}{\numberline {17.1}Orderbook and liquidity-pool derivatives}{32}{subsection.17.1}%
+\contentsline {subsection}{\numberline {17.2}Layer separation and specialization}{32}{subsection.17.2}%
+\contentsline {subsection}{\numberline {17.3}Portfolio margin}{32}{subsection.17.3}%
+\contentsline {subsection}{\numberline {17.4}Modular exchange architectures}{32}{subsection.17.4}%
+\contentsline {subsection}{\numberline {17.5}Private execution}{32}{subsection.17.5}%
+\contentsline {subsection}{\numberline {17.6}Tokenized yield and agent infrastructure}{33}{subsection.17.6}%
+\contentsline {section}{\numberline {18}Implementation Roadmap}{33}{section.18}%
+\contentsline {subsection}{\numberline {18.1}Accelerator MVP: privacy-preserving BTC/USDC perpetual on Arc Testnet}{33}{subsection.18.1}%
+\contentsline {subsection}{\numberline {18.2}Phase 1: production clearing kernel and cross-market margin}{33}{subsection.18.2}%
+\contentsline {subsection}{\numberline {18.3}Phase 2: FX, RWA, and strategy vaults}{34}{subsection.18.3}%
+\contentsline {subsection}{\numberline {18.4}Phase 3: agent-native and privacy-at-scale infrastructure}{34}{subsection.18.4}%
+\contentsline {subsection}{\numberline {18.5}Stack}{34}{subsection.18.5}%
+\contentsline {section}{\numberline {19}Conclusion}{35}{section.19}%
+\contentsline {paragraph}{Acknowledgements.}{35}{section*.2}%
