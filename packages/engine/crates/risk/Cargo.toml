@@ -1,0 +1,16 @@
+[package]
+name = "risk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Off-chain portfolio margin risk monitor (Rust mirror of RiskMonitor.sol)."
+
+[dependencies]
+common = { path = "../common" }
+primitive-types = "0.12"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "clob"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-chain CLOB off-chain matching engine (price-time priority, gas-aware modify, recycle fees)."
+
+[dependencies]
+common = { path = "../common" }
+primitive-types = { version = "0.12", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.7"
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "matching"
+harness = false
