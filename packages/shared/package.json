@@ -1,0 +1,23 @@
+{
+  "name": "@synchra/shared",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synchra shared TypeScript types + protocol constants (collateral tiers, margin thresholds, USYC testnet address)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "echo '@synchra/shared lint stub — eslint pending'"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
