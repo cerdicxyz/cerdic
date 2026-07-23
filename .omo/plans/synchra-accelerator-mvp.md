@@ -113,7 +113,7 @@ Total: **37 implementation todos + 4 final verification tasks = 41 tracked work 
 
 ### Wave 0 — Scaffold & Foundation
 
-- [ ] 1. Pnpm-workspaces monorepo + tooling bootstrap
+- [x] 1. Pnpm-workspaces monorepo + tooling bootstrap
   What to do / Must NOT do: Initialize a pnpm workspaces monorepo at `/Users/nuel/oss/pjs/synchra-monorepo` with four workspaces: `packages/contracts` (Foundry project), `packages/engine` (Cargo workspace), `packages/frontend` (Next.js app), `packages/shared` (TS types shared across TS-only code paths). Root `package.json` exposes `dev`, `test`, `lint`, `build` scripts that fan out to each workspace. Root `pnpm-workspace.yaml` lists the four packages; root `Cargo.toml` declares a virtual workspace with `members = ["packages/engine/*"]`. Install working versions: pnpm ≥ 9.x, solc 0.8.24 (lock via `foundryup`), Rust ≥ 1.78 (via `rustup`), Node ≥ 20. Add root `.gitignore` covering `node_modules/`, `target/`, `out/`, `cache/`, `lib/`, `next-env.d.ts`, `*.log`, `.omo/evidence/` (so agent-exec evidence doesn't pollute the repo). Add `.tool-versions` pinning node, rust, and solc to the locked versions. **Must NOT have:** commit `paper/synchra.tex` history changes (paper keeps living in `paper/`); must NOT pin specific Phala or Circle SDK versions at this layer — those go in their dependent todos.
   Parallelization: Wave 0 | Blocked by: — | Blocks: 2-37
   References (executor has NO interview context — be exhaustive): `README.md:1-3` (current repo state); `paper/synchra.tex:1198-1219` (Stack Table — Solidity+Foundry / Rust / TypeScript+Node.js / Next.js); Pnpm workspaces docs https://pnpm.io/workspaces; Foundry book at Context7 ID `/foundry-rs/book`.
@@ -161,7 +161,7 @@ Total: **37 implementation todos + 4 final verification tasks = 41 tracked work 
   QA scenarios: happy = green CI on the trivial commit; failure = intentionally break a TS type and assert the `frontend` job fails — restore. Evidence `<attemptDir>/task-6-synchra-accelerator-mvp.log`
   Commit: Y | ci: add parallel contracts+engine+frontend build/test/lint pipeline
 
-- [ ] 7. Protocol constants reference snapshot in repo
+- [x] 7. Protocol constants reference snapshot in repo
   What to do / Must NOT do: Write `packages/contracts/src/lib/ProtocolConstants.sol` exposing constant values matching `packages/shared/src/constants.ts`: `IMR_BPS`, `MMR_BPS`, `LIQUIDATION_GAMMA_PERCENT`, `MAX_LEVERAGE_BPS` (2000 for 20×), `FUNDING_MAX_RATE_BPS_PER_SEC` per paper line 567 somewhere in the 5-50 bps/sec industry range (use `30` — conservative for MVP), `TIER_*_HAIRCUT_*_BPS_*` ranges mirroring `paper/synchra.tex:367-380`, `USYC_ARC_TESTNET` (= `address(0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C)`). Add `ProtocolConstants.t.sol` that asserts each immutable matches the paper-cited value. The intent is a **single source of truth** between TS and Solidity — the test guards against the two drifting apart. **Must NOT have:** live-haircut adjustment logic — that is Phase 1 (`dynamic haircuts` per `paper/synchra.tex:1166`); MVP uses static MVP-tiered haircuts.
   Parallelization: Wave 0 | Blocked by: 1 | Blocks: 8, 25, 37
   References: `paper/synchra.tex:367-380` (collateral tiers), `paper/synchra.tex:422-425` (settlement), `paper/synchra.tex:567` (funding clamp), `paper/synchra.tex:571` (1×-50× ceiling; MVP trims to 20× = `2000` bps), `packages/shared/src/constants.ts` (TS source of truth, todo #2).

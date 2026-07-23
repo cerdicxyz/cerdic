@@ -371,3 +371,102 @@ real submodule (so it can be pinned to a specific SHA), run
 `packages/contracts/` and the third entry appears in `.gitmodules`. The
 plan's "exactly 2 entries" is satisfied today; the future migration is
 one line.
+
+## #7 — `forge coverage` elides `return 0;` (and the optimizer's other constant-zero special-cases)
+
+**Pattern:** Solc's optimizer treats `return CONST;` specially when
+`CONST` is exactly `0`. The body line of the function is reported as
+uncovered (hit count `0`) even when the function is being called via an
+external STATICCALL from a different contract.
+
+**How to verify:** run `forge coverage --match-contract <Contract>
+--report lcov` and inspect the `.lcov` file. The entry for the affected
+line is `DA:<line>,0` while the function-signature line above it
+(`FN:<line>,...`) is hit normally.
+
+**Reproduction (smallest case):**
+```solidity
+contract C {
+    function zero() public pure returns (uint256) { return 0; }
+}
+```
+Calling `c.zero()` from a test contract reports the `return 0;` line
+unhit. Replacing the body with `return ZERO;` where `ZERO` is a
+`uint256 public constant ZERO = 0;` shows the same behavior — the
+constant-zero special-case triggers on the literal value, not the
+symbol.
+
+**Fixes (any one):**
+1. **Two-statement body** (cheapest, used in `t1HaircutBps`):
+   ```solidity
+   function t1HaircutBps() public pure returns (uint256) {
+       uint256 value = T1_HAIRCUT_BPS;
+       return value;
+   }
+   ```
+   The local-variable assignment forces the compiler to emit a real
+   `MSTORE` + `MLOAD` round-trip, which has source-line coverage.
+2. `assembly { result := T1_HAIRCUT_BPS }` — also works, slightly
+   noisier.
+3. Reorder so the affected constant is non-zero (e.g. shift all
+   values up by one) — invasive, breaks the paper-cited values.
+
+The two-statement body fix is a one-line change per affected getter
+and preserves both the constant value and the API.
+
+## #7 — `forge coverage` does not track `public constant` auto-generated getters
+
+**Pattern:** A `uint256 public constant X = 500;` declaration
+auto-generates a getter `function X() public returns (uint256);`.
+That getter IS executed at runtime, but its bytecode maps to the
+*declaration* line in the source map, and `forge coverage` doesn't
+track declaration lines as executable. So a test that calls
+`c.X()` reports `0/0` (zero trackable lines) for the file — which
+is technically 100% but doesn't reflect the real coverage.
+
+**Fix:** add explicit `public pure` getter functions that return the
+same constant. The test calls the explicit getter (e.g.
+`c.imrBps()` instead of `c.IMR_BPS()`); the source-mapped body lines
+are then tracked and hit-counted properly. The auto-generated getter
+for the state variable can stay (it's free, and downstream consumers
+may prefer the all-caps name) — the explicit getter is the coverage
+surface.
+
+**Why both, not just one?** `public constant` getter (auto) + `public
+pure` getter (explicit) is redundant but cheap, and it gives you a
+choice of API style at the call site. The Solidity compiler will not
+deduplicate the two — each emits its own dispatch entry, and the
+explicit getter is the one that the source-level coverage report
+sees.
+
+## #7 — `forge test` builds every file in `src/` and `test/`; pre-existing compile errors block unrelated tests
+
+**Pattern:** `forge test --match-contract X` still compiles ALL
+.sol files in `src/` and `test/`. The match flags only filter which
+contracts to RUN. If any other file in the tree has a compile error,
+your tests won't run. The same is true for `forge coverage` and
+`forge build` — they have no per-file opt-out at the Solidity
+compiler level.
+
+**Workarounds:**
+- `forge build --skip "<glob>"` skips building files whose names
+  contain the filter (e.g. `forge build --skip "Setup"`). Useful
+  for incremental local loops.
+- `forge test --no-match-path "<glob>"` filters at the test-runner
+  level, but does NOT skip compilation of the matched files.
+- `forge test --match-path` similarly filters at the runner level.
+
+**Concrete gotcha hit during this task:** another in-progress todo
+modified `test/Setup.t.sol` (string passed to `int256` ctor) and
+`lib/pyth-sdk-solidity/MockPyth.sol` (stray `@` in NatSpec that
+solc 0.8.24 misparses as a doc tag) AFTER the first clean
+`forge build` had cached. Subsequent builds failed until the
+other todo's fixes landed. The pre-existing bugs were not in
+this task's files; the right call was to wait for the other todo
+to converge (it did, within minutes) and not to touch
+cross-todo files.
+
+**Lesson for parallel-todo execution:** when `forge build` fails
+and the error is in a file you did not write, the cause is almost
+certainly another agent's WIP. `git status` plus
+`stat -f "%Sm %N" <file>` reveals the timeline.
