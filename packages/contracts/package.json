@@ -1,0 +1,11 @@
+{
+  "name": "@synchra/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synchra Solidity clearing kernel + market extensions (Foundry project, solc 0.8.24)",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "lint": "forge fmt --check"
+  }
+}

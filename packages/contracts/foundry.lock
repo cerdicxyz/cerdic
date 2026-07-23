@@ -1,0 +1,8 @@
+{
+  "lib/chainlink": {
+    "rev": "19bc7447bbe1d7d686d37d532927c458adb8ca2f"
+  },
+  "lib/pyth-sdk-solidity": {
+    "rev": "d7dd6e149936552198c12fac1273997cefc03ceb"
+  }
+}

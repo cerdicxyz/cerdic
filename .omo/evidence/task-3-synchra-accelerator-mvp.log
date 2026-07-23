@@ -1,0 +1,175 @@
+# Task #3 — Foundry + Solc 0.8.24 in `packages/contracts`
+# Plan: synchra-accelerator-mvp
+
+## Toolchain
+
+$ forge --version
+forge Version: 1.4.4-v1.4.4
+Commit SHA: 05794498bf47257b144e2e2789a1d5bf8566be0e
+Build Timestamp: 2025-10-30T15:19:24.333756000Z (1761837564)
+Build Profile: maxperf
+
+## `forge config` — solc pin check
+
+$ forge config | grep solc
+solc = "0.8.24"
+auto_detect_solc = true
+
+$ FOUNDRY_PROFILE=testnet forge config | grep -E '^(solc|evm_version|optimizer_runs|eth_rpc_url)'
+evm_version = "cancun"
+solc = "0.8.24"
+optimizer_runs = 200
+eth_rpc_url = "${ARC_TESTNET_RPC}"
+
+## `forge build` — exits 0
+
+$ forge build
+No files changed, compilation skipped
+   (re-ran with a fresh source file to capture the success line)
+$ touch test/Setup.t.sol && forge build
+Compiling 1 files with Solc 0.8.24
+Solc 0.8.24 finished in 807.27ms
+Compiler run successful!
+
+## `forge test -vvv` — all pass
+
+$ forge test -vvv
+Ran 4 tests for test/Setup.t.sol:SetupTest
+[PASS] test_ChainlinkUnsetIsZero() (gas: 17441)
+[PASS] test_LibrariesResolve() (gas: 4727)
+[PASS] test_PythStructsRoundTrip() (gas: 550)
+[PASS] test_PythUnsetReverts() (gas: 14663)
+Suite result: ok. 4 passed; 0 failed; 0 skipped; finished in 395.25µs (211.04µs CPU time)
+
+Ran 18 tests for test/ProtocolConstants.t.sol:ProtocolConstantsTest
+[PASS] test_fundingMaxRateBpsPerSec() (gas: 338)
+[PASS] test_imrBps() (gas: 329)
+[PASS] test_liquidationGammaPercent() (gas: 316)
+[PASS] test_maxLeverageBps() (gas: 360)
+[PASS] test_maxLeverageImpliesImr() (gas: 448)
+[PASS] test_mmrBps() (gas: 305)
+[PASS] test_mmrIs60PercentOfImr() (gas: 482)
+[PASS] test_t1HaircutBps() (gas: 328)
+[PASS] test_t2HaircutBpsMax() (gas: 348)
+[PASS] test_t2HaircutBpsMin() (gas: 338)
+[PASS] test_t3HaircutBpsMax() (gas: 362)
+[PASS] test_t3HaircutBpsMin() (gas: 317)
+[PASS] test_t4HaircutBpsMax() (gas: 361)
+[PASS] test_t4HaircutBpsMin() (gas: 318)
+[PASS] test_tierMonotonicity_max() (gas: 562)
+[PASS] test_tierMonotonicity_min() (gas: 586)
+[PASS] test_tierRangesAreOrdered() (gas: 559)
+[PASS] test_usycArcTestnet() (gas: 397)
+Suite result: ok. 18 passed; 0 failed; 0 skipped; finished in 426.17µs (471.37µs CPU time)
+
+Ran 2 test suites in 135.32ms (821.42µs CPU time): 22 tests passed, 0 failed, 0 skipped (22 total tests)
+
+## `.gitmodules` — exactly 2 submodule entries
+
+$ cat .gitmodules
+[submodule "packages/contracts/lib/pyth-sdk-solidity"]
+	path = packages/contracts/lib/pyth-sdk-solidity
+	url = https://github.com/pyth-network/pyth-sdk-solidity
+[submodule "packages/contracts/lib/chainlink-evm"]
+	path = packages/contracts/lib/chainlink-evm
+	url = https://github.com/smartcontractkit/chainlink-evm
+
+## `ls -la packages/contracts/`
+
+$ ls -la packages/contracts/
+total 40
+drwxr-xr-x@ 13 nuel  staff   416 23 Jul 15:49 .
+drwxr-xr-x@  6 nuel  staff   192 23 Jul 15:37 ..
+drwxr-xr-x@  3 nuel  staff    96 23 Jul 15:49 cache          # gitignored
+-rw-r--r--@  1 nuel  staff   170 23 Jul 15:43 foundry.lock   # forge's own lockfile (auto)
+-rw-r--r--@  1 nuel  staff   336 23 Jul 15:42 foundry.toml
+-rw-r--r--@  1 nuel  staff  1375 23 Jul 15:49 lcov.info      # from ProtocolConstants.t.sol coverage run (parallel todo #7)
+drwxr-xr-x@  5 nuel  staff   160 23 Jul 15:49 lib
+drwxr-xr-x@ 34 nuel  staff  1088 23 Jul 15:49 out
+-rw-r--r--@  1 nuel  staff   286 23 Jul 15:45 package.json
+-rw-r--r--@  1 nuel  staff   972 23 Jul 15:41 README.md
+drwxr-xr-x@  2 nuel  staff    64 23 Jul 15:41 script
+drwxr-xr-x@  3 nuel  staff    96 23 Jul 15:43 src
+drwxr-xr-x@  4 nuel  staff   128 23 Jul 15:44 test
+
+$ ls packages/contracts/lib/
+chainlink-evm          # submodule
+forge-std              # cloned by `forge init` (lib/ is gitignored, not a submodule)
+pyth-sdk-solidity      # submodule
+
+## `foundry.toml` — final content
+
+$ cat packages/contracts/foundry.toml
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.24"
+evm_version = "cancun"
+optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./" }]
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+[profile.testnet]
+eth_rpc_url = "${ARC_TESTNET_RPC}"
+
+## `packages/contracts/package.json` — final content
+
+$ cat packages/contracts/package.json
+{
+  "name": "@synchra/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synchra Solidity clearing kernel + market extensions (Foundry project, solc 0.8.24)",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "lint": "forge fmt --check"
+  }
+}
+
+## `forge fmt --check test/Setup.t.sol` — clean
+
+$ forge fmt --check test/Setup.t.sol
+$ echo $?
+0
+
+## Plan-text deviations (declared)
+
+1. **Pyth org is `pyth-network` (lowercase) — not `PythNetwork`.** The plan
+   body and Context7 reference both use the lowercase form, but the
+   install instruction in the same plan body spells it `PythNetwork`
+   (PascalCase). Used the working URL.
+
+2. **Chainlink Solidity contracts are in `smartcontractkit/chainlink-evm` —
+   not `smartcontractkit/chainlink`.** The legacy monorepo
+   `smartcontractkit/chainlink` was split; Solidity moved to
+   `chainlink-evm`. The `@chainlink/contracts` npm package is published
+   from `chainlink-evm/contracts/`. Used `chainlink-evm` and let
+   `chainlink-evm/=lib/chainlink-evm/contracts/` remapping apply.
+
+3. **`forge init` in this foundry version uses `--no-git` (not
+   `--no-commit`).** forge 1.4.4 made commit opt-in (`--commit`); the
+   plan's `--no-commit` is the default in 1.4.4. Omitted both flags.
+
+4. **`forge install` in this foundry version uses `--commit` (not
+   `--no-commit`).** Same inversion as #3; the plan's `--no-commit` is
+   the default. Omitted `--commit`.
+
+5. **Deprecated `pyth-sdk-solidity` repo patched at install time.**
+   Solc 0.8.24 rejects the deprecated Pyth files' backticked
+   `@pythnetwork/...` doc tags with error 6546
+   ("Documentation tag not valid for contracts"). Patched the 4 affected
+   lines in 4 files with `sed` to drop the leading `@` inside the
+   backticks. The semantic content of the comments is unchanged.
+   This is the post-install patch the maintainer-suggested migration
+   guide calls for; once the maintained package is wired in via
+   `pyth-network/pyth-crosschain` the patch goes away. Documented
+   in the Setup test header and in learnings.md.
+
+6. **MockV3Aggregator constructor signature changed.** The current
+   `chainlink-evm` takes `(uint8 decimals, int256 initialAnswer)` —
+   not `(uint8, string description)`. The original (description-string)
+   signature is preserved in `MockV3Aggregator.sol` only as a comment
+   in some branches. Updated the Setup test to match.

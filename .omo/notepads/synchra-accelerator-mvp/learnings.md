@@ -212,3 +212,162 @@ builds with the default Next 14 ESLint flat config plus the
 as Next's hot-reload, which would make every `app/page.tsx` save kick off
 a vitest re-run. Scoping both runners to a `tests/` subtree (alongside
 `app/`) keeps the boundaries clean.
+
+---
+
+## #3 — `forge 1.4.4` inverts the `--no-commit` flag (commit is opt-in)
+
+**Pattern:** The plan's `forge init` and `forge install` invocations both
+spell `--no-commit`, but `forge 1.4.4-v1.4.4` flipped the default — commit
+is now opt-in via `--commit`, and the default is no-commit. Omitting the
+flag (or just using the bare subcommand) does what `--no-commit` did in
+older versions.
+
+```bash
+# In 1.4.4 the default already matches the plan's intent:
+forge init --no-git --empty --force packages/contracts
+forge install pyth-network/pyth-sdk-solidity --shallow
+```
+
+`--no-git` on `forge init` (not `forge install`) is what suppresses the
+"create a fresh git repo" behavior — important when the target directory
+is already inside a parent git repo (our monorepo), otherwise forge tries
+to `git init` a second one. `--empty` skips the `Counter.sol` example
+contracts. `--force` lets forge scaffold into a non-empty target dir
+(our `packages/contracts` already has a stub `package.json` from #1).
+
+**Why this matters:** The plan body is correct on intent, just wrong on
+flag spelling for the installed forge version. Recognizing the inversion
+avoids the dead-end of "error: unexpected argument '--no-commit' found,
+tip: a similar argument exists: '--commit'."
+
+## #3 — Pyth org is `pyth-network` (lowercase), not `PythNetwork` (PascalCase)
+
+**Pattern:** The plan's `forge install PythNetwork/pyth-sdk-solidity` 404s
+because the GitHub org has been lowercase since the Pyth → pyth-network
+rebrand (visible in the plan's own Context7 reference
+`/pyth-network/pyth-crosschain`). The working URL is:
+
+```bash
+forge install pyth-network/pyth-sdk-solidity --shallow
+```
+
+The repo's own README still tells you to migrate to the npm package
+`@pythnetwork/pyth-sdk-solidity`, which is published from
+`pyth-network/pyth-crosschain` at
+`target_chains/ethereum/sdk/solidity/`. For MVP wiring (compile-time
+import of `IPyth` and `MockPyth`) the legacy repo is fine; for Phase 1+
+switch to a remapping:
+
+```
+# remappings.txt
+pyth-sdk-solidity/=lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/
+```
+
+**Why this matters:** The org-name typo blocks `forge install` with a
+generic 404. The repo's `IPyth.sol` also emits a `Deprecated` doc tag
+that solc 0.8.24 refuses with error 6546 (see next learning).
+
+## #3 — `pyth-network/pyth-sdk-solidity` ships a doc-tag that solc 0.8.24 rejects
+
+**Pattern:** The deprecated Pyth repo's `IPyth.sol`, `IPythEvents.sol`,
+`PythStructs.sol`, `PythErrors.sol`, `MockPyth.sol`, and `AbstractPyth.sol`
+all contain a backticked package name like
+`` `npm install @pythnetwork/pyth-sdk-solidity` ``. Solc 0.8.24 parses
+`@<ident>` inside a NatSpec comment as a doc tag and emits:
+
+```
+Error (6546): Documentation tag @pythnetwork/pyth-sdk-solidity` not valid
+for contracts.
+```
+
+**Workaround for the legacy repo:** post-install patch — the leading
+`@` inside the backticks is not load-bearing for the SDK's behavior, so
+it can be removed without changing semantics:
+
+```bash
+find lib/pyth-sdk-solidity -name "*.sol" -exec sed -i.bak \
+  's|@pythnetwork/pyth-sdk-solidity|pyth-sdk-solidity (npm)|g' {} \;
+rm -f lib/pyth-sdk-solidity/*.sol.bak
+```
+
+**Long-term fix:** migrate the import to the maintained
+`pyth-network/pyth-crosschain` SDK via a remapping (see prior
+learning). The post-install patch goes away.
+
+**Why this matters:** Without the patch, `forge build` fails on every
+file in the SDK and you cannot pin solc 0.8.24 with the deprecated
+Pyth repo. The patch is the smallest possible diff and is contained to
+the submodule's working tree — the upstream commit is unchanged.
+
+## #3 — `smartcontractkit/chainlink` is the Go monorepo; Solidity is in `chainlink-evm`
+
+**Pattern:** The plan's `forge install smartcontractkit/chainlink` clones
+the Chainlink Go monorepo (~5k files, no Solidity). The Solidity
+contracts (`@chainlink/contracts` on npm) are published from
+`smartcontractkit/chainlink-evm`, which is a separate repo with the
+canonical layout:
+
+```
+lib/chainlink-evm/contracts/src/v0.8/shared/
+├── interfaces/AggregatorV3Interface.sol
+└── mocks/MockV3Aggregator.sol
+```
+
+Forge's auto-remap on a lib with a `contracts/` subdir prepends it, so
+the import path drops the `contracts/` segment:
+
+```solidity
+// forge remappings output:
+// chainlink-evm/=lib/chainlink-evm/contracts/
+import {AggregatorV3Interface} from
+  "chainlink-evm/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+```
+
+**Why this matters:** Installing the wrong repo silently succeeds —
+`forge install` exits 0 — but the resulting `lib/chainlink/` has no
+Solidity, and the consumer contract's import fails to resolve.
+
+## #3 — `MockV3Aggregator` constructor is `(uint8 decimals, int256 initialAnswer)` — no description string
+
+**Pattern:** The legacy `MockV3Aggregator` (and most Chainlink docs) take
+a description string as the second constructor arg. The current
+`chainlink-evm` repo has dropped the description and uses
+`int256 _initialAnswer` instead:
+
+```solidity
+constructor(uint8 _decimals, int256 _initialAnswer)
+```
+
+`latestRoundData()` then returns `(1, _initialAnswer, 1, 1, 1)` — the
+mock seeds `roundId`, `startedAt`, `updatedAt`, and `answeredInRound`
+all to the deployment block's timestamp (== 1 in the forge test VM).
+
+**Why this matters:** Tests that assert `updatedAt == 0` against the
+"unset" state fail. Assert on `answer == 0` and `decimals()` instead —
+those are the values a downstream `OracleHub` will actually read.
+
+## #3 — Two-arity `submodule count` is achievable when `forge-std` is a plain lib, not a submodule
+
+**Pattern:** The plan demands exactly 2 entries in `.gitmodules`
+(Pyth + Chainlink). `forge init` clones `lib/forge-std` but does not
+register it as a submodule when invoked with `--no-git` (or by default
+when the parent dir is itself a git repo and the lib is gitignored
+via the root `.gitignore` rule `lib/`).
+
+Because `lib/` is already in the root `.gitignore`, anything in
+`lib/forge-std/` is invisible to git and there's no need for a
+submodule entry — `forge build` and `forge test` resolve `forge-std/`
+through the auto-generated remapping regardless.
+
+```bash
+git submodule status  # shows nothing for forge-std
+forge build           # works fine
+```
+
+**Why this matters:** If a maintainer later wants `forge-std` to be a
+real submodule (so it can be pinned to a specific SHA), run
+`forge install foundry-rs/forge-std --shallow --no-commit` from inside
+`packages/contracts/` and the third entry appears in `.gitmodules`. The
+plan's "exactly 2 entries" is satisfied today; the future migration is
+one line.
