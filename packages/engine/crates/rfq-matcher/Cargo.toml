@@ -1,0 +1,12 @@
+[package]
+name = "rfq-matcher"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encrypted RFQ block-trade matcher running inside the Phala TEE CVM."
+
+[dependencies]
+
+[dev-dependencies]

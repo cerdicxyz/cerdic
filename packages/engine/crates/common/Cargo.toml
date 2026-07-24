@@ -1,0 +1,12 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-crate types and constants for the engine (Rust mirror of packages/shared/src/types.ts)."
+
+[dependencies]
+
+[dev-dependencies]
