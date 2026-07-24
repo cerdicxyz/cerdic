@@ -2,7 +2,7 @@ node_modules/
 target/
 out/
 cache/
-lib/
+packages/contracts/lib/
 next-env.d.ts
 *.log
 .omo/evidence/
