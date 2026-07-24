@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel duplicate runs on the same ref; concurrency for PRs groups in-flight runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Root-level workspace sanity: pnpm lockfile is respected and the root
+  # `lint` fan-out runs cleanly. This is the cheap smoke test that catches
+  # lockfile drift and root-config breakage before the three stack jobs fire.
+  root:
+    name: Root (pnpm install + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (root fan-out)
+        run: pnpm lint
+
+  contracts:
+    name: Contracts (forge fmt + build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache Foundry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/foundry
+          key: foundry-${{ runner.os }}-${{ hashFiles('packages/contracts/foundry.lock', 'packages/contracts/foundry.toml') }}
+          restore-keys: |
+            foundry-${{ runner.os }}-
+
+      - name: Install Foundry
+        run: foundryup
+
+      - name: Format check
+        working-directory: packages/contracts
+        run: forge fmt --check
+
+      - name: Build
+        working-directory: packages/contracts
+        run: forge build
+
+      - name: Run tests
+        working-directory: packages/contracts
+        run: forge test -vvv
+
+  engine:
+    name: Engine (cargo fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.78
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('packages/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: cargo-git-${{ runner.os }}-${{ hashFiles('packages/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-git-${{ runner.os }}-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: packages/engine/target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('packages/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-
+
+      - name: Format check
+        working-directory: packages/engine
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: packages/engine
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        working-directory: packages/engine
+        run: cargo test --workspace
+
+  frontend:
+    name: Frontend (lint + test + playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            packages/*/node_modules
+            packages/*/tests/e2e/node_modules
+          key: node_modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            node_modules-${{ runner.os }}-
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared
+        run: pnpm --filter @synchra/shared build
+
+      - name: Lint
+        run: pnpm --filter @synchra/frontend lint
+
+      - name: Test (vitest)
+        run: pnpm --filter @synchra/frontend test
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @synchra/frontend exec playwright install --with-deps chromium
+
+      - name: Playwright E2E (chromium)
+        run: npx playwright test --project=chromium
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
