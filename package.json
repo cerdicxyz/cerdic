@@ -1,0 +1,15 @@
+{
+  "name": "synchra",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synchra — privacy-preserving clearing and leverage layer for Arc",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --if-present run dev",
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test",
+    "lint": "pnpm -r --if-present run lint"
+  }
+}

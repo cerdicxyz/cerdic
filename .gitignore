@@ -1,0 +1,10 @@
+node_modules/
+target/
+out/
+cache/
+lib/
+next-env.d.ts
+*.log
+.omo/evidence/
+.omo/
+lcov.info
