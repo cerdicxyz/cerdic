@@ -50,7 +50,7 @@ contract ConfigurableAggregator is AggregatorV3Interface {
 
 /// @title  OracleHubTest
 /// @notice Unit tests for the oracle stack (plan todo #12,
-///         paper/synchra.tex:1055-1063): the `PythConsumer` and
+///         paper/cerdic.tex:1055-1063): the `PythConsumer` and
 ///         `ChainlinkConsumer` wrappers (valid price, 60-second staleness
 ///         bound) and the `OracleHub` mark-price median with the TWAP
 ///         stub, the 500 bps circuit breaker (eager view-path revert plus

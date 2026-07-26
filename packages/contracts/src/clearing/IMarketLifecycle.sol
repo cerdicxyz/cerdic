@@ -4,7 +4,7 @@ import {IMarket} from "./IMarket.sol";
 
 /// @title IMarketLifecycle
 /// @notice Lifecycle-callback surface a market extension exposes to the
-///         clearing kernel (paper/synchra.tex:549-556, `alg:hooks`). The
+///         clearing kernel (paper/cerdic.tex:549-556, `alg:hooks`). The
 ///         kernel invokes these hooks around position, funding,
 ///         liquidation, and oracle events so the extension can keep its
 ///         own derived state (funding indices, open interest, impact
@@ -60,7 +60,7 @@ interface IMarketLifecycle {
 
     /// @notice Fired before a funding settlement is applied at `rate`.
     ///         Lets the extension checkpoint its funding index ahead of
-    ///         the kernel's lazy settlement (paper/synchra.tex:419-420).
+    ///         the kernel's lazy settlement (paper/cerdic.tex:419-420).
     /// @param  market Kernel market identifier.
     /// @param  rate   Funding rate being settled (1e18-scaled per the
     ///         extension's cadence convention).
@@ -77,7 +77,7 @@ interface IMarketLifecycle {
 
     /// @notice Fired when the oracle updates the market's reference
     ///         price. Extensions maintaining impact TWAP or mark-price
-    ///         medians (paper/synchra.tex:1055-1063) update their windows
+    ///         medians (paper/cerdic.tex:1055-1063) update their windows
     ///         here.
     /// @param  market Kernel market identifier.
     /// @param  price  New oracle price (1e18-scaled USD).

@@ -6,8 +6,8 @@ import {IMarketLifecycle} from "./IMarketLifecycle.sol";
 import {MarketImpactTwap} from "../oracle/MarketImpactTwap.sol";
 
 /// @title  SettlementEngine
-/// @notice Settlement engine of the Synchra clearing kernel
-///         (paper/synchra.tex:413-420). Processes matched trades from the
+/// @notice Settlement engine of the Cerdic clearing kernel
+///         (paper/cerdic.tex:413-420). Processes matched trades from the
 ///         execution layer: validates each side against the market
 ///         extension, applies collateral changes and position updates
 ///         ATOMICALLY (paper line 419), and forwards any upfront premium
@@ -188,7 +188,7 @@ contract SettlementEngine is PositionEngine {
 
     /// @notice Settles a matched trade between a long and a short trader,
     ///         atomically updating both positions
-    ///         (paper/synchra.tex:415-419).
+    ///         (paper/cerdic.tex:415-419).
     /// @dev    `size` is expressed from the long side (positive); the
     ///         short side's size is its negation. Reverts — with NO state
     ///         mutation — when the market is unregistered, any

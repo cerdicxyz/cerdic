@@ -19,7 +19,7 @@ import {MockV3Aggregator} from "chainlink-evm/src/v0.8/shared/mocks/MockV3Aggreg
 
 /// @title  Setup.t.sol
 /// @notice Smoke test that pins both oracle libraries as compile-time and
-///         runtime dependencies for the Synchra clearing kernel.
+///         runtime dependencies for the Cerdic clearing kernel.
 ///
 ///         Both libraries are mounted as Foundry submodules under
 ///         `packages/contracts/lib/`. A passing `forge test` here proves the

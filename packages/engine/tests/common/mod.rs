@@ -21,7 +21,7 @@
 //!
 //! The helper wraps a 1-tick/second tokio current-thread runtime sized
 //! for the engine's per-batch budget (matching the paper's 1-second
-//! matching tick at `paper/synchra.tex:646`) and a 5-second per-test
+//! matching tick at `paper/cerdic.tex:646`) and a 5-second per-test
 //! timeout so a wedged future fails fast instead of stalling CI.
 //!
 //! The actual `#[tokio::test]` macro is re-exported from `tokio` once

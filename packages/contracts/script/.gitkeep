@@ -1,0 +1,3 @@
+# Keep this directory tracked even when empty.
+# Foundry uses `script/` for deployment / invariant scripts (see todo #37
+# for the Arc Testnet end-to-end smoke test).

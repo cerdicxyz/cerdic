@@ -1,6 +1,6 @@
-// Shared Synchra protocol types.
+// Shared Cerdic protocol types.
 //
-// Shapes mirror paper/synchra.tex §3 (Account Model) and §4 (Portfolio Margin
+// Shapes mirror paper/cerdic.tex §3 (Account Model) and §4 (Portfolio Margin
 // Engine). All monetary / size / price / leverage fields are `bigint` to match
 // the on-chain Solidity types (int256 / uint256) without precision loss; the
 // only string fields are addresses and bytes32 identifiers.
@@ -13,7 +13,7 @@ export type MarketId = string;
 export type Address = string;
 
 // Canonical per-market position record. Mirrors the `IMarket` interface in
-// paper/synchra.tex lines 396-407 (MarketPosition struct). `size` is signed
+// paper/cerdic.tex lines 396-407 (MarketPosition struct). `size` is signed
 // (positive = long, negative = short). `leverage` is the per-market risk-tier
 // ceiling, NOT the trader's effective leverage — effective leverage is an
 // emergent account-level quantity computed by the portfolio risk engine.
@@ -64,7 +64,7 @@ export interface RfqQuote {
 // Per-market funding index snapshot. `cumulative` is the running integral of
 // the funding rate since market inception; a position's funding PnL is the
 // difference between the index at the current block and the index snapshotted
-// at the position's open block (lazy PnL per paper/synchra.tex §3 settlement
+// at the position's open block (lazy PnL per paper/cerdic.tex §3 settlement
 // engine).
 export interface FundingIndex {
   marketId: MarketId;
@@ -72,7 +72,7 @@ export interface FundingIndex {
   lastUpdateBlock: bigint;
 }
 
-// Account liquidation state machine (paper/synchra.tex fig:liquidation).
+// Account liquidation state machine (paper/cerdic.tex fig:liquidation).
 //   Healthy     — C_eff >= M
 //   Warning     — C_eff < M
 //   Liquidation — C_eff < M * gamma

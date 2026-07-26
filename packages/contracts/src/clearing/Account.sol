@@ -8,8 +8,8 @@ import {ICollateralBalanceSource} from "./ICollateralEngine.sol";
 import {IRiskMonitor} from "./RiskMonitor.sol";
 
 /// @title  Account
-/// @notice Clearing account contract of the Synchra clearing kernel
-///         (paper/synchra.tex:339-421). Owns the authoritative per-trader
+/// @notice Clearing account contract of the Cerdic clearing kernel
+///         (paper/cerdic.tex:339-421). Owns the authoritative per-trader
 ///         account tuple `A = (B, P, H)` (paper lines 356-360):
 ///         collateral balances by asset, the position set keyed by market
 ///         (stored as opaque bytes per paper line 409 so the kernel stays
@@ -55,7 +55,7 @@ contract Account is AccessControl, ICollateralBalanceSource {
     // ---------------------------------------------------------------------
 
     /// @notice Per-trader account tuple `A = (B, P, H)`
-    ///         (paper/synchra.tex:356-360) plus the MVP frozen flag.
+    ///         (paper/cerdic.tex:356-360) plus the MVP frozen flag.
     /// @dev    `frozen` doubles as the struct's only scalar member: a
     ///         public mapping to a struct containing ONLY mappings cannot
     ///         generate a getter (solc 6744), so the auto-generated
@@ -66,7 +66,7 @@ contract Account is AccessControl, ICollateralBalanceSource {
         /// @dev B — collateral balance per asset (token base units).
         mapping(address => uint256) collateralBalances;
         /// @dev P — position set keyed by market ID, opaque bytes per
-        ///      paper/synchra.tex:409. Written by the position/settlement
+        ///      paper/cerdic.tex:409. Written by the position/settlement
         ///      engines, not by this contract.
         mapping(bytes32 => bytes) positions;
         /// @dev H — credit/debit record per market ID for funding
@@ -264,7 +264,7 @@ contract Account is AccessControl, ICollateralBalanceSource {
     // ---------------------------------------------------------------------
 
     /// @notice Returns the caller's opaque position bytes for `marketId`
-    ///         (paper/synchra.tex:409). Empty when no position exists.
+    ///         (paper/cerdic.tex:409). Empty when no position exists.
     function getPosition(bytes32 marketId) external view returns (bytes memory) {
         return accounts[msg.sender].positions[marketId];
     }
@@ -278,7 +278,7 @@ contract Account is AccessControl, ICollateralBalanceSource {
     /// @inheritdoc ICollateralBalanceSource
     /// @notice Read surface consumed by the collateral engine (todo #9)
     ///         when computing `C_eff = Σ b_a · (1 − h_a) · p_a`
-    ///         (paper/synchra.tex:384-386).
+    ///         (paper/cerdic.tex:384-386).
     function collateralBalanceOf(address trader, address asset) external view returns (uint256) {
         return accounts[trader].collateralBalances[asset];
     }

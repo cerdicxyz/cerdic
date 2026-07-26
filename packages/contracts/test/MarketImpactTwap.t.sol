@@ -22,7 +22,7 @@ contract NoopRecordTarget {
 
 /// @title  MarketImpactTwapTest
 /// @notice Unit + integration tests for the on-chain mark-price impact
-///         TWAP (plan todo #21, paper/synchra.tex:570 and :1059). Covers:
+///         TWAP (plan todo #21, paper/cerdic.tex:570 and :1059). Covers:
 ///           - the 60-block rolling window: uniform-trade TWAP (happy
 ///             path), the 1-wei probe invariant, outlier pull with its
 ///             bound (failure path), ring-buffer wraparound, the 59/60

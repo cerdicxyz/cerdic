@@ -3,8 +3,8 @@ pragma solidity 0.8.35;
 import {AggregatorV3Interface} from "chainlink-evm/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /// @title  ChainlinkConsumer
-/// @notice Secondary-oracle consumer of the Synchra multi-oracle stack
-///         (paper/synchra.tex:1055-1063, plan todo #12). Wraps Chainlink
+/// @notice Secondary-oracle consumer of the Cerdic multi-oracle stack
+///         (paper/cerdic.tex:1055-1063, plan todo #12). Wraps Chainlink
 ///         `AggregatorV3Interface` feeds and exposes a staleness-checked,
 ///         1e18-scaled USD price surface to the `OracleHub`, where it acts
 ///         as the cross-check for the circuit breaker.

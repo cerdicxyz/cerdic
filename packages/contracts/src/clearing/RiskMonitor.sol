@@ -12,20 +12,20 @@ import {LiquidationEntry, IMarkPriceOracle} from "./LiquidationEntry.sol";
 interface IRiskMonitor {
     /// @notice Returns true when `trader` can withdraw `amount` of `asset`
     ///         without pushing the account below its maintenance-margin
-    ///         requirement (paper/synchra.tex:422-474, MVP isolated margin).
+    ///         requirement (paper/cerdic.tex:422-474, MVP isolated margin).
     function isWithdrawSafe(address trader, address asset, uint256 amount) external view returns (bool);
 }
 
 /// @title  RiskMonitor
-/// @notice Risk monitor of the Synchra clearing kernel — the on-chain
+/// @notice Risk monitor of the Cerdic clearing kernel — the on-chain
 ///         isolated-margin requirement engine (plan todo #15) and the
 ///         liquidation trigger that feeds `LiquidationEntry`
-///         (paper/synchra.tex:511-518, standard waterfall stage only).
+///         (paper/cerdic.tex:511-518, standard waterfall stage only).
 /// @dev    MVP scope guardrails (plan todo #15 + paper §margin):
 ///         - ISOLATED margin only. The margin requirement is the sum of
 ///           per-market maintenance requirements — there are NO
 ///           cross-market portfolio offsets. The `f_S` / `f_C` / `f_L` /
-///           `f_K` portfolio components of `M(P)` (paper/synchra.tex:446)
+///           `f_K` portfolio components of `M(P)` (paper/cerdic.tex:446)
 ///           are scope-OUT for the MVP: the engine computes the isolated
 ///           requirement and grants no hedging credit.
 ///         - MMR-based, not IMR-based. The requirement enforced here is
@@ -41,7 +41,7 @@ interface IRiskMonitor {
 ///         `PositionEngine` is an opaque-bytes store with no enumerable
 ///         market set — the same reason `CollateralEngine` keeps its
 ///         `_assets` list for the `C_eff` summation domain
-///         (paper/synchra.tex:385). Markets without a position record are
+///         (paper/cerdic.tex:385). Markets without a position record are
 ///         skipped (the market decoder cannot be assumed to accept empty
 ///         bytes, matching `LiquidationEntry.checkAndFlag`).
 ///

@@ -6,8 +6,8 @@ import {PythStructs} from "pyth-sdk-solidity/PythStructs.sol";
 import {IOracleConsumer} from "../clearing/ICollateralEngine.sol";
 
 /// @title  PythConsumer
-/// @notice Primary-oracle consumer of the Synchra multi-oracle stack
-///         (paper/synchra.tex:1055-1063, plan todo #12). Wraps a Pyth
+/// @notice Primary-oracle consumer of the Cerdic multi-oracle stack
+///         (paper/cerdic.tex:1055-1063, plan todo #12). Wraps a Pyth
 ///         `IPyth` deployment and exposes a staleness-checked, 1e18-scaled
 ///         USD price surface to the clearing kernel and the `OracleHub`.
 /// @dev    MVP scope guardrails:
@@ -16,7 +16,7 @@ import {IOracleConsumer} from "../clearing/ICollateralEngine.sol";
 ///           fails with the same `StalePrice` surface and the same
 ///           `MAX_STALENESS_SECONDS = 60` bound (task spec).
 ///         - No ZK proofs for oracle data — explicitly out of MVP scope
-///           (paper/synchra.tex:1095-1100).
+///           (paper/cerdic.tex:1095-1100).
 ///         - No real deployment addresses are baked in: the Pyth contract
 ///           is wired by the admin via `setPythContract`, so tests run
 ///           against `MockPyth` and the Arc Testnet address is injected by

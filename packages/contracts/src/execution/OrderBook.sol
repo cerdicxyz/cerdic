@@ -4,8 +4,8 @@ import {IMarket} from "../clearing/IMarket.sol";
 import {ICollateralEngine} from "../clearing/ICollateralEngine.sol";
 
 /// @title  OrderBook
-/// @notice On-chain order book storage for the Synchra CLOB execution layer
-///         (paper/synchra.tex:619-629, plan todo #17). Stores limit orders
+/// @notice On-chain order book storage for the Cerdic CLOB execution layer
+///         (paper/cerdic.tex:619-629, plan todo #17). Stores limit orders
 ///         with EIP-712 signature verification, gas-aware modify (paper
 ///         line 627), cancel, and an expired-order recycle-fee claim
 ///         mechanism (paper line 954).
@@ -82,7 +82,7 @@ contract OrderBook {
     uint256 public constant MIN_RECYCLE_FEE = 0.001 ether;
 
     /// @notice EIP-712 domain name.
-    string internal constant EIP712_DOMAIN_NAME = "Synchra OrderBook";
+    string internal constant EIP712_DOMAIN_NAME = "Cerdic OrderBook";
 
     /// @notice EIP-712 domain version.
     string internal constant EIP712_DOMAIN_VERSION = "1";

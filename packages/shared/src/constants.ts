@@ -1,10 +1,10 @@
-// Synchra protocol constants.
+// Cerdic protocol constants.
 //
 // All haircut / margin values are basis points (1 bps = 0.01%). Each is a
 // `readonly [number, number]` tuple representing the [floor, ceiling] range
 // the risk engine may quote for that tier / parameter at runtime.
 //
-// Source of truth: paper/synchra.tex Table 1 (collateral tiers) and
+// Source of truth: paper/cerdic.tex Table 1 (collateral tiers) and
 // plan decisions (IMR 5%, MMR 3% = 60% of IMR, gamma = 0.85).
 
 // --- Collateral tier haircut ranges (basis points) ---------------------------------
@@ -33,7 +33,7 @@ export const MMR_BPS: number = 300;
 // --- Liquidation threshold (percent) ----------------------------------------------
 
 // Liquidation threshold gamma. When C_eff < M * gamma, the account is in
-// the Liquidation state (paper/synchra.tex fig:liquidation). The paper
+// the Liquidation state (paper/cerdic.tex fig:liquidation). The paper
 // specifies 0.8-0.9; we pin 0.85 (85%) as the MVP default.
 export const LIQUIDATION_GAMMA: number = 85;
 

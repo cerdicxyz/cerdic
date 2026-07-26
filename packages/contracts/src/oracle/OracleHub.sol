@@ -22,8 +22,8 @@ interface IOracleHubEvents {
 }
 
 /// @title  OracleHub
-/// @notice Mark-price oracle of the Synchra clearing kernel
-///         (paper/synchra.tex:1055-1063, plan todo #12). Computes the mark
+/// @notice Mark-price oracle of the Cerdic clearing kernel
+///         (paper/cerdic.tex:1055-1063, plan todo #12). Computes the mark
 ///         price as the median of the multi-oracle stack:
 ///           1. Pyth primary   — via `PythConsumer.fetchPrice`
 ///           2. Chainlink      — via `ChainlinkConsumer.fetchPrice`
@@ -35,7 +35,7 @@ interface IOracleHubEvents {
 ///              the 3-slot median resolves to the primary while the
 ///              Chainlink leg guards divergence through the circuit
 ///              breaker.
-/// @dev    Circuit breaker (paper/synchra.tex:1062-1063): when Pyth and
+/// @dev    Circuit breaker (paper/cerdic.tex:1062-1063): when Pyth and
 ///         Chainlink diverge by more than `maxDivergenceBps` (default 500
 ///         bps = 5%, the upper end of the paper's 1%-5% configurable
 ///         band), `markPrice` fails closed by reverting
@@ -76,7 +76,7 @@ contract OracleHub {
 
     /// @notice Default circuit-breaker divergence bound: 500 bps (5%) —
     ///         the upper end of the paper's configurable 1%-5% band
-    ///         (paper/synchra.tex:1062).
+    ///         (paper/cerdic.tex:1062).
     uint16 public constant DEFAULT_MAX_DIVERGENCE_BPS = 500;
 
     // ---------------------------------------------------------------------
@@ -213,7 +213,7 @@ contract OracleHub {
     /// @notice Returns the raw Pyth primary price for `marketId`
     ///         (1e18-scaled USD), bypassing the circuit breaker and the
     ///         median computation. Used as the index price `P_index` in the
-    ///         continuous funding formula (paper/synchra.tex:567,
+    ///         continuous funding formula (paper/cerdic.tex:567,
     ///         plan todo #14). The mark price (`markPrice`) is the validated
     ///         median; the index price is the unvalidated primary — the
     ///         funding basis `P_mark - P_index` is what drives funding
@@ -252,7 +252,7 @@ contract OracleHub {
     ///         Does not bypass the live-divergence check: if the two legs
     ///         still diverge beyond `maxDivergenceBps`, `markPrice` keeps
     ///         reverting until convergence is restored
-    ///         (paper/synchra.tex:1063).
+    ///         (paper/cerdic.tex:1063).
     function unpause() external onlyAdmin {
         paused = false;
         emit CircuitBreakerReset(msg.sender);

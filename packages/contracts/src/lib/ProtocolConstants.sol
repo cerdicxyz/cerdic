@@ -2,11 +2,11 @@
 pragma solidity 0.8.35;
 
 /// @title ProtocolConstants
-/// @notice Single source of truth for Synchra MVP protocol parameters
+/// @notice Single source of truth for Cerdic MVP protocol parameters
 ///         (margin thresholds, liquidation gamma, leverage ceiling, funding
 ///         clamp, collateral-tier haircut ranges, and the USYC Arc Testnet
 ///         token address).
-/// @dev    These values are pinned to `paper/synchra.tex:367-380` (collateral
+/// @dev    These values are pinned to `paper/cerdic.tex:367-380` (collateral
 ///         tiers) and the plan decisions for IMR 5% / MMR 3% (= 60% of IMR) /
 ///         gamma 0.85 / max 20x leverage. They mirror
 ///         `packages/shared/src/constants.ts`; the drift test in
@@ -67,7 +67,7 @@ contract ProtocolConstants {
 
     // ---------------------------------------------------------------------
     // Collateral-tier haircut ranges (basis points).
-    // Source: paper/synchra.tex Table 1 (lines 367-380).
+    // Source: paper/cerdic.tex Table 1 (lines 367-380).
     // ---------------------------------------------------------------------
 
     /// @notice Tier 1 (USDC, EURC): 0% haircut.

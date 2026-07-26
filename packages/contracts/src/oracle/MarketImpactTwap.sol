@@ -3,10 +3,10 @@ pragma solidity 0.8.35;
 import {RingBuffer} from "../lib/RingBuffer.sol";
 
 /// @title  MarketImpactTwap
-/// @notice On-chain mark-price impact TWAP of the Synchra oracle stack
+/// @notice On-chain mark-price impact TWAP of the Cerdic oracle stack
 ///         (plan todo #21): the tertiary oracle input cited by
-///         paper/synchra.tex:570 ("median of external feeds, on-chain
-///         impact mid-price, ...") and paper/synchra.tex:1059 ("Tertiary
+///         paper/cerdic.tex:570 ("median of external feeds, on-chain
+///         impact mid-price, ...") and paper/cerdic.tex:1059 ("Tertiary
 ///         oracle: TWAP from CLOB trades"). `SettlementEngine` calls
 ///         `recordTrade` after every `settleTrade`; `OracleHub.markPrice`
 ///         reads `twap` as the third leg of its median.

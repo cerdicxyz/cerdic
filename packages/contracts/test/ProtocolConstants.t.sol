@@ -7,7 +7,7 @@ import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 /// @notice Unit test asserting each `ProtocolConstants` value matches the
 ///         paper-cited / plan-pinned value, and verifying the collateral-tier
 ///         haircut ranges are monotonically increasing
-///         (T1 < T2 < T3 < T4) per `paper/synchra.tex:367-380`.
+///         (T1 < T2 < T3 < T4) per `paper/cerdic.tex:367-380`.
 ///
 ///         Mirrors `packages/shared/src/constants.ts`; this test is the
 ///         drift guard between the TS and Solidity single sources of truth.
@@ -99,7 +99,7 @@ contract ProtocolConstantsTest is Test {
 
     // ---------------------------------------------------------------------
     // Tier monotonicity. The collateral tiers in
-    // `paper/synchra.tex:367-380` form a strictly increasing sequence on
+    // `paper/cerdic.tex:367-380` form a strictly increasing sequence on
     // the haircut axis — both the floor and the ceiling of each tier must
     // be lower than the next tier's floor, otherwise a Tier-N asset could
     // be treated as more conservatively haircutt-ed than a Tier-(N+1)

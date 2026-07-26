@@ -15,7 +15,7 @@ interface IOracleConsumer {
 /// @title ICollateralBalanceSource
 /// @notice Read-only surface the collateral engine uses to pull per-trader,
 ///         per-asset collateral balances when computing
-///         `C_eff = Σ b_a · (1 − h_a) · p_a` (paper/synchra.tex:384-386).
+///         `C_eff = Σ b_a · (1 − h_a) · p_a` (paper/cerdic.tex:384-386).
 /// @dev    Implemented by `Account.sol` (todo #8), which owns the
 ///         authoritative `collateralBalances` storage. The engine never
 ///         custody-splits balances itself; it only reads.
@@ -27,7 +27,7 @@ interface ICollateralBalanceSource {
 
 /// @title ICollateralEngine
 /// @notice Collateral-tier registry and effective-collateral valuation for
-///         the Synchra clearing kernel (paper/synchra.tex:362-386).
+///         the Cerdic clearing kernel (paper/cerdic.tex:362-386).
 /// @dev    Static MVP tier table per paper Table 1 (lines 367-380):
 ///         Tier 1 USDC/EURC 0%, Tier 2 USYC 2%-5% (MVP pins 200 bps),
 ///         Tier 3 10%-20%, Tier 4 15%-35%. Dynamic haircuts are Phase 1
@@ -60,7 +60,7 @@ interface ICollateralEngine {
     error InvalidTier(uint8 tier);
 
     /// @notice Haircut outside the static MVP range for its tier
-    ///         (paper/synchra.tex:367-380).
+    ///         (paper/cerdic.tex:367-380).
     error HaircutOutOfRange(uint8 tier, uint16 haircutBps);
 
     /// @notice A required non-zero address was passed as zero.
@@ -90,7 +90,7 @@ interface ICollateralEngine {
 
     /// @notice Effective collateral of `trader`:
     ///         `C_eff = Σ b_a · (1 − h_a) · p_a` over registered assets
-    ///         (paper/synchra.tex:384-386). 1e18-scaled USD.
+    ///         (paper/cerdic.tex:384-386). 1e18-scaled USD.
     function effectiveCollateral(address trader) external view returns (uint256);
 
     // ---------------------------------------------------------------------

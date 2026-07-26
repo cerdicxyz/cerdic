@@ -1,8 +1,8 @@
 {
-  "name": "@synchra/contracts",
+  "name": "@cerdic/contracts",
   "version": "0.0.0",
   "private": true,
-  "description": "Synchra Solidity clearing kernel + market extensions (Foundry project, solc 0.8.24)",
+  "description": "Cerdic Solidity clearing kernel + market extensions (Foundry project, solc 0.8.24)",
   "scripts": {
     "build": "forge build",
     "test": "forge test",

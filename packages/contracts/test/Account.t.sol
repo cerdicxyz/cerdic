@@ -18,7 +18,7 @@ contract MockERC20 is ERC20 {
 
 /// @title  AccountTest
 /// @notice Unit tests for the clearing kernel's `Account.sol`
-///         (paper/synchra.tex:339-421, plan todo #8). Covers the deposit /
+///         (paper/cerdic.tex:339-421, plan todo #8). Covers the deposit /
 ///         withdraw round-trip, the insufficient-balance revert, the frozen
 ///         account guard, and the `CLEARING_ADMIN_ROLE` access gate.
 contract AccountTest is Test {

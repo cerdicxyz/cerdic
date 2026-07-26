@@ -1,5 +1,5 @@
-//! Off-chain matching engine for the Synchra public CLOB market extension
-//! (paper/synchra.tex:619-651, plan todo #16).
+//! Off-chain matching engine for the Cerdic public CLOB market extension
+//! (paper/cerdic.tex:619-651, plan todo #16).
 //!
 //! The engine maintains one [`OrderBook`] per market: asks live in a
 //! [`BTreeMap`] keyed ascending by price, bids in a mirror map keyed by

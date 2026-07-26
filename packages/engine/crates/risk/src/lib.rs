@@ -12,7 +12,7 @@
 //! - ISOLATED margin only. The requirement is the sum of per-market
 //!   maintenance requirements — NO cross-market portfolio offsets. The
 //!   `f_S` / `f_C` / `f_L` / `f_K` portfolio components of `M(P)`
-//!   (paper/synchra.tex:446) are scope-OUT.
+//!   (paper/cerdic.tex:446) are scope-OUT.
 //! - MMR-based, not IMR-based: `Σ |positionSize| · markPrice · MMR_BPS / 1e4`
 //!   with `MMR_BPS = 300` (3%, 60% of IMR per the plan decision). The
 //!   initial-margin check (5%) lives at position open.

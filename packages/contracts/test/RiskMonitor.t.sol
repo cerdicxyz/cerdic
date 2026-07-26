@@ -45,7 +45,7 @@ contract MockMarkPriceOracle {
 /// @dev Stand-in market extension (todo #14): permissive validator, no-op
 ///      lifecycle hooks, and the canonical `MarketPosition` decoder
 ///      (absolute size, matching the kernel's opaque-bytes contract at
-///      paper/synchra.tex:409).
+///      paper/cerdic.tex:409).
 contract MockMarket is IMarket, IMarketLifecycle, IPositionDecoder {
     // -- IMarket ------------------------------------------------------------
     function getPnL(bytes32, uint256) external pure returns (int256) {
@@ -94,7 +94,7 @@ contract MockMarket is IMarket, IMarketLifecycle, IPositionDecoder {
 
 /// @title  RiskMonitorTest
 /// @notice Unit + fuzz tests for the clearing kernel's `RiskMonitor.sol`
-///         (plan todo #15; margin model at paper/synchra.tex:422-474, MVP
+///         (plan todo #15; margin model at paper/cerdic.tex:422-474, MVP
 ///         isolated-margin subset). Covers the withdraw-safety gate wired
 ///         into `Account.withdraw` (happy, boundary, and breach paths), the
 ///         MMR-based `currentMarginRequirement` formula including the

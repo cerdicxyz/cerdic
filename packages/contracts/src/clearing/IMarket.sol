@@ -2,14 +2,14 @@
 pragma solidity 0.8.35;
 
 /// @title IMarket
-/// @notice Canonical market-extension interface of the Synchra clearing
-///         kernel (paper/synchra.tex:396-407, `alg:market`). Every
+/// @notice Canonical market-extension interface of the Cerdic clearing
+///         kernel (paper/cerdic.tex:396-407, `alg:market`). Every
 ///         financial primitive deployed against the kernel — perpetuals,
 ///         FX derivatives, structured products — implements this surface
 ///         so the kernel can value, fund, and validate its positions
 ///         without knowing the primitive's internals.
 /// @dev    Positions are stored by the kernel as opaque bytes
-///         (paper/synchra.tex:409); the market extension owns the encoding.
+///         (paper/cerdic.tex:409); the market extension owns the encoding.
 ///         The MVP encoding is an `abi.encode` of the `MarketPosition`
 ///         struct below, written by `SettlementEngine.settleTrade`
 ///         (todo #11) and decoded by the extension's own
@@ -20,12 +20,12 @@ pragma solidity 0.8.35;
 ///         All four functions are `view`: they are pure reads over the
 ///         position bytes, the oracle price, and the market's own risk
 ///         parameters. The lazy funding-index mutation model
-///         (paper/synchra.tex:419-420) lives behind a separate
+///         (paper/cerdic.tex:419-420) lives behind a separate
 ///         non-view update path in the perp extension (todo #14), not
 ///         behind these getters.
 interface IMarket {
     /// @notice Canonical position record mirrored from
-    ///         `paper/synchra.tex:396-407`.
+    ///         `paper/cerdic.tex:396-407`.
     /// @param  marketId   Kernel-wide market identifier.
     /// @param  size       Signed position size (base units, 1e18-scaled).
     ///                    Positive = long, negative = short.
@@ -52,7 +52,7 @@ interface IMarket {
 
     /// @notice Funding payment accrued by a position over `period`,
     ///         computed lazily off the market's funding index
-    ///         (paper/synchra.tex:419-420).
+    ///         (paper/cerdic.tex:419-420).
     /// @param  positionId Identifier the extension uses to locate the
     ///         position.
     /// @param  period     Funding period (blocks or seconds at the
@@ -64,7 +64,7 @@ interface IMarket {
     /// @notice Validates that a new position of `size` backed by
     ///         `collateral` satisfies the market's open constraints —
     ///         initial-margin requirement and leverage ceiling
-    ///         (paper/synchra.tex:417-418).
+    ///         (paper/cerdic.tex:417-418).
     /// @param  size       Signed size to open (base units, 1e18-scaled).
     /// @param  collateral Margin offered for the position (1e18-scaled).
     /// @return True when the position may open.

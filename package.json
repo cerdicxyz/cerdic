@@ -1,8 +1,8 @@
 {
-  "name": "synchra",
+  "name": "cerdic",
   "version": "0.0.0",
   "private": true,
-  "description": "Synchra — privacy-preserving clearing and leverage layer for Arc",
+  "description": "Cerdic — privacy-preserving clearing and leverage layer for Arc",
   "engines": {
     "node": ">=20"
   },

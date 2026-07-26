@@ -1,8 +1,8 @@
 {
-  "name": "@synchra/shared",
+  "name": "@cerdic/shared",
   "version": "0.0.0",
   "private": true,
-  "description": "Synchra shared TypeScript types + protocol constants (collateral tiers, margin thresholds, USYC testnet address)",
+  "description": "Cerdic shared TypeScript types + protocol constants (collateral tiers, margin thresholds, USYC testnet address)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -14,7 +14,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "echo '@synchra/shared lint stub — eslint pending'"
+    "lint": "echo '@cerdic/shared lint stub — eslint pending'"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

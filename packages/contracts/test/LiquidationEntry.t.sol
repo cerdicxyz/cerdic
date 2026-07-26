@@ -43,7 +43,7 @@ contract MockMarkPriceOracle {
 /// @dev Stand-in market extension (todo #14): permissive validator, no-op
 ///      lifecycle hooks with an `onLiquidation` invocation record, and the
 ///      canonical `MarketPosition` decoder (absolute size, matching the
-///      kernel's opaque-bytes contract at paper/synchra.tex:409).
+///      kernel's opaque-bytes contract at paper/cerdic.tex:409).
 contract MockMarket is IMarket, IMarketLifecycle, IPositionDecoder {
     uint256 public onLiquidationCalls;
     address public lastLiquidatedUser;
@@ -100,7 +100,7 @@ contract MockMarket is IMarket, IMarketLifecycle, IPositionDecoder {
 
 /// @title  LiquidationEntryTest
 /// @notice Unit + fuzz tests for the clearing kernel's `LiquidationEntry.sol`
-///         (paper/synchra.tex:488-520 liquidation mechanism, lines 945-948
+///         (paper/cerdic.tex:488-520 liquidation mechanism, lines 945-948
 ///         penalty fee; plan todo #13). Covers the healthy / boundary /
 ///         breach transitions of `checkAndFlag`, the standard-liquidation
 ///         close-out with its 1% penalty split between liquidator and the

@@ -7,8 +7,8 @@ import {IMarketLifecycle} from "../clearing/IMarketLifecycle.sol";
 import {OracleHub} from "../oracle/OracleHub.sol";
 
 /// @title  BtcPerpMarket
-/// @notice BTC/USDC perpetual market extension for the Synchra clearing
-///         kernel (paper/synchra.tex:561-575, plan todo #14). Implements
+/// @notice BTC/USDC perpetual market extension for the Cerdic clearing
+///         kernel (paper/cerdic.tex:561-575, plan todo #14). Implements
 ///         continuous funding-index accrual with lazy PnL settlement, the
 ///         IMarket validator surface, all seven IMarketLifecycle callbacks,
 ///         and the IPositionDecoder surface — the four hats a registered
@@ -135,7 +135,7 @@ contract BtcPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, IPosition
     /// @notice Updates the cumulative funding index for `marketId` using
     ///         the continuous formula
     ///         `deltaF = clamp((P_mark - P_index) / P_index, -max_rate,
-    ///         +max_rate) * delta_t` (paper/synchra.tex:567).
+    ///         +max_rate) * delta_t` (paper/cerdic.tex:567).
     /// @dev    Permissionless: the update is a pure function of oracle
     ///         prices and block numbers — any keeper may call it. The
     ///         clamp ensures the per-block funding rate cannot exceed
@@ -185,7 +185,7 @@ contract BtcPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, IPosition
     /// @dev    Combines spot PnL `Q * (oraclePrice - entryPrice) / SCALE`
     ///         with lazy funding PnL
     ///         `Q * (F_current - F_entry) * P_index / SCALE^2`
-    ///         (paper/synchra.tex:569). `F_current` is computed on-the-fly
+    ///         (paper/cerdic.tex:569). `F_current` is computed on-the-fly
     ///         from the stored index plus the pending delta since the last
     ///         checkpoint, so the view path never mutates state.
     function getPnL(bytes32 positionId, uint256 oraclePrice) external view returns (int256) {

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Synchra",
+  title: "Cerdic",
   description:
     "Privacy-preserving clearing and leverage layer for Arc — stablecoin-native, agent-driven capital markets.",
 };

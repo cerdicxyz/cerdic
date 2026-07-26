@@ -5,8 +5,8 @@ pragma solidity 0.8.35;
 /// @notice Rolling 60-block window of per-block trade observations, used
 ///         by `MarketImpactTwap` (plan todo #21) to compute the on-chain
 ///         impact TWAP cited as the tertiary mark-price input
-///         (paper/synchra.tex:570 "on-chain impact mid-price",
-///         paper/synchra.tex:1059 "TWAP from CLOB trades").
+///         (paper/cerdic.tex:570 "on-chain impact mid-price",
+///         paper/cerdic.tex:1059 "TWAP from CLOB trades").
 /// @dev    Storage layout per market (61 slots):
 ///           - `latest` — the accumulator for the block currently being
 ///             written. Trades landing in the same block aggregate here;

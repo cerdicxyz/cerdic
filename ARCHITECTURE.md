@@ -1,4 +1,4 @@
-# Synchra — Private, Leveraged FX Perpetuals on Arc
+# Cerdic — Private, Leveraged FX Perpetuals on Arc
 
 ## System Overview
 
@@ -51,7 +51,7 @@ is still too slow for continuous order matching).
 Stellar-based private perp DEX) proves position validity with Groth16 circuits over
 Poseidon2 commitment/nullifier chains — real cryptographic privacy for every position, no
 enclave trust required. That is a stronger guarantee and a heavier build: circuit design,
-trusted setup, proving infrastructure for every state transition. Synchra's kernel already
+trusted setup, proving infrastructure for every state transition. Cerdic's kernel already
 does its most expensive computation off-chain (portfolio margin recomputation scales with a
 trader's entire cross-market position set, Section below) — adding per-position ZK proving
 on top compounds cost rather than removing trust. Sealed params + an authorized-TEE-settler
@@ -212,7 +212,7 @@ Keeper                          TEE Matcher                    Arc EVM
 
 ## TEE Deployment
 
-One binary (`synchra-tee-matcher`, Rust), two independent deployments. Same order-matching
+One binary (`cerdic-tee-matcher`, Rust), two independent deployments. Same order-matching
 and portfolio-margin logic runs on both; they attest independently and the kernel can
 require agreement from either (liveness/failover) or both (defense-in-depth quorum,
 Phase 1+) before honoring a settlement.
@@ -228,7 +228,7 @@ The proven pattern — same shape as our earlier `cer-perp` build.
 │  workload.operator.google.com/confidential-space               │
 │                                                               │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │  Container: synchra-tee-matcher (Rust)                    │  │
+│  │  Container: cerdic-tee-matcher (Rust)                    │  │
 │  │                                                          │  │
 │  │  ┌────────────────────┐  ┌───────────────────────────┐  │  │
 │  │  │  Decryption Key     │  │  Attestation Token         │  │  │
@@ -265,7 +265,7 @@ refuses to release the decryption key to anything but the exact measured enclave
 │                    AWS Nitro Enclave (EC2)                     │
 │                                                               │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │  synchra-tee-matcher (Rust, vsock-only I/O — no network,  │  │
+│  │  cerdic-tee-matcher (Rust, vsock-only I/O — no network,  │  │
 │  │  no disk, no SSH into the enclave itself)                 │  │
 │  │                                                          │  │
 │  │  ┌────────────────────┐  ┌───────────────────────────┐  │  │
@@ -387,7 +387,7 @@ zkVM-compressed DCAP path, own circuit or a borrowed verifier, not required for 
 contract FxPerpMarket is IMarket
   // EURC/USDC. Funding = interest-rate differential (r_quote - r_base).
   // Spot leg of a settled trade may route through StableFX PvP settlement
-  // instead of Synchra bootstrapping its own EURC/USDC liquidity.
+  // instead of Cerdic bootstrapping its own EURC/USDC liquidity.
 ```
 
 ## Portfolio Margin Model
@@ -502,7 +502,7 @@ correctness guarantee that lands a few seconds to minutes later.
 
 ```
 ├── paper/
-│   └── synchra.tex             # formal spec — kernel, margin proof sketch, security model
+│   └── cerdic.tex             # formal spec — kernel, margin proof sketch, security model
 │
 ├── packages/
 │   ├── contracts/               # Foundry / Solidity, Arc EVM
@@ -582,7 +582,7 @@ correctness guarantee that lands a few seconds to minutes later.
 - Portfolio margin upgrade: `f_S+f_C+f_L+f_K` replacing the current isolated-margin-only
   `RiskMonitor`.
 - `FxPerpMarket` (EURC/USDC) alongside the existing `BtcPerpMarket`.
-- `synchra-tee-matcher` (Rust), deployed to GCP Confidential Space (primary) implementing
+- `cerdic-tee-matcher` (Rust), deployed to GCP Confidential Space (primary) implementing
   the sealed-params / authorized-settler / stripped-events design above, replacing the
   `rfq-matcher` stub.
 - `GcpAttestationVerifier` contract + public-settlement fallback path.
@@ -613,7 +613,7 @@ vaults; migration path to Arc's protocol-level privacy roadmap (APS) if/when it 
 - [Automata DCAP Attestation](https://github.com/automata-network/automata-dcap-attestation) — reference for on-chain attestation verification patterns and gas costs, not currently depended on
 - [Marlin Kalypso](https://marlin.org/kalypso) — ZK-compressed TEE attestation verification, reference for a possible Phase 3 optimization
 - [Messari — TEE: A Privacy Engine for Institutional Onchain Markets](https://messari.io/report/tee-a-privacy-engine-for-institutional-onchain-markets)
-- `paper/synchra.tex` — formal specification, portfolio margin derivation, security analysis
+- `paper/cerdic.tex` — formal specification, portfolio margin derivation, security analysis
 - `/Users/mac/work/cer-perp` — prior private-perp-DEX build (Stellar/Soroban, dual
   Noir+RISC0 ZK stack); source of the sealed-params, authorized-settler, and
   stripped-events patterns adapted here

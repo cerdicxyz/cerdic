@@ -11,7 +11,7 @@ import {IMarketLifecycle} from "./IMarketLifecycle.sol";
 /// @notice Minimal mark-price surface the liquidation entry reads from.
 ///         Implemented by `OracleHub.sol` (todo #12) — the median of the
 ///         Pyth primary, Chainlink secondary, and impact-TWAP tertiary
-///         feeds (paper/synchra.tex:1055-1063). Until the hub is wired the
+///         feeds (paper/cerdic.tex:1055-1063). Until the hub is wired the
 ///         entry runs against a stub oracle set via `setMarkPriceOracle`.
 /// @dev    Prices are USD-denominated and scaled to 1e18
 ///         (i.e. `1e18 == $1.00`).
@@ -21,9 +21,9 @@ interface IMarkPriceOracle {
 }
 
 /// @title  LiquidationEntry
-/// @notice Liquidation entry point of the Synchra clearing kernel —
+/// @notice Liquidation entry point of the Cerdic clearing kernel —
 ///         the STANDARD stage of the liquidation waterfall
-///         (paper/synchra.tex:488-520) for the isolated-margin MVP.
+///         (paper/cerdic.tex:488-520) for the isolated-margin MVP.
 /// @dev    Two operations:
 ///
 ///         1. `checkAndFlag` — the liquidation-state transition of
@@ -44,7 +44,7 @@ interface IMarkPriceOracle {
 ///            counterparty (paper line 511-513: "close positions against
 ///            the public order book at market prices"), then routes the
 ///            liquidation penalty — 1% of the liquidated notional, the
-///            floor of the 1%-5% band at paper/synchra.tex:947 — out of
+///            floor of the 1%-5% band at paper/cerdic.tex:947 — out of
 ///            the trader's collateral to the liquidator and the insurance
 ///            fund (stub: an address credited inside `Account`; a
 ///            dedicated fund contract replaces it post-MVP).
@@ -101,7 +101,7 @@ contract LiquidationEntry {
 
     /// @notice Liquidation penalty in basis points of the liquidated
     ///         notional: 100 bps = 1%, the floor of the paper's 1%-5%
-    ///         band (paper/synchra.tex:947).
+    ///         band (paper/cerdic.tex:947).
     uint256 internal constant LIQUIDATION_PENALTY_BPS = 100;
 
     /// @notice Liquidator's share of the penalty in basis points; the

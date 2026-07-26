@@ -4,14 +4,14 @@ import {ICollateralEngine, ICollateralBalanceSource, IOracleConsumer} from "./IC
 import {ProtocolConstants} from "../lib/ProtocolConstants.sol";
 
 /// @title  CollateralEngine
-/// @notice Collateral engine of the Synchra clearing kernel
-///         (paper/synchra.tex:362-386). Owns the four-tier collateral
+/// @notice Collateral engine of the Cerdic clearing kernel
+///         (paper/cerdic.tex:362-386). Owns the four-tier collateral
 ///         classification (paper Table 1, lines 367-380) and the
 ///         effective-collateral valuation
 ///         `C_eff = Σ b_a · (1 − h_a) · p_a` (paper lines 384-386).
 /// @dev    MVP scope guardrails:
 ///         - Static haircuts only. Dynamic, risk-engine-adjusted haircuts
-///           are Phase 1 (paper/synchra.tex:378, line 1166) and explicitly
+///           are Phase 1 (paper/cerdic.tex:378, line 1166) and explicitly
 ///           out of scope; `registerAsset` validates every haircut against
 ///           the static per-tier ranges pinned in `ProtocolConstants`.
 ///         - Stub oracle. `oraclePriceOf` returns `1e18` ($1.00) for every
@@ -63,7 +63,7 @@ contract CollateralEngine is ICollateralEngine, ProtocolConstants {
     mapping(address => uint16) internal _haircutBps;
 
     /// @dev Registered asset list in registration order — the summation
-    ///      domain A of the `C_eff` formula (paper/synchra.tex:385).
+    ///      domain A of the `C_eff` formula (paper/cerdic.tex:385).
     address[] internal _assets;
 
     // ---------------------------------------------------------------------
@@ -157,7 +157,7 @@ contract CollateralEngine is ICollateralEngine, ProtocolConstants {
 
     /// @notice Registered collateral asset list in registration order — the
     ///         summation domain A of the `C_eff` formula
-    ///         (paper/synchra.tex:385), exposed so the liquidation entry
+    ///         (paper/cerdic.tex:385), exposed so the liquidation entry
     ///         (todo #13) can sweep a flagged account's collateral for the
     ///         liquidation penalty without a parallel registry.
     function registeredAssets() external view returns (address[] memory) {
@@ -214,7 +214,7 @@ contract CollateralEngine is ICollateralEngine, ProtocolConstants {
 
     /// @dev Validates `tier` is inside the paper's 1-4 taxonomy and
     ///      `haircutBps` inside the tier's static MVP range
-    ///      (paper/synchra.tex:367-380; ranges from `ProtocolConstants`).
+    ///      (paper/cerdic.tex:367-380; ranges from `ProtocolConstants`).
     ///      Assignment-based branches (no literal `return 0;`) keep every
     ///      line visible to `forge coverage` (see notepad learning #7).
     function _checkTierHaircut(uint8 tier, uint16 haircutBps) internal pure {

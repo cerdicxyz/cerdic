@@ -35,13 +35,13 @@
 % --- Title ---
 \title{
   \vspace{-1.5cm}
-  \textbf{Synchra: Private, Leveraged FX on Arc}
+  \textbf{Cerdic: Private, Leveraged FX on Arc}
   \vspace{-0.3cm}
 }
 
 \author{
-  Synchra Protocol Contributors\\[4pt]
-  \texttt{https://synchra.org}
+  Cerdic Protocol Contributors\\[4pt]
+  \texttt{https://cerdic.org}
 }
 
 \date{}
@@ -54,7 +54,7 @@
 \vspace{0.3cm}
 
 \begin{abstract}
-  \noindent Circle's Arc blockchain settles stablecoin value with sub-second finality and USDC-native gas, and Circle's own StableFX engine now settles \emph{spot} FX conversion between stablecoins on Arc~\cite{circlearc, circle_stablefx}. Neither provides \emph{leveraged} FX exposure, and neither hides who is trading what. Synchra is the layer above that: a clearing kernel that lets a trader post collateral once and open margined FX, crypto, and RWA positions against it, matched privately through a trusted execution environment (TEE) rather than a public order book. This paper describes the kernel, the portfolio margin model that makes leverage capital-efficient, the TEE matching design that makes it private, and where Synchra sits relative to existing onchain perpetuals (Ostium) and Arc's own settlement infrastructure (StableFX).
+  \noindent Circle's Arc blockchain settles stablecoin value with sub-second finality and USDC-native gas, and Circle's own StableFX engine now settles \emph{spot} FX conversion between stablecoins on Arc~\cite{circlearc, circle_stablefx}. Neither provides \emph{leveraged} FX exposure, and neither hides who is trading what. Cerdic is the layer above that: a clearing kernel that lets a trader post collateral once and open margined FX, crypto, and RWA positions against it, matched privately through a trusted execution environment (TEE) rather than a public order book. This paper describes the kernel, the portfolio margin model that makes leverage capital-efficient, the TEE matching design that makes it private, and where Cerdic sits relative to existing onchain perpetuals (Ostium) and Arc's own settlement infrastructure (StableFX).
 \end{abstract}
 
 \vspace{0.3cm}
@@ -74,7 +74,7 @@ Arc is a stablecoin-native chain: deterministic sub-second finality, USDC as nat
 
 What is missing is leverage and privacy. StableFX converts EURC to USDC at spot; it does not let a treasury hedge a EURC receivable with a margined FX forward, and every conversion it settles is visible onchain. A firm managing FX risk at size does not want its hedge ratio, timing, or currency exposure legible to anyone watching the chain.
 
-\textbf{Synchra} is a clearing kernel and margin engine that sits above Arc's settlement layer. It does three things:
+\textbf{Cerdic} is a clearing kernel and margin engine that sits above Arc's settlement layer. It does three things:
 
 \begin{enumerate}
   \item \textbf{Portfolio margin.} Collateral is posted once, against the whole account, not per position. A long EURC/USDC hedge can net against a USDC-denominated perpetual instead of each requiring its own margin.
@@ -82,11 +82,11 @@ What is missing is leverage and privacy. StableFX converts EURC to USDC at spot;
   \item \textbf{Yield-bearing collateral.} Collateral sitting behind a position earns yield (USYC and similar instruments) instead of sitting idle.
 \end{enumerate}
 
-FX is the first market because it is the one Arc's own roadmap is explicit about, and because Ostium already shows there is real demand for onchain leveraged FX/RWA exposure~\cite{ostium} -- just not privately, and not with portfolio margin. Section~\ref{sec:related} compares Synchra to both StableFX and Ostium directly.
+FX is the first market because it is the one Arc's own roadmap is explicit about, and because Ostium already shows there is real demand for onchain leveraged FX/RWA exposure~\cite{ostium} -- just not privately, and not with portfolio margin. Section~\ref{sec:related} compares Cerdic to both StableFX and Ostium directly.
 
 \subsection{What this paper covers}
 
-Section~\ref{sec:related} places Synchra against StableFX and Ostium concretely. Section~\ref{sec:model} defines actors and threat model. Section~\ref{sec:architecture} gives the layered design. Section~\ref{sec:clearing} is the clearing kernel; Section~\ref{sec:margin} is the portfolio margin formula and liquidation logic. Section~\ref{sec:markets} covers the market extension interface and the FX module specifically. Section~\ref{sec:privacy} is the TEE matching design. Section~\ref{sec:agents} and~\ref{sec:yield} cover agent accounts and yield-bearing collateral. Section~\ref{sec:economics} is the fee model. Section~\ref{sec:security} is a plain-language risk list. Section~\ref{sec:roadmap} is what ships first.
+Section~\ref{sec:related} places Cerdic against StableFX and Ostium concretely. Section~\ref{sec:model} defines actors and threat model. Section~\ref{sec:architecture} gives the layered design. Section~\ref{sec:clearing} is the clearing kernel; Section~\ref{sec:margin} is the portfolio margin formula and liquidation logic. Section~\ref{sec:markets} covers the market extension interface and the FX module specifically. Section~\ref{sec:privacy} is the TEE matching design. Section~\ref{sec:agents} and~\ref{sec:yield} cover agent accounts and yield-bearing collateral. Section~\ref{sec:economics} is the fee model. Section~\ref{sec:security} is a plain-language risk list. Section~\ref{sec:roadmap} is what ships first.
 
 \subsection{Risks, stated up front}
 
@@ -97,20 +97,20 @@ Section~\ref{sec:related} places Synchra against StableFX and Ostium concretely.
   \item \textbf{Smart contract risk.} Undiscovered bugs in the kernel could cause loss of funds despite audits and formal verification targets.
 \end{itemize}
 
-None of this is unique to Synchra -- it is inherent to onchain leverage and private execution generally -- but this paper is a design and a build plan, not an audited, production system.
+None of this is unique to Cerdic -- it is inherent to onchain leverage and private execution generally -- but this paper is a design and a build plan, not an audited, production system.
 
 %=============================================================================
 \section{Related Systems}
 \label{sec:related}
 %=============================================================================
 
-Rather than a generic DeFi literature survey, this section names the three systems Synchra sits between.
+Rather than a generic DeFi literature survey, this section names the three systems Cerdic sits between.
 
 \begin{table}[h]
   \centering
   \begin{tabular}{lccc}
     \toprule
-    & \textbf{StableFX} & \textbf{Ostium} & \textbf{Synchra} \\
+    & \textbf{StableFX} & \textbf{Ostium} & \textbf{Cerdic} \\
     \midrule
     Instrument & Spot FX conversion & Leveraged RWA/FX perps & Leveraged FX/RWA perps \\
     Margin model & N/A (spot) & Pooled LP vault & Portfolio margin \\
@@ -118,15 +118,15 @@ Rather than a generic DeFi literature survey, this section names the three syste
     Settlement chain & Arc & Arbitrum & Arc \\
     \bottomrule
   \end{tabular}
-  \caption{Synchra relative to the two systems closest to it.}
+  \caption{Cerdic relative to the two systems closest to it.}
   \label{tab:comparison}
 \end{table}
 
-\textbf{StableFX}~\cite{circle_stablefx} is Circle's own onchain FX engine: RFQ pricing aggregated across liquidity providers, payment-versus-payment settlement, live on Arc testnet since November 2025. It solves spot conversion. It has no leverage and no margin model, because it does not need one -- a spot conversion settles and is done. Synchra does not compete with StableFX; a Synchra FX position can settle its spot leg through it.
+\textbf{StableFX}~\cite{circle_stablefx} is Circle's own onchain FX engine: RFQ pricing aggregated across liquidity providers, payment-versus-payment settlement, live on Arc testnet since November 2025. It solves spot conversion. It has no leverage and no margin model, because it does not need one -- a spot conversion settles and is done. Cerdic does not compete with StableFX; a Cerdic FX position can settle its spot leg through it.
 
 \textbf{Ostium}~\cite{ostium} is a live perpetuals protocol (currently on Arbitrum) offering leveraged FX, commodities, and equity exposure against a single pooled LP vault, using a Pool-RFQ pricing model. It proves the demand for onchain leveraged FX exists -- it carries real open interest today. It is fully transparent (every position, size, and PnL is public), and its risk model is per-position against a shared LP pool rather than portfolio margin, so LPs absorb concentrated counterparty risk rather than the protocol netting offsetting exposure.
 
-Synchra's position: take the demand Ostium has already validated, remove the transparency, and replace the pooled-LP counterparty with portfolio-margined, kernel-settled positions -- on the chain whose settlement layer (StableFX, USDC/EURC, CCTP) is purpose-built for exactly this instrument class.
+Cerdic's position: take the demand Ostium has already validated, remove the transparency, and replace the pooled-LP counterparty with portfolio-margined, kernel-settled positions -- on the chain whose settlement layer (StableFX, USDC/EURC, CCTP) is purpose-built for exactly this instrument class.
 
 %=============================================================================
 \section{System Model}
@@ -199,7 +199,7 @@ Synchra's position: take the demand Ostium has already validated, remove the tra
     \draw[<->, thick] (clearing.south) -- (risk.north);
     \draw[->, thick] (risk.south) -- (settlement.north);
   \end{tikzpicture}
-  \caption{Synchra layers. Only settlement is one-directional -- everything above it can query and be queried.}
+  \caption{Cerdic layers. Only settlement is one-directional -- everything above it can query and be queried.}
   \label{fig:architecture}
 \end{figure}
 
@@ -261,7 +261,7 @@ Funding settlement and liquidation settlement follow the same shape: an event tr
 \label{sec:margin}
 %=============================================================================
 
-Margining each position independently over-collateralizes hedged accounts. A trader long 10 BTC-notional on one market and short 9.5 BTC-notional on another has 0.5 BTC of real risk but would post margin on 19.5 BTC of gross notional under isolated margin. Synchra margins the account, not the position.
+Margining each position independently over-collateralizes hedged accounts. A trader long 10 BTC-notional on one market and short 9.5 BTC-notional on another has 0.5 BTC of real risk but would post margin on 19.5 BTC of gross notional under isolated margin. Cerdic margins the account, not the position.
 
 \[
 \mathcal{M}(\mathcal{P}) = f_S(\mathcal{P}) + f_C(\mathcal{P}) + f_L(\mathcal{P}) + f_K(\mathcal{P})
@@ -322,7 +322,7 @@ A market extension implements one interface and a handful of lifecycle callbacks
 
 \subsection{FX perpetual (first module)}
 
-EURC/USDC at launch, additional pairs after. Funding follows the interest-rate differential, $r_{\text{FX}} = r_{\text{quote}} - r_{\text{base}}$. The spot leg of a settled trade can route through StableFX's PvP settlement rather than requiring Synchra to bootstrap its own EURC/USDC liquidity. This is the module the rest of the paper's examples assume.
+EURC/USDC at launch, additional pairs after. Funding follows the interest-rate differential, $r_{\text{FX}} = r_{\text{quote}} - r_{\text{base}}$. The spot leg of a settled trade can route through StableFX's PvP settlement rather than requiring Cerdic to bootstrap its own EURC/USDC liquidity. This is the module the rest of the paper's examples assume.
 
 \subsection{Later modules (not required for the FX thesis, kept for continuity)}
 
@@ -359,7 +359,7 @@ The trader encrypts an order to the TEE's public key; the enclave decrypts, matc
 \subsection{On-chain footprint of a private position}
 \label{sec:sealed}
 
-Matching an order privately is only half the claim -- the position that results has to stay private too, or the TEE only hid the five seconds before a trade. Synchra keeps two things off-chain in plaintext:
+Matching an order privately is only half the claim -- the position that results has to stay private too, or the TEE only hid the five seconds before a trade. Cerdic keeps two things off-chain in plaintext:
 
 \begin{itemize}
   \item \textbf{Sealed position parameters.} Side, leverage, entry price, size, and any TP/SL thresholds are never stored as separate on-chain fields. They are collapsed into one \texttt{sealedParams: bytes} blob, encrypted to the TEE's key, alongside a plain \texttt{collateral} amount and \texttt{status} the kernel needs for solvency accounting. Any check that would otherwise read a plaintext field -- a TP/SL trigger, a liquidation solvency check, a margin recomputation -- runs \emph{inside} the enclave against the decrypted blob; the contract never re-derives it from public state.
@@ -383,7 +383,7 @@ The kernel authorizes exactly one caller -- the attested TEE -- to invoke settle
   \label{tab:events}
 \end{table}
 
-This is deliberately not full position-level ZK privacy (commitment/nullifier circuits proving position validity without any party but the trader ever seeing the plaintext, as in comparable Stellar-based designs). That is a stronger, ZK-native version of the same idea, and a heavier build; sealed params plus an authorized-settler contract gets most of the same on-chain opacity with Solidity and a TEE, no circuit design required, and composes cleanly with the ZK layer already on Synchra's roadmap (Section~\ref{sec:roadmap}) if solvency-proof-style privacy is needed later.
+This is deliberately not full position-level ZK privacy (commitment/nullifier circuits proving position validity without any party but the trader ever seeing the plaintext, as in comparable Stellar-based designs). That is a stronger, ZK-native version of the same idea, and a heavier build; sealed params plus an authorized-settler contract gets most of the same on-chain opacity with Solidity and a TEE, no circuit design required, and composes cleanly with the ZK layer already on Cerdic's roadmap (Section~\ref{sec:roadmap}) if solvency-proof-style privacy is needed later.
 
 Two other execution modes exist for markets that do not need this: a \textbf{public CLOB} for transparent price discovery, and \textbf{RFQ} for block trades where a taker requests quotes and settles atomically against the best one.
 
@@ -484,7 +484,7 @@ ZK solvency attestation for institutions; ZK-compressed TEE attestation verifica
 \label{sec:conclusion}
 %=============================================================================
 
-Arc settles stablecoin value. StableFX settles spot FX conversion on top of it. Neither gives a trader leverage, and neither hides an order before it executes. Synchra is the layer that does both: post collateral once, get portfolio-margined leverage across correlated positions, match privately through a TEE, settle through the same rails Circle already built. Ostium already proved leveraged onchain FX/RWA has demand; Synchra's bet is that the next version of that market is private and portfolio-margined, on the chain built specifically for stablecoin-native FX.
+Arc settles stablecoin value. StableFX settles spot FX conversion on top of it. Neither gives a trader leverage, and neither hides an order before it executes. Cerdic is the layer that does both: post collateral once, get portfolio-margined leverage across correlated positions, match privately through a TEE, settle through the same rails Circle already built. Ostium already proved leveraged onchain FX/RWA has demand; Cerdic's bet is that the next version of that market is private and portfolio-margined, on the chain built specifically for stablecoin-native FX.
 
 \paragraph{Acknowledgements.} We thank the Circle Arc and Encode Club communities for the accelerator context that motivated this work.
 

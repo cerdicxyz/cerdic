@@ -5,7 +5,7 @@ import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessContr
 /// @title IPositionDecoder
 /// @notice Per-market decoder surface the position engine uses to read typed
 ///         metadata out of a position's opaque bytes
-///         (paper/synchra.tex:396-411).
+///         (paper/cerdic.tex:396-411).
 /// @dev    Implemented by each market extension — the perp extension
 ///         (`BtcPerpMarket.sol`, todo #14) decodes its own encoded
 ///         `MarketPosition` struct. The kernel stays market-agnostic: it
@@ -23,7 +23,7 @@ interface IPositionDecoder {
     /// @return entryPrice Volume-weighted entry price (1e18-scaled USD).
     /// @return margin     Margin locked against the position (1e18-scaled).
     /// @return leverage   Per-market leverage ceiling, not effective
-    ///                    leverage (paper/synchra.tex:410-411).
+    ///                    leverage (paper/cerdic.tex:410-411).
     function getMetadata(bytes calldata positionData)
         external
         view
@@ -31,15 +31,15 @@ interface IPositionDecoder {
 }
 
 /// @title  PositionEngine
-/// @notice Position engine of the Synchra clearing kernel
-///         (paper/synchra.tex:388-411). Maintains the position set
+/// @notice Position engine of the Cerdic clearing kernel
+///         (paper/cerdic.tex:388-411). Maintains the position set
 ///         `P = {p_m | m in M}` per account (paper line 357-360), storing
 ///         each position as opaque bytes (paper line 409) so the kernel
 ///         stays market-agnostic while market extensions own their own
 ///         encoding.
 /// @dev    MVP scope guardrails:
 ///         - No funding accrual — the lazy funding-index model
-///           (paper/synchra.tex:419-420) lives in the perp market
+///           (paper/cerdic.tex:419-420) lives in the perp market
 ///           extension (todo #14).
 ///         - No portfolio margin — cross-market offsets are todo #15;
 ///           this engine is a dumb store plus a decoder registry.
@@ -70,7 +70,7 @@ contract PositionEngine is AccessControl {
     // ---------------------------------------------------------------------
 
     /// @notice Position set P, keyed by trader then market ID. Values are
-    ///         opaque bytes (paper/synchra.tex:409); the engine never
+    ///         opaque bytes (paper/cerdic.tex:409); the engine never
     ///         interprets them.
     mapping(address => mapping(bytes32 => bytes)) internal _positions;
 
@@ -125,7 +125,7 @@ contract PositionEngine is AccessControl {
     /// @notice Stores `positionData` as `trader`'s position in `marketId`,
     ///         overwriting any existing position. Opaque to the kernel —
     ///         market extensions encode their own struct into bytes
-    ///         (paper/synchra.tex:409).
+    ///         (paper/cerdic.tex:409).
     /// @dev    Internal: the settlement engine (todo #11) calls this from
     ///         its `IMarket`-validated trade path. Gas budget 50k covers a
     ///         fresh two-slot store plus the event; cost scales ~20k per
@@ -157,7 +157,7 @@ contract PositionEngine is AccessControl {
     // ---------------------------------------------------------------------
 
     /// @notice Returns `trader`'s opaque position bytes for `marketId`
-    ///         (paper/synchra.tex:409). Empty when no position exists.
+    ///         (paper/cerdic.tex:409). Empty when no position exists.
     function load(address trader, bytes32 marketId) external view returns (bytes memory) {
         return _positions[trader][marketId];
     }
@@ -165,7 +165,7 @@ contract PositionEngine is AccessControl {
     /// @notice Returns the typed metadata of `trader`'s position in
     ///         `marketId` by delegating to the market's registered
     ///         decoder — the "typed accessor" over the opaque bytes the
-    ///         risk engine reads (paper/synchra.tex:409).
+    ///         risk engine reads (paper/cerdic.tex:409).
     /// @dev    Reverts with `DecoderNotRegistered` when no decoder is
     ///         registered for `marketId`; decoding semantics for empty
     ///         bytes belong to the market extension's decoder.

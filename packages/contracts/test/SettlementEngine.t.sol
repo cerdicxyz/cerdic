@@ -152,7 +152,7 @@ contract SettlementHandler is Test {
 
 /// @title  SettlementEngineTest
 /// @notice Unit + fuzz + invariant tests for the clearing kernel's
-///         `SettlementEngine.sol` (paper/synchra.tex:413-420, plan todo
+///         `SettlementEngine.sol` (paper/cerdic.tex:413-420, plan todo
 ///         #11). Covers the happy two-sided settle, hook-revert
 ///         propagation, `validateOpen == false` on either side (with
 ///         atomicity), the upfront-premium transfer path and its failure
@@ -226,7 +226,7 @@ contract SettlementEngineTest is Test {
     /// @notice A matched trade writes BOTH sides' positions in one call:
     ///        long gets `+size`, short gets `-size`, both at the execution
     ///        price with the engine-computed IMR margin and the MVP
-    ///        leverage ceiling (paper/synchra.tex:415-419).
+    ///        leverage ceiling (paper/cerdic.tex:415-419).
     function test_SettleTradeStoresBothPositions() public {
         _settleCanonical();
 
@@ -270,7 +270,7 @@ contract SettlementEngineTest is Test {
     /// @notice The typed metadata read path (`PositionEngine.getPositionMetadata`)
     ///         decodes what `settleTrade` stored, via the market's own
     ///         decoder — the kernel's opaque-bytes contract holds end to
-    ///         end (paper/synchra.tex:409).
+    ///         end (paper/cerdic.tex:409).
     function test_SettleTradeMetadataRoundTripsThroughDecoder() public {
         _settleCanonical();
 
@@ -378,7 +378,7 @@ contract SettlementEngineTest is Test {
     }
 
     // ---------------------------------------------------------------------
-    // Premium path (StructuredProductLimit, paper/synchra.tex:419).
+    // Premium path (StructuredProductLimit, paper/cerdic.tex:419).
     // ---------------------------------------------------------------------
 
     /// @notice The upfront premium travels buyer -> seller at settlement:

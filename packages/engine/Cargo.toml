@@ -11,7 +11,7 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/synchra/synchra"
+repository = "https://github.com/cerdic/cerdic"
 
 [workspace.dependencies]
 # Async runtime + test helpers.

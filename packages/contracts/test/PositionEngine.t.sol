@@ -42,7 +42,7 @@ contract MockPositionDecoder is IPositionDecoder {
 
 /// @title  PositionEngineTest
 /// @notice Unit tests for the clearing kernel's `PositionEngine.sol`
-///         (paper/synchra.tex:388-411, plan todo #10). Covers the
+///         (paper/cerdic.tex:388-411, plan todo #10). Covers the
 ///         store/load round-trip over opaque bytes, slot clearing, the
 ///         empty read for unknown positions, the per-market decoder
 ///         registry with typed metadata reads, the admin gate on
@@ -82,7 +82,7 @@ contract PositionEngineTest is Test {
 
     /// @notice Round-trip: bytes written by `_store` come back from `load`
     ///         bit-for-bit — the kernel treats them as opaque
-    ///         (paper/synchra.tex:409).
+    ///         (paper/cerdic.tex:409).
     function test_StoreLoadRoundTrip() public {
         bytes memory positionData = _positionBytes();
 
@@ -233,7 +233,7 @@ contract PositionEngineTest is Test {
 
     /// @notice With a mock decoder registered, `getPositionMetadata`
     ///         decodes the opaque bytes into the typed quadruple the risk
-    ///         engine reads (paper/synchra.tex:409).
+    ///         engine reads (paper/cerdic.tex:409).
     function test_GetPositionMetadataViaRegisteredDecoder() public {
         vm.prank(admin);
         engine.registerDecoder(MARKET_ID, address(decoder));

@@ -43,7 +43,7 @@ pub type Address = String;
 /// Canonical per-market position record.
 ///
 /// Mirrors `IMarket.MarketPosition` from
-/// `paper/synchra.tex:396-407` and the TS interface
+/// `paper/cerdic.tex:396-407` and the TS interface
 /// `MarketPosition` in `packages/shared/src/types.ts`.
 ///
 /// `size` sign convention: positive = long, negative = short.

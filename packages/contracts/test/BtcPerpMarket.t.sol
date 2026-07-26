@@ -38,7 +38,7 @@ contract MockOracleHub {
 
 /// @title  BtcPerpMarketTest
 /// @notice Unit + fuzz tests for the BTC/USDC perpetual market extension
-///         (paper/synchra.tex:561-575, plan todo #14). Covers the happy
+///         (paper/cerdic.tex:561-575, plan todo #14). Covers the happy
 ///         open/close path, leverage and margin validation reverts,
 ///         funding-index monotonicity in a stable market, the getPnL
 ///         formula (spot + lazy funding) within 1 wei for fuzzed prices,

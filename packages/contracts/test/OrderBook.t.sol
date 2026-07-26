@@ -84,7 +84,7 @@ contract MockCollateralEngine is ICollateralEngine {
 // ---------------------------------------------------------------------------
 
 /// @title  OrderBookTest
-/// @notice Unit tests for `OrderBook.sol` (paper/synchra.tex:619-629,
+/// @notice Unit tests for `OrderBook.sol` (paper/cerdic.tex:619-629,
 ///         plan todo #17). Covers >=7 required scenarios plus gas benchmarks.
 contract OrderBookTest is Test {
     OrderBook internal orderBook;

@@ -37,7 +37,7 @@ contract MockOracle is IOracleConsumer {
 
 /// @title  CollateralEngineTest
 /// @notice Unit tests for the clearing kernel's `CollateralEngine.sol`
-///         (paper/synchra.tex:362-386, plan todo #9). Covers the static
+///         (paper/cerdic.tex:362-386, plan todo #9). Covers the static
 ///         MVP tier basket (T1 USDC at 0 bps, T2 USYC at 200 bps), the
 ///         tier-haircut monotonicity invariant (fuzzed), the
 ///         `C_eff = Σ b_a · (1 − h_a) · p_a` valuation against
@@ -85,7 +85,7 @@ contract CollateralEngineTest is Test {
         vm.stopPrank();
     }
 
-    /// @dev Paper Table 1 haircut ranges (paper/synchra.tex:367-380),
+    /// @dev Paper Table 1 haircut ranges (paper/cerdic.tex:367-380),
     ///      hardcoded so the test encodes the paper spec independently of
     ///      the constants the engine consumes.
     function _rangeOf(uint8 tier) internal pure returns (uint256 minBps, uint256 maxBps) {
@@ -417,7 +417,7 @@ contract CollateralEngineTest is Test {
     /// @notice Paper example (plan todo #9): 1000 USDC at 0% haircut plus
     ///         1000 USYC at 2% haircut values to $1980 of effective
     ///         collateral — `C_eff = Σ b_a · (1 − h_a) · p_a`
-    ///         (paper/synchra.tex:384-386).
+    ///         (paper/cerdic.tex:384-386).
     function test_EffectiveCollateralMatchesPaperExample() public {
         vm.startPrank(trader);
         account.deposit(address(usdc), DEPOSIT_AMOUNT);
