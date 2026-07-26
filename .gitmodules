@@ -1,9 +1,0 @@
-[submodule "packages/contracts/lib/pyth-sdk-solidity"]
-	path = packages/contracts/lib/pyth-sdk-solidity
-	url = https://github.com/pyth-network/pyth-sdk-solidity
-[submodule "packages/contracts/lib/chainlink-evm"]
-	path = packages/contracts/lib/chainlink-evm
-	url = https://github.com/smartcontractkit/chainlink-evm
-[submodule "packages/contracts/lib/openzeppelin-contracts"]
-	path = packages/contracts/lib/openzeppelin-contracts
-	url = https://github.com/openzeppelin/openzeppelin-contracts

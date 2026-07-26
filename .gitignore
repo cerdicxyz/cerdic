@@ -8,4 +8,9 @@ next-env.d.ts
 .omo/evidence/
 .omo/
 lcov.info
+.DS_Storelib/
+app/package-lock.json
+*.tsbuildinfo
+app/vite.config.d.ts
+app/vite.config.js
 .DS_Store
