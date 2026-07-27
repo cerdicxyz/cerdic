@@ -1,0 +1,17 @@
+[package]
+name = "sp1-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sp1-host"
+path = "src/main.rs"
+
+[dependencies]
+sp1-sdk = { version = "6", features = ["blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+hex = "0.4"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }

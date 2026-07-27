@@ -1,0 +1,28 @@
+services:
+  # Local Arc-EVM-equivalent chain for the tiny MVP. Point RPC_URL at Arc
+  # Testnet instead (see README) once you're ready to leave local dev.
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    platform: linux/amd64
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--chain-id", "31337"]
+    ports:
+      - "8545:8545"
+
+  # The TEE matcher. This is a plain container today (local dev mode) — see
+  # tee/Dockerfile and ARCHITECTURE.md's TEE Deployment section for what
+  # changes to make this a real GCP Confidential Space / AWS Nitro workload.
+  tee:
+    build:
+      context: .
+      dockerfile: tee/Dockerfile
+    env_file: ./tee/.env
+    environment:
+      # override RPC_URL so the container reaches the anvil service by name,
+      # not localhost — tee/.env can keep RPC_URL=http://127.0.0.1:8545 for
+      # running the tee service outside Docker.
+      RPC_URL: http://anvil:8545
+    ports:
+      - "8787:8787"
+    depends_on:
+      - anvil

@@ -1,0 +1,18 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.24"
+evm_version = "cancun"
+optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./" }]
+# Demo.s.sol shells out to tiny/client/src/ffi.ts for the one thing Solidity
+# can't do itself (NaCl box encryption + HTTP to the TEE). ffi runs arbitrary
+# commands from script code — fine for this local demo tooling, never enable
+# it for a script anyone else's input reaches.
+ffi = true
+
+[profile.arc_testnet]
+eth_rpc_url = "${ARC_TESTNET_RPC}"

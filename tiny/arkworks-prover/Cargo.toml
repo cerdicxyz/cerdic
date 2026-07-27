@@ -1,0 +1,33 @@
+[workspace]
+# Empty — marks this as its own workspace root so Cargo doesn't walk up and
+# attach it to the repo root's packages/engine workspace.
+
+[package]
+name = "arkworks-prover"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arkworks_prover"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arkworks-prover"
+path = "src/main.rs"
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-ec = "0.5"
+ark-relations = "0.5"
+ark-r1cs-std = "0.5"
+ark-groth16 = "0.5"
+ark-snark = "0.5"
+ark-std = { version = "0.5", features = ["std"] }
+rand_chacha = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+
+[profile.release]
+opt-level = 3

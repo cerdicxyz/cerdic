@@ -1,0 +1,13 @@
+[package]
+name = "position-commitment-sp1"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "position-commitment-sp1"
+path = "src/main.rs"
+
+[dependencies]
+sp1-zkvm = "6"
+sha2 = { version = "0.10", default-features = false, features = ["compress"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
