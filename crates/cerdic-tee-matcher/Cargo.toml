@@ -17,7 +17,7 @@ tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-alloy = { workspace = true, features = ["k256", "serde", "signer-local"] }
+alloy = { workspace = true, features = ["k256", "serde", "signer-local", "provider-http", "rpc-types-eth", "reqwest", "sol-types"] }
 
 axum = "0.7"
 tracing = "0.1"

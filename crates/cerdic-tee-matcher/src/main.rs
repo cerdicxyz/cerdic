@@ -7,6 +7,7 @@ mod decrypt;
 mod keystore;
 mod logging;
 mod proof;
+mod settle;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
