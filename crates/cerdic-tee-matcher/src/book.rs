@@ -7,8 +7,8 @@
 //! A balanced tree gives O(log n) insert/remove per price level and,
 //! worse, scatters price levels across the heap with no cache locality:
 //! every level touched is a pointer chase to a new allocation. On the hot
-//! path of a matching engine — insert, cancel, and walk-the-book-until-
-//! filled, thousands of times a second — that adds up. It's *correct*,
+//! path of a matching engine (insert, cancel, and walk-the-book-until-
+//! filled, thousands of times a second), that adds up. It's *correct*,
 //! it's just not what a shop running this at HFT latency would ship.
 //!
 //! # What this does instead
@@ -20,8 +20,8 @@
 //! O(1) with no tree traversal and excellent cache locality (adjacent
 //! price levels are adjacent in memory). Each level is a FIFO queue
 //! implemented as an intrusive doubly-linked list over a slab arena of
-//! order nodes (`Vec<Option<OrderNode>>`), not a `Box`/`Rc` per order —
-//! inserting, removing, and splicing a node is index arithmetic, not
+//! order nodes (`Vec<Option<OrderNode>>`), not a `Box`/`Rc` per order.
+//! Inserting, removing, and splicing a node is index arithmetic, not
 //! allocator traffic. Order lookup for cancel is direct array indexing
 //! (order IDs are arena slots, assigned by the book), not a `HashMap`, so
 //! there's no hashing on the cancel path either.
@@ -33,11 +33,11 @@
 //! # Finding the next occupied level: a hierarchical bitmap
 //!
 //! When the best-price level empties (fully filled or cancelled), the
-//! book needs the next occupied level. A dense array makes that a scan —
+//! book needs the next occupied level. A dense array makes that a scan,
 //! fine on the happy path (price drifts gradually, the next level is
 //! usually right there), bad on the adversarial one (a sweep clears a
 //! wide contiguous range and the next resting order is far away).
-//! `Occupancy` (see below) tracks level occupancy in a two-tier bitmap —
+//! `Occupancy` (see below) tracks level occupancy in a two-tier bitmap,
 //! the same core trick Monad's on-chain "Octopus Heap" order book design
 //! uses to skip empty price ticks, adapted here for worst-case-fast
 //! in-memory lookup rather than to minimize gas-metered storage reads.
@@ -48,8 +48,8 @@
 //! # The one real tradeoff
 //!
 //! A dense array needs bounded, contiguous indices. `Ladder` grows to
-//! cover whatever tick range has actually been quoted and never shrinks —
-//! fine for a market trading in a bounded band (which every real market
+//! cover whatever tick range has actually been quoted and never shrinks.
+//! Fine for a market trading in a bounded band (which every real market
 //! does, moment to moment), but a pathological order miles from the
 //! touch would allocate a large, mostly-empty array. Production books
 //! handle this with periodic re-basing (drop the array, rebuild centered
@@ -57,7 +57,7 @@
 //! resting orders; this implementation notes the tradeoff rather than
 //! solving a problem this venue's realistic tick ranges don't create.
 
-// Not wired into main.rs yet — the API layer (POST /order) that will call
+// Not wired into main.rs yet. The API layer (POST /order) that will call
 // OrderBook::submit lands in a later milestone. Fully exercised by the
 // tests below in the meantime.
 #![allow(dead_code)]
@@ -69,12 +69,12 @@ pub type OrderId = u32;
 /// oracle-scaled unit (e.g. 1e18) the rest of the kernel uses.
 pub type Tick = u64;
 pub type Qty = u64;
-/// Opaque owner identifier, used only for self-trade prevention — the
+/// Opaque owner identifier, used only for self-trade prevention. The
 /// caller owns the mapping to a real identity (e.g. `portfolioKey`).
 pub type OwnerId = u64;
 /// Expiry timestamp, in whatever monotonic unit the caller's `now` (see
 /// `OrderBook::submit`) is denominated in (block number, unix seconds,
-/// etc.) — the book itself is agnostic, it only ever compares `now` to a
+/// etc.). The book itself is agnostic, it only ever compares `now` to a
 /// stored expiry with `>=`.
 pub type Timestamp = u64;
 
@@ -92,7 +92,7 @@ fn opposite_side(side: Side) -> Side {
 pub enum TimeInForce {
     /// Rest any unfilled remainder in the book until cancelled.
     GoodTilCancel,
-    /// Rest the remainder, but drop it once `now >= expiry` — checked
+    /// Rest the remainder, but drop it once `now >= expiry`, checked
     /// lazily, the moment matching would otherwise touch it, not on a
     /// timer (see module docs, "Lazy expiry").
     GoodTilTime(Timestamp),
@@ -150,15 +150,15 @@ impl Level {
 }
 
 /// Hierarchical occupancy bitmap over a `Ladder`'s levels: bit `i` set
-/// means level `i` has resting orders. Two tiers — `words` (one bit per
+/// means level `i` has resting orders. Two tiers, `words` (one bit per
 /// level) and `summary` (one bit per `words` entry, set iff that word is
-/// nonzero) — so finding the next/previous occupied level never has to
+/// nonzero), so finding the next/previous occupied level never has to
 /// visit an empty one individually.
 ///
 /// This is the same core trick Monad's "Octopus Heap" on-chain order
 /// book design uses to jump between active price regions without
-/// scanning empty ticks — there, to avoid gas-metered storage reads;
-/// here, to give worst-case fast level lookup instead of relying on the
+/// scanning empty ticks. There, it's to avoid gas-metered storage reads;
+/// here, it's to give worst-case fast level lookup instead of relying on the
 /// happy-path assumption that price only ever drifts a short distance
 /// between touches. A resting order at one edge of a wide, mostly-empty
 /// book and a sweep that clears everything in between is exactly the
@@ -178,7 +178,7 @@ impl Occupancy {
         }
     }
 
-    /// Shifts every set bit up by `shift` positions — the bitmap's side
+    /// Shifts every set bit up by `shift` positions, the bitmap's side
     /// of `Ladder::ensure`'s prepend-on-rebase. O(current size), the same
     /// cost class as the array prepend it accompanies.
     fn shift_up(&mut self, shift: usize, new_level_count: usize) {
@@ -333,7 +333,7 @@ impl Ladder {
         self.occupancy.clear(idx);
     }
 
-    /// Next occupied level at or after `idx`, via the occupancy bitmap —
+    /// Next occupied level at or after `idx`, via the occupancy bitmap.
     /// O(1) amortized, not a per-level scan.
     fn next_occupied_from(&self, idx: usize) -> Option<usize> {
         self.occupancy.next_set_from(idx)
@@ -344,8 +344,8 @@ impl Ladder {
         self.occupancy.prev_set_from(idx)
     }
 
-    /// Next occupied level strictly worse than `from_idx` on this side —
-    /// bids get worse as the index decreases (best bid is the highest
+    /// Next occupied level strictly worse than `from_idx` on this side.
+    /// Bids get worse as the index decreases (best bid is the highest
     /// tick), asks get worse as the index increases (best ask is the
     /// lowest tick). Shared by `advance_best_from` (mutating) and
     /// `available_to_match` (read-only), so the two can't drift apart on
@@ -358,7 +358,7 @@ impl Ladder {
     }
 
     /// Index for `tick` if that level has ever been allocated (does not
-    /// grow the array — used on the read/cancel path where a miss just
+    /// grow the array, used on the read/cancel path where a miss just
     /// means "no such level").
     fn index_of(&self, tick: Tick) -> Option<usize> {
         if self.levels.is_empty() || tick < self.base_tick {
@@ -403,17 +403,17 @@ pub struct SubmitResult {
     pub resting_id: Option<OrderId>,
     pub resting_qty: Qty,
     /// Resting orders the matching walk removed because they'd expired
-    /// (`now >= expiry`) when it reached them — not traded against, just
+    /// (`now >= expiry`) when it reached them. Not traded against, just
     /// pruned in passing. The caller should treat these as cancelled,
     /// not filled.
     pub expired: Vec<OrderId>,
     /// Resting orders cancelled because they belonged to the same
     /// `owner` as this incoming order (self-trade prevention, "cancel
-    /// resting" policy — the standing order loses, not the incoming
+    /// resting" policy: the standing order loses, not the incoming
     /// one). Not traded against.
     pub self_trade_cancelled: Vec<OrderId>,
     /// Set when `post_only` was true and the order would have crossed
-    /// the book. The order was rejected in full — `fills` is empty and
+    /// the book. The order was rejected in full: `fills` is empty and
     /// nothing rests.
     pub post_only_rejected: bool,
     /// Set when `tif` was `FillOrKill` and the book could not fill the
@@ -492,7 +492,7 @@ impl OrderBook {
     /// Accesses a live arena slot. Every call site holds an index that
     /// came from a level's `head`/`tail`, or a node's `prev`/`next`,
     /// which by construction is either `NIL` (checked separately by the
-    /// caller) or a currently-live slot — a slot ever going missing here
+    /// caller) or a currently-live slot. A slot ever going missing here
     /// means the arena's own invariants broke, not a normal runtime
     /// condition, hence the panic rather than an `Option` return the
     /// caller would have to handle everywhere for a case that can't
@@ -554,7 +554,7 @@ impl OrderBook {
 
     /// After the level at `tick` on `side` has just emptied, advances the
     /// cached best price to the next occupied level via the occupancy
-    /// bitmap — jumps directly to it instead of scanning intervening
+    /// bitmap, jumping directly to it instead of scanning intervening
     /// empty levels one at a time.
     fn advance_best_from(&mut self, side: Side, emptied_tick: Tick) {
         let ladder = self.ladder(side);
@@ -567,7 +567,7 @@ impl OrderBook {
     }
 
     /// Removes a live order's arena node from its level's linked list and
-    /// frees the slot. Does not touch `best_bid`/`best_ask` — the caller
+    /// frees the slot. Does not touch `best_bid`/`best_ask`; the caller
     /// decides whether the level emptied and advances the cursor.
     fn unlink(&mut self, idx: u32) -> OrderNode {
         let node = self.take_slot(idx);
@@ -618,14 +618,10 @@ impl OrderBook {
         Some((tick, node.qty))
     }
 
-    /// Submits a new limit order: matches immediately against the
-    /// opposite side at prices that cross, then rests any remainder.
-    /// Price-time priority: at each price level, the resting order that
-    /// arrived first (the level's FIFO head) fills first.
     /// Read-only walk mirroring `submit`'s matching loop, used only to
     /// answer "could a Fill-or-Kill order for `qty` be fully satisfied
     /// right now?" before committing any state change. Must skip exactly
-    /// the same orders `submit` would skip (expired, self-owned) — if
+    /// the same orders `submit` would skip (expired, self-owned). If
     /// this ever drifts from `submit`'s real skip logic, FOK can
     /// overestimate available liquidity and let a partial fill through
     /// as if it were all-or-nothing, which is the one bug this order

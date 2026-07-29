@@ -56,7 +56,7 @@ fn level_color(level: &Level) -> Style {
 }
 
 /// Collects an event's fields into `message` (the `message` field, if
-/// present) plus an ordered `key=value` tail for everything else — mirrors
+/// present) plus an ordered `key=value` tail for everything else. Mirrors
 /// how reth's own formatter separates the human sentence from the
 /// structured context that follows it.
 #[derive(Default)]
@@ -99,28 +99,28 @@ where
         let ansi = writer.has_ansi_escapes();
         let dim = if ansi { Style::new().dimmed() } else { Style::new() };
 
-        // Timestamp — dimmed, subsecond RFC3339, UTC (the only sane choice
+        // Timestamp, dimmed, subsecond RFC3339, UTC (the only sane choice
         // for a process whose logs get aggregated across enclaves/clouds).
         let now = time::OffsetDateTime::now_utc();
         let ts = now.format(&Rfc3339).unwrap_or_default();
         write!(writer, "{}", dim.paint(ts))?;
         write!(writer, " ")?;
 
-        // Level — fixed 5-char width so every line's message column lines
+        // Level, fixed 5-char width so every line's message column lines
         // up, colored per level_color above.
         let level = event.metadata().level();
         let style = if ansi { level_color(level) } else { Style::new() };
         write!(writer, "{}", style.paint(format!("{level:>5}")))?;
         write!(writer, " ")?;
 
-        // Target — dimmed, e.g. `cerdic_tee_matcher::book`. This is the
+        // Target, dimmed, e.g. `cerdic_tee_matcher::book`. This is the
         // single most useful field for filtering scrollback by subsystem,
         // so it stays even at the default (non-verbose) format.
         let target = event.metadata().target();
         write!(writer, "{}", dim.paint(target))?;
         write!(writer, ": ")?;
 
-        // Span context, if any — reth shows the active span chain inline
+        // Span context, if any. reth shows the active span chain inline
         // so a log line from inside `settle_match{match_id=..}` is
         // self-describing without cross-referencing an earlier line.
         if let Some(scope) = ctx.event_scope() {

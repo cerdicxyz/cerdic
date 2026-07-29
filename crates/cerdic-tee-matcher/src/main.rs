@@ -1,4 +1,4 @@
-//! `cerdic-tee-matcher` — entrypoint. See `docs/spec-contracts-tee.md` for
+//! `cerdic-tee-matcher` entrypoint. See `docs/spec-contracts-tee.md` for
 //! the full module layout and HTTP API this binary implements.
 
 mod book;
