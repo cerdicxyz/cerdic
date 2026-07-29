@@ -30,6 +30,21 @@
 //! amortized, and the constant factor is small (array indexing + a few
 //! pointer-width writes) rather than tree-rebalancing or hash computation.
 //!
+//! # Finding the next occupied level: a hierarchical bitmap
+//!
+//! When the best-price level empties (fully filled or cancelled), the
+//! book needs the next occupied level. A dense array makes that a scan —
+//! fine on the happy path (price drifts gradually, the next level is
+//! usually right there), bad on the adversarial one (a sweep clears a
+//! wide contiguous range and the next resting order is far away).
+//! `Occupancy` (see below) tracks level occupancy in a two-tier bitmap —
+//! the same core trick Monad's on-chain "Octopus Heap" order book design
+//! uses to skip empty price ticks, adapted here for worst-case-fast
+//! in-memory lookup rather than to minimize gas-metered storage reads.
+//! `next_set_from`/`prev_set_from` jump straight to the answer via a
+//! handful of word-level bit operations instead of visiting every empty
+//! level in between.
+//!
 //! # The one real tradeoff
 //!
 //! A dense array needs bounded, contiguous indices. `Ladder` grows to
@@ -85,17 +100,149 @@ impl Level {
     }
 }
 
+/// Hierarchical occupancy bitmap over a `Ladder`'s levels: bit `i` set
+/// means level `i` has resting orders. Two tiers — `words` (one bit per
+/// level) and `summary` (one bit per `words` entry, set iff that word is
+/// nonzero) — so finding the next/previous occupied level never has to
+/// visit an empty one individually.
+///
+/// This is the same core trick Monad's "Octopus Heap" on-chain order
+/// book design uses to jump between active price regions without
+/// scanning empty ticks — there, to avoid gas-metered storage reads;
+/// here, to give worst-case fast level lookup instead of relying on the
+/// happy-path assumption that price only ever drifts a short distance
+/// between touches. A resting order at one edge of a wide, mostly-empty
+/// book and a sweep that clears everything in between is exactly the
+/// case a plain linear scan handles badly and this doesn't.
+#[derive(Default)]
+struct Occupancy {
+    words: Vec<u64>,
+    summary: Vec<u64>,
+}
+
+impl Occupancy {
+    fn ensure_len(&mut self, level_count: usize) {
+        let word_count = level_count.div_ceil(64);
+        if word_count > self.words.len() {
+            self.words.resize(word_count, 0);
+            self.summary.resize(word_count.div_ceil(64), 0);
+        }
+    }
+
+    /// Shifts every set bit up by `shift` positions — the bitmap's side
+    /// of `Ladder::ensure`'s prepend-on-rebase. O(current size), the same
+    /// cost class as the array prepend it accompanies.
+    fn shift_up(&mut self, shift: usize, new_level_count: usize) {
+        let mut shifted = Occupancy::default();
+        shifted.ensure_len(new_level_count);
+        for i in 0..self.words.len() * 64 {
+            if self.is_set(i) {
+                shifted.set(i + shift);
+            }
+        }
+        *self = shifted;
+    }
+
+    fn set(&mut self, idx: usize) {
+        self.ensure_len(idx + 1);
+        let word = idx / 64;
+        self.words[word] |= 1u64 << (idx % 64);
+        self.summary[word / 64] |= 1u64 << (word % 64);
+    }
+
+    fn clear(&mut self, idx: usize) {
+        let word = idx / 64;
+        if word >= self.words.len() {
+            return;
+        }
+        self.words[word] &= !(1u64 << (idx % 64));
+        if self.words[word] == 0 {
+            self.summary[word / 64] &= !(1u64 << (word % 64));
+        }
+    }
+
+    fn is_set(&self, idx: usize) -> bool {
+        let word = idx / 64;
+        word < self.words.len() && self.words[word] & (1u64 << (idx % 64)) != 0
+    }
+
+    /// First set bit at or after `idx`, if any.
+    fn next_set_from(&self, idx: usize) -> Option<usize> {
+        let start_word = idx / 64;
+        if start_word >= self.words.len() {
+            return None;
+        }
+        let masked = self.words[start_word] & (!0u64 << (idx % 64));
+        if masked != 0 {
+            return Some(start_word * 64 + masked.trailing_zeros() as usize);
+        }
+        let mut sw = start_word / 64;
+        let mut mask_from_bit = (start_word % 64) + 1;
+        while sw < self.summary.len() {
+            let effective = if mask_from_bit >= 64 { 0 } else { self.summary[sw] & (!0u64 << mask_from_bit) };
+            if effective != 0 {
+                let word = sw * 64 + effective.trailing_zeros() as usize;
+                if word >= self.words.len() {
+                    return None;
+                }
+                let w = self.words[word];
+                debug_assert_ne!(w, 0);
+                return Some(word * 64 + w.trailing_zeros() as usize);
+            }
+            sw += 1;
+            mask_from_bit = 0;
+        }
+        None
+    }
+
+    /// Last set bit at or before `idx`, if any.
+    fn prev_set_from(&self, idx: usize) -> Option<usize> {
+        if self.words.is_empty() {
+            return None;
+        }
+        let start_word = idx / 64;
+        if start_word >= self.words.len() {
+            return self.prev_set_from(self.words.len() * 64 - 1);
+        }
+        let bit = idx % 64;
+        let masked = self.words[start_word] & (!0u64 >> (63 - bit));
+        if masked != 0 {
+            return Some(start_word * 64 + (63 - masked.leading_zeros() as usize));
+        }
+        if start_word == 0 {
+            return None;
+        }
+        let mut sw = start_word - 1;
+        loop {
+            let summary_bit = sw % 64;
+            let summary_word = sw / 64;
+            let effective = self.summary[summary_word] & (!0u64 >> (63 - summary_bit));
+            if effective != 0 {
+                let word = summary_word * 64 + (63 - effective.leading_zeros() as usize);
+                let w = self.words[word];
+                debug_assert_ne!(w, 0);
+                return Some(word * 64 + (63 - w.leading_zeros() as usize));
+            }
+            if summary_word == 0 {
+                return None;
+            }
+            sw = summary_word * 64 - 1;
+        }
+    }
+}
+
 /// A dense, tick-indexed array of price levels for one side of the book.
 /// Grows on demand to cover `[min_tick, max_tick]` as orders arrive
 /// outside its current range; never shrinks (see module docs).
 struct Ladder {
     base_tick: Tick,
     levels: Vec<Level>,
+    occupancy: Occupancy,
 }
 
 impl Ladder {
     fn new() -> Self {
-        Self { base_tick: 0, levels: Vec::new() }
+        Self { base_tick: 0, levels: Vec::new(), occupancy: Occupancy::default() }
     }
 
     /// Ensures `tick` has a slot, growing/re-basing the array if needed,
@@ -104,6 +251,7 @@ impl Ladder {
         if self.levels.is_empty() {
             self.base_tick = tick;
             self.levels.push(Level::EMPTY);
+            self.occupancy.ensure_len(1);
             return 0;
         }
         if tick < self.base_tick {
@@ -112,14 +260,39 @@ impl Ladder {
             let mut grown = vec![Level::EMPTY; shift];
             grown.extend_from_slice(&self.levels);
             self.levels = grown;
+            self.occupancy.shift_up(shift, self.levels.len());
             self.base_tick = tick;
             return 0;
         }
         let idx = (tick - self.base_tick) as usize;
         if idx >= self.levels.len() {
             self.levels.resize(idx + 1, Level::EMPTY);
+            self.occupancy.ensure_len(idx + 1);
         }
         idx
+    }
+
+    /// Marks `idx` as occupied (called whenever a level goes from empty
+    /// to non-empty).
+    fn mark_occupied(&mut self, idx: usize) {
+        self.occupancy.set(idx);
+    }
+
+    /// Marks `idx` as empty (called whenever a level's last order is
+    /// removed).
+    fn mark_empty(&mut self, idx: usize) {
+        self.occupancy.clear(idx);
+    }
+
+    /// Next occupied level at or after `idx`, via the occupancy bitmap —
+    /// O(1) amortized, not a per-level scan.
+    fn next_occupied_from(&self, idx: usize) -> Option<usize> {
+        self.occupancy.next_set_from(idx)
+    }
+
+    /// Last occupied level at or before `idx`, via the occupancy bitmap.
+    fn prev_occupied_from(&self, idx: usize) -> Option<usize> {
+        self.occupancy.prev_set_from(idx)
     }
 
     /// Index for `tick` if that level has ever been allocated (does not
@@ -244,6 +417,7 @@ impl OrderBook {
             let level = ladder.level_mut(level_idx);
             level.head = idx;
             level.tail = idx;
+            self.ladder_mut(side).mark_occupied(level_idx);
         } else {
             self.arena[tail as usize].as_mut().unwrap().next = idx;
             self.arena[idx as usize].as_mut().unwrap().prev = tail;
@@ -271,42 +445,22 @@ impl OrderBook {
     }
 
     /// After the level at `tick` on `side` has just emptied, advances the
-    /// cached best price to the next occupied level. Amortized O(1) in
-    /// practice: real price action moves the touch gradually, so this
-    /// scan is short almost always, but it is a real scan, not a cached
-    /// jump — the honest tradeoff of a dense array over e.g. a skip-list
-    /// of occupied levels, which would make this O(1) worst-case at the
-    /// cost of extra bookkeeping on every insert.
+    /// cached best price to the next occupied level via the occupancy
+    /// bitmap — jumps directly to it instead of scanning intervening
+    /// empty levels one at a time.
     fn advance_best_from(&mut self, side: Side, emptied_tick: Tick) {
         let ladder = self.ladder(side);
+        let Some(start) = ladder.index_of(emptied_tick) else { return };
         match side {
             Side::Long => {
-                let Some(start) = ladder.index_of(emptied_tick) else { return };
-                let mut i = start;
-                loop {
-                    if i == 0 {
-                        self.best_bid = None;
-                        return;
-                    }
-                    i -= 1;
-                    if !self.ladder(side).level(i).is_empty() {
-                        self.best_bid = Some(self.ladder(side).tick_at(i));
-                        return;
-                    }
-                }
+                self.best_bid = if start == 0 {
+                    None
+                } else {
+                    self.ladder(side).prev_occupied_from(start - 1).map(|i| self.ladder(side).tick_at(i))
+                };
             }
             Side::Short => {
-                let Some(start) = ladder.index_of(emptied_tick) else { return };
-                let len = self.ladder(side).levels.len();
-                let mut i = start + 1;
-                while i < len {
-                    if !self.ladder(side).level(i).is_empty() {
-                        self.best_ask = Some(self.ladder(side).tick_at(i));
-                        return;
-                    }
-                    i += 1;
-                }
-                self.best_ask = None;
+                self.best_ask = self.ladder(side).next_occupied_from(start + 1).map(|i| self.ladder(side).tick_at(i));
             }
         }
     }
@@ -333,6 +487,9 @@ impl OrderBook {
         }
         let level = self.ladder_mut(node.side).level_mut(level_idx);
         level.qty -= node.qty;
+        if level.is_empty() {
+            self.ladder_mut(node.side).mark_empty(level_idx);
+        }
 
         node
     }
@@ -417,6 +574,95 @@ impl OrderBook {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod occupancy_tests {
+    use super::Occupancy;
+    use proptest::prelude::*;
+
+    fn naive_next(set: &[usize], from: usize) -> Option<usize> {
+        set.iter().copied().filter(|&i| i >= from).min()
+    }
+
+    fn naive_prev(set: &[usize], from: usize) -> Option<usize> {
+        set.iter().copied().filter(|&i| i <= from).max()
+    }
+
+    #[test]
+    fn single_bit_found_forward_and_backward() {
+        let mut o = Occupancy::default();
+        o.set(200);
+        assert_eq!(o.next_set_from(0), Some(200));
+        assert_eq!(o.next_set_from(200), Some(200));
+        assert_eq!(o.next_set_from(201), None);
+        assert_eq!(o.prev_set_from(300), Some(200));
+        assert_eq!(o.prev_set_from(200), Some(200));
+        assert_eq!(o.prev_set_from(199), None);
+    }
+
+    #[test]
+    fn crosses_word_boundary() {
+        // Bits 63 and 64 straddle the first two u64 words.
+        let mut o = Occupancy::default();
+        o.set(64);
+        assert_eq!(o.next_set_from(63), Some(64));
+        assert_eq!(o.prev_set_from(64), Some(64));
+        assert_eq!(o.prev_set_from(63), None);
+    }
+
+    #[test]
+    fn crosses_summary_boundary() {
+        // Word 64 is bit 0 of the *second* summary word (64 words * 64
+        // bits/word = bit 4096) — this only works if the two-tier jump
+        // is wired correctly across summary words, not just within one.
+        let mut o = Occupancy::default();
+        o.set(4096);
+        assert_eq!(o.next_set_from(0), Some(4096));
+        assert_eq!(o.next_set_from(4096), Some(4096));
+        assert_eq!(o.next_set_from(4097), None);
+        assert_eq!(o.prev_set_from(10_000), Some(4096));
+    }
+
+    #[test]
+    fn empty_bitmap_finds_nothing() {
+        let o = Occupancy::default();
+        assert_eq!(o.next_set_from(0), None);
+        assert_eq!(o.prev_set_from(0), None);
+    }
+
+    #[test]
+    fn clear_removes_bit_and_summary_when_word_empties() {
+        let mut o = Occupancy::default();
+        o.set(10);
+        o.clear(10);
+        assert_eq!(o.next_set_from(0), None);
+        assert_eq!(o.prev_set_from(100), None);
+    }
+
+    proptest! {
+        /// Differential test: for arbitrary sets of bits and arbitrary
+        /// query points, the bitmap's forward/backward jump must agree
+        /// with a naive brute-force scan over the same set. This is the
+        /// real correctness guarantee for a two-tier bit-trick structure
+        /// like this one — word/summary boundary bugs don't show up in
+        /// hand-picked examples reliably.
+        #[test]
+        fn matches_naive_scan(
+            bits in prop::collection::hash_set(0usize..2000, 0..40),
+            queries in prop::collection::vec(0usize..2000, 1..20),
+        ) {
+            let mut o = Occupancy::default();
+            let set: Vec<usize> = bits.into_iter().collect();
+            for &b in &set {
+                o.set(b);
+            }
+            for &q in &queries {
+                prop_assert_eq!(o.next_set_from(q), naive_next(&set, q));
+                prop_assert_eq!(o.prev_set_from(q), naive_prev(&set, q));
+            }
+        }
     }
 }
 
