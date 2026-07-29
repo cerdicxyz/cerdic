@@ -42,7 +42,7 @@ use std::ops::Not;
 /// plain big-endian lexicographic comparison the way its name suggests,
 /// verified directly by the `le_gadget_matches_native_comparison`
 /// property test below rather than trusted on read.
-fn le(a: &FpVar<Fr>, b: &FpVar<Fr>) -> Result<Boolean<Fr>, SynthesisError> {
+pub(crate) fn le(a: &FpVar<Fr>, b: &FpVar<Fr>) -> Result<Boolean<Fr>, SynthesisError> {
     let a_bits = a.to_bits_be()?;
     let b_bits = b.to_bits_be()?;
 

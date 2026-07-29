@@ -33,7 +33,7 @@ mod tests {
             market_id: zero_market_id,
             size: 1,
             entry_price: 60_000_000_000_000_000_000_000, // 60k * 1e18
-            margin: 5_000_000_000_000_000_000_000,      // 5k  * 1e18
+            margin: 5_000_000_000_000_000_000_000,       // 5k  * 1e18
             leverage: 20,
         };
         assert_eq!(pos.size, 1);

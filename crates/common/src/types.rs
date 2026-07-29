@@ -181,9 +181,7 @@ mod cross_check {
         // until the call site is updated, which forces the change
         // to be deliberate.
         let _pos = MarketPosition {
-            market_id: String::from(
-                "0x0000000000000000000000000000000000000000000000000000000000000001",
-            ),
+            market_id: String::from("0x0000000000000000000000000000000000000000000000000000000000000001"),
             size: 0,
             entry_price: 0,
             margin: 0,
