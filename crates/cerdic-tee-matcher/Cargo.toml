@@ -1,0 +1,29 @@
+[package]
+name = "cerdic-tee-matcher"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TEE-hosted order matcher: decrypt, match, margin-check, attest, settle. Runs identically inside GCP Confidential Space and AWS Nitro Enclaves (see ARCHITECTURE.md, docs/spec-contracts-tee.md)."
+
+[[bin]]
+name = "cerdic-tee-matcher"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+alloy.workspace = true
+
+axum = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "time"] }
+nu-ansi-term = "0.50"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+proptest.workspace = true
