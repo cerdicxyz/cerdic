@@ -15,7 +15,7 @@ importers:
       '@circle-fin/app-kit':
         specifier: 1.10.0
         version: 1.10.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
-      '@synchra/shared':
+      '@cerdic/shared':
         specifier: workspace:*
         version: link:../shared
       axios:

@@ -25,8 +25,6 @@ thiserror = "1"
 alloy = "0.3"
 # Property-based test harness for the matching + risk engines.
 proptest = "1"
-# Phala TEE SDK for the RFQ matcher crate.
-dstack-sdk = "0.1"
 
 [profile.release]
 lto = "fat"

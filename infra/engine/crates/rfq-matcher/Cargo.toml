@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Encrypted RFQ block-trade matcher running inside the Phala TEE CVM."
+description = "Encrypted RFQ block-trade matcher (stub, superseded by cerdic-tee-matcher)."
 
 [dependencies]
 
