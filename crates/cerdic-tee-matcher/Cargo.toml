@@ -17,7 +17,7 @@ tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-alloy.workspace = true
+alloy = { workspace = true, features = ["k256", "serde", "signer-local"] }
 
 axum = "0.7"
 tracing = "0.1"
@@ -25,5 +25,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi",
 nu-ansi-term = "0.50"
 time = { version = "0.3", features = ["formatting"] }
 
+crypto_box = { version = "0.9", features = ["std", "chacha20"] }
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["limit", "timeout", "trace"] }
+
 [dev-dependencies]
 proptest.workspace = true
+http-body-util = "0.1"

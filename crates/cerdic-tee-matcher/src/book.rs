@@ -88,7 +88,7 @@ fn opposite_side(side: Side) -> Side {
 }
 
 /// What to do with any quantity that doesn't fill immediately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimeInForce {
     /// Rest any unfilled remainder in the book until cancelled.
     GoodTilCancel,
