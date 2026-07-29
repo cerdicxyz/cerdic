@@ -1,6 +1,6 @@
 # tiny — privacy MVP
 
-A small, real, end-to-end proof of Synchra's TEE privacy pattern. Rust end to
+A small, real, end-to-end proof of Cerdic's TEE privacy pattern. Rust end to
 end (contract logic aside, which is Solidity) — no TypeScript anywhere in
 this directory. Two generations, both real and tested, not just written:
 
@@ -26,7 +26,7 @@ the *link* from that deposit to whatever position or withdrawal comes after.
 
 Scoped down from the full design on purpose, both versions:
 
-| This MVP | Full design (ARCHITECTURE.md / paper/synchra.tex) |
+| This MVP | Full design (ARCHITECTURE.md / paper/cerdic.tex) |
 |---|---|
 | Single collateral asset (mock USDC) | Tiered collateral (USDC/EURC/USYC/RWA) |
 | One position per trader, no market extension | `IMarket` interface, FX/BTC perpetuals |
@@ -164,9 +164,9 @@ Or in Docker (build from `tiny/`, not `tiny/tee/` — the crate path-depends on
 
 ```bash
 cd tiny
-docker build -f tee/Dockerfile -t synchra-tiny-tee \
+docker build -f tee/Dockerfile -t cerdic-tiny-tee \
   --build-context host-cargo-registry="$HOME/.cargo/registry" .
-docker run --env-file tee/.env -p 8787:8787 synchra-tiny-tee
+docker run --env-file tee/.env -p 8787:8787 cerdic-tiny-tee
 ```
 
 (The `--build-context` flag reuses your host's already-populated cargo

@@ -12,7 +12,7 @@ interface IERC20Minimal {
 /// @title TinyPrivacyVault
 /// @notice Minimal, end-to-end proof of the sealed-params / authorized-TEE-settler
 ///         privacy pattern described in ARCHITECTURE.md ("On-chain footprint of a
-///         private position") and paper/synchra.tex Section 7.1 — scoped down from
+///         private position") and paper/cerdic.tex Section 7.1 — scoped down from
 ///         PositionEngine + SettlementEngine to a single collateral asset, a single
 ///         position per trader, and no portfolio margin, market extension, or oracle
 ///         integration. The point of this contract is to prove the privacy mechanism

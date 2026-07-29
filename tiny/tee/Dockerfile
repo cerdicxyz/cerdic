@@ -10,7 +10,7 @@
 #
 # Build from the `tiny/` directory (not `tiny/tee/`), since this crate
 # path-depends on ../arkworks-prover:
-#   docker build -f tee/Dockerfile -t synchra-tiny-tee .
+#   docker build -f tee/Dockerfile -t cerdic-tiny-tee .
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 

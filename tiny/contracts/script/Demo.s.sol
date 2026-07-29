@@ -21,7 +21,7 @@ import {TinyPrivacyVault} from "../src/TinyPrivacyVault.sol";
 ///   export VAULT_ADDRESS=<from Deploy.s.sol>
 ///   export RPC_URL=<same URL you pass to --rpc-url — used to force-refresh
 ///                    forge's simulated state after each ffi call, see below>
-///   # TEE must already be running (docker run ... synchra-tiny-tee, or
+///   # TEE must already be running (docker run ... cerdic-tiny-tee, or
 ///   # `pnpm run dev` in tiny/tee) and reachable at TEE_URL (default
 ///   # http://127.0.0.1:8787, see tiny/client/src/ffi.ts)
 ///   forge script script/Demo.s.sol --rpc-url $RPC_URL \
