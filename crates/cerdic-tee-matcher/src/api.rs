@@ -34,7 +34,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use common::types::Side as CommonSide;
+use common::types::{MarketId, Side as CommonSide};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -63,6 +63,7 @@ impl From<OrderSide> for CommonSide {
 /// greater than the signer's last accepted nonce, see module docs.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrderPayload {
+    pub market_id: MarketId,
     pub side: OrderSide,
     pub tick: u64,
     pub qty: u64,
@@ -84,8 +85,8 @@ impl SignedPayload for OrderPayload {
             TimeInForce::FillOrKill => "FOK".to_string(),
         };
         format!(
-            "order|{:?}|{}|{}|{}|{}|{}",
-            self.side, self.tick, self.qty, tif_tag, self.post_only, self.nonce
+            "order|{}|{:?}|{}|{}|{}|{}|{}",
+            self.market_id, self.side, self.tick, self.qty, tif_tag, self.post_only, self.nonce
         )
         .into_bytes()
     }
@@ -146,7 +147,12 @@ impl IntoResponse for ApiError {
 
 pub struct AppState {
     pub keystore: Keystore,
-    pub book: Mutex<OrderBook>,
+    /// One book per market, created lazily on that market's first
+    /// order. `IMarket` (the paper/ARCHITECTURE.md's on-chain interface)
+    /// is what actually registers a market as real; the matcher doesn't
+    /// duplicate that registry, it just needs somewhere to rest orders
+    /// once one shows up.
+    books: Mutex<HashMap<MarketId, OrderBook>>,
     /// Last accepted nonce per signer, replay protection (see module
     /// docs). Unbounded growth is a real, documented limitation, a
     /// production deployment would expire entries or move this to a
@@ -158,7 +164,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             keystore: Keystore::generate(),
-            book: Mutex::new(OrderBook::new()),
+            books: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
         }
     }
@@ -217,12 +223,14 @@ async fn post_order(
         .expect("system clock before the Unix epoch")
         .as_secs();
 
-    let mut book = state.book.lock().expect("book mutex poisoned");
+    let mut books = state.books.lock().expect("books mutex poisoned");
+    let book = books.entry(payload.market_id.clone()).or_default();
     let result = book.submit(order, now);
-    drop(book);
+    drop(books);
 
     tracing::info!(
         signer = %signer,
+        market_id = %payload.market_id,
         fills = result.fills.len(),
         resting = result.resting_id.is_some(),
         "order accepted"
@@ -312,6 +320,7 @@ mod tests {
         let state = Arc::new(AppState::new());
         let wallet = wallet();
         let mut order = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Buy,
             tick: 100,
             qty: 10,
@@ -335,6 +344,7 @@ mod tests {
         let taker = wallet();
 
         let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Sell,
             tick: 100,
             qty: 5,
@@ -349,6 +359,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Buy,
             tick: 100,
             qty: 5,
@@ -365,10 +376,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orders_in_different_markets_never_cross() {
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let taker = wallet();
+
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        // Same price and size, but a different market: must rest
+        // instead of crossing against the EURC/USDC order above.
+        let mut crossing = OrderPayload {
+            market_id: "0xBTCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(crossing, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "resting", "different markets must never match each other's orders");
+    }
+
+    #[tokio::test]
     async fn replayed_nonce_is_rejected() {
         let state = Arc::new(AppState::new());
         let wallet = wallet();
         let mut order = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Buy,
             tick: 100,
             qty: 1,
@@ -385,6 +435,7 @@ mod tests {
         // Same nonce again, must be rejected even though the signature
         // and content are both individually valid.
         let mut replay = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Buy,
             tick: 100,
             qty: 1,
@@ -403,6 +454,7 @@ mod tests {
         let state = Arc::new(AppState::new());
         let wallet = wallet();
         let mut order = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
             side: OrderSide::Buy,
             tick: 100,
             qty: 1,
