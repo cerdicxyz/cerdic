@@ -393,6 +393,20 @@ pub struct Fill {
     /// True when the maker order was fully consumed and removed from the
     /// book (as opposed to partially filled and left resting).
     pub maker_filled: bool,
+    /// The maker order's resting size immediately before this fill
+    /// (i.e. `qty <= maker_size_before` always holds). Not derivable
+    /// from `maker_filled` alone, and needed as-is (not just the
+    /// post-fill remainder) by `MatchCorrectness`'s `matchSize <=
+    /// size_a` constraint, which is a statement about the size that
+    /// was live at match time, not what's left afterward.
+    pub maker_size_before: Qty,
+    /// The taker's own remaining size at the moment this specific fill
+    /// happened (relevant when one incoming order sweeps multiple
+    /// resting orders across one or more price levels: each `Fill` in
+    /// that sweep has a different `taker_size_before`, the taker's
+    /// remaining quantity right before *that* fill, not the order's
+    /// original total).
+    pub taker_size_before: Qty,
 }
 
 /// Result of submitting a new order: whatever it matched immediately,
@@ -740,6 +754,7 @@ impl OrderBook {
 
             let maker_qty = head_node.qty;
             let maker_owner = head_node.owner;
+            let taker_size_before = qty;
             let traded = qty.min(maker_qty);
             qty -= traded;
 
@@ -760,6 +775,8 @@ impl OrderBook {
                 tick: level_tick,
                 qty: traded,
                 maker_filled,
+                maker_size_before: maker_qty,
+                taker_size_before,
             });
 
             if self.ladder(opposite).level(level_idx).is_empty() {
@@ -935,6 +952,28 @@ mod tests {
         assert_eq!(r.fills[0].tick, 100, "best (lowest ask) price must fill first");
         assert_eq!(r.fills[1].tick, 101);
         assert_eq!(r.resting_qty, 0);
+    }
+
+    #[test]
+    fn fill_reports_each_side_size_at_the_moment_of_that_fill() {
+        // A 10-unit taker sweeps two 5-unit makers at different levels.
+        // Each Fill must report the sizes live at THAT match, not the
+        // taker's original total or the maker's post-fill remainder.
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 100, 5, MAKER), 0);
+        book.submit(gtc(Side::Short, 101, 5, MAKER), 0);
+        let r = book.submit(gtc(Side::Long, 101, 10, TAKER), 0);
+
+        assert_eq!(r.fills.len(), 2);
+        assert_eq!(r.fills[0].maker_size_before, 5, "first maker's own resting size");
+        assert_eq!(r.fills[0].taker_size_before, 10, "taker's full size going into the first fill");
+        assert_eq!(r.fills[0].qty, 5);
+        assert_eq!(r.fills[1].maker_size_before, 5, "second maker's own resting size");
+        assert_eq!(
+            r.fills[1].taker_size_before, 5,
+            "taker only had 5 left after the first fill consumed 5 of its 10"
+        );
+        assert_eq!(r.fills[1].qty, 5);
     }
 
     #[test]
