@@ -1,4 +1,4 @@
-# Synchra — gas benchmarks (clearing kernel)
+# Cerdic — gas benchmarks (clearing kernel)
 #
 # Convention: values are from `forge test --match-contract <Test> --gas-report`
 # with forge 1.4.4. Per foundry's gas-report accounting, the reported
@@ -58,7 +58,7 @@
 # staticcall overhead) isolates the actual `_store` cost at 48,135 gas —
 # within the plan's 50k budget. The 139,736 max is the fuzz test hitting a
 # 64-byte payload (3 fresh SSTOREs); a full four-word perp position
-# (paper/synchra.tex:396-411) packs into 4 slots and would scale linearly.
+# (paper/cerdic.tex:396-411) packs into 4 slots and would scale linearly.
 # That scaling is inherent EVM storage pricing, not engine overhead, and is
 # charged to the trade settlement path in todo #11.
 #

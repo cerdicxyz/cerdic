@@ -464,7 +464,7 @@ Every component below is real and working end-to-end, not a stub -- the point of
   \item Clearing kernel (Solidity, Arc EVM, Foundry): accounts, collateral, positions, settlement.
   \item One FX market extension (EURC/USDC) plus the existing BTC/USDC extension, both against the same \texttt{IMarket} interface.
   \item Full portfolio margin engine ($f_S+f_C+f_L+f_K$), on-chain enforced, off-chain computed.
-  \item TEE-matched private RFQ against a real enclave (Intel TDX via Phala or Marlin), with on-chain attestation verification and public-settlement fallback.
+  \item TEE-matched private RFQ against a real enclave (GCP Confidential Space, AMD SEV-SNP), with on-chain attestation verification and public-settlement fallback.
   \item Agent accounts: identity, capability tokens, session keys, one working agent type (trading agent), Nanopayments-integrated.
   \item USYC as a live collateral tier.
   \item Frontend (Next.js) via Circle Developer Controlled Wallets; Arc Testnet deployment.

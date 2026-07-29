@@ -21,7 +21,7 @@ public chain in plaintext.
 ## Privacy Stack Decision
 
 We run our own matcher binary on infrastructure we operate, rather than depending on a
-third-party TEE network (Phala, Marlin) or a third-party attestation/confidential-EVM
+third-party TEE network (Marlin) or a third-party attestation/confidential-EVM
 platform (Automata, Oasis Sapphire). Those are real, live products and worth knowing about
 (see "Landscape considered" below), but the point of this build is to own the code and the
 security story end to end, and we already have both GCP and AWS to deploy on.
@@ -209,6 +209,63 @@ Keeper                          TEE Matcher                    Arc EVM
  │                                │                             │     pay keeper reward,
  │                                │                             │     emit (positionId) only
 ```
+
+## Market Maker Offers
+
+`OrderBook` (`packages/contracts/src/execution/`) already stores signed limit orders for the
+public CLOB path. Market makers quoting into the private RFQ path need a different shape:
+one maker, many standing quotes, across many markets, without pre-locking collateral against
+every quote individually. Sizing capital per-quote is what makes market making on most
+on-chain venues capital-inefficient — a maker quoting five FX pairs either locks 5x the
+capital it actually needs, or under-quotes to stay safe.
+
+### Offer, not order
+
+A maker `Offer` differs from a taker's `Order` in one structural way: it doesn't debit
+collateral at placement. Collateral is checked and pulled only at match time, against the
+maker's live `effectiveCollateral` (Section "Portfolio Margin Model") at that moment — so a
+maker can post standing quotes across every market it's willing to fill without carving out
+capital per quote up front.
+
+```
+struct Offer {
+    address maker;
+    bytes32 marketId;
+    Side side;
+    uint256 tick;            // price, quantized to the market's tickSpacing
+    uint128 maxSize;
+    uint64 expiry;
+    bytes32 group;           // 0x0 = ungrouped; see "Offer groups" below
+    bool reduceOnly;         // can only close existing exposure, never open new
+    address ratifier;        // optional: must approve the fill before it executes
+}
+```
+
+`reduceOnly` reuses the same semantics `PositionEngine` already needs for close-side orders
+(Section "Smart Contract Design") — a reduce-only offer can never increase the maker's net
+exposure, only unwind it. `ratifier` is the same attestation pattern the TEE matcher uses
+elsewhere in this design (Section "Attestation Verifier"): a fill is only valid if the
+designated ratifier contract approves it, so a standing offer can be gated on "the TEE
+attests this match was computed correctly" instead of trusting the taker's calldata blindly.
+
+### Offer groups
+
+A maker quoting the same book on both sides, or quoting several correlated markets, doesn't
+want each `Offer` sized independently — sizing five offers at $200k each when the maker only
+has $200k of real risk appetite either over-commits capital or forces conservative undersized
+quotes. An offer `group` shares one consumed-size counter across every offer tagged with it:
+filling any offer in the group debits the shared cap, so the maker's other offers in that
+group shrink automatically instead of needing a manual resize. This is the same problem
+`RiskMonitor`'s correlation term (`f_K`, Section "Portfolio Margin Model") solves for a
+trader's positions, applied to a maker's outstanding quotes instead.
+
+### Settlement rounding
+
+`SettlementEngine` rounds any residual dust from a fill against the taker, in the maker's
+favor. This isn't a maker subsidy — it closes a specific manipulation path: a taker who
+can choose rounding direction on a sequence of small fills can grind a maker down over many
+trades, and asymmetric rounding removes that degree of freedom. It costs the taker at most
+one wei-equivalent of price precision per fill, which is negligible at any real trade size.
 
 ## TEE Deployment
 
@@ -502,34 +559,47 @@ correctness guarantee that lands a few seconds to minutes later.
 
 ```
 ├── paper/
-│   └── cerdic.tex             # formal spec — kernel, margin proof sketch, security model
+│   ├── cerdic.tex                # formal spec — kernel, margin proof sketch, security model
+│   └── cerdic-propdesk.tex       # prop-desk brief
+│
+├── docs/
+│   └── *.excalidraw, overflow.png  # architecture + flow diagrams (editable sources)
 │
 ├── packages/
-│   ├── contracts/               # Foundry / Solidity, Arc EVM
+│   ├── contracts/                # Foundry / Solidity, Arc EVM
 │   │   └── src/
-│   │       ├── clearing/        # Account, CollateralEngine, PositionEngine,
-│   │       │                    # SettlementEngine, RiskMonitor, LiquidationEntry
-│   │       ├── markets/         # BtcPerpMarket (built), FxPerpMarket (TODO)
-│   │       ├── oracle/          # OracleHub, PythConsumer, ChainlinkConsumer,
-│   │       │                    # MarketImpactTwap
-│   │       ├── execution/       # OrderBook (public CLOB settlement)
-│   │       ├── privacy/         # GcpAttestationVerifier, NitroAttestationRegistry,
-│   │       │                    # AttestationRouter (TODO)
-│   │       └── agents/          # Agent identity + capability tokens (TODO)
+│   │       ├── clearing/         # Account, CollateralEngine, PositionEngine,
+│   │       │                     # SettlementEngine, RiskMonitor, LiquidationEntry
+│   │       ├── markets/          # BtcPerpMarket (built), FxPerpMarket (TODO)
+│   │       ├── oracle/           # OracleHub, PythConsumer, ChainlinkConsumer,
+│   │       │                     # MarketImpactTwap
+│   │       ├── execution/        # OrderBook (public CLOB) + Market Maker Offers (TODO)
+│   │       ├── lib/              # ProtocolConstants, RingBuffer
+│   │       ├── privacy/          # GcpAttestationVerifier, NitroAttestationRegistry,
+│   │       │                     # AttestationRouter (not yet scaffolded)
+│   │       └── agents/           # Agent identity + capability tokens (not yet scaffolded)
 │   │
-│   ├── engine/                  # Rust
-│   │   └── crates/
-│   │       ├── clob/            # off-chain matching engine (built, ~1.2k lines)
-│   │       ├── risk/            # margin engine — isolated only today, needs
-│   │       │                    # f_S/f_C/f_L/f_K upgrade
-│   │       ├── rfq-matcher/     # TEE-hosted matcher (stub — TODO)
-│   │       └── common/          # shared types
-│   │
-│   └── shared/                  # TS types/constants shared with frontend
+│   └── shared/                   # TS types/constants (no frontend consumer yet — see `app/`)
 │
-├── app/                          # Next.js frontend (Circle Developer Controlled Wallets)
+├── app/                           # Vite + React frontend
 │
-└── ARCHITECTURE.md               # this file
+├── crates/                        # Rust workspace scaffold for non-engine crates (empty — TODO)
+│
+├── infra/
+│   └── engine/                   # Rust — the off-chain matching/risk/TEE-matcher workspace
+│       └── crates/
+│           ├── clob/             # off-chain matching engine (built, ~1.2k lines)
+│           ├── risk/             # margin engine — isolated only today, needs
+│           │                     # f_S/f_C/f_L/f_K upgrade
+│           ├── rfq-matcher/      # TEE-hosted matcher (stub — TODO)
+│           └── common/           # shared types
+│
+├── mobile/                        # mobile client (empty — TODO)
+│
+├── tiny/                          # standalone MVP: TEE-shielded vault, unlinkable positions —
+│                                   # see tiny/README.md, not wired into packages/
+│
+└── ARCHITECTURE.md                # this file
 ```
 
 ## Privacy Model
@@ -588,7 +658,7 @@ correctness guarantee that lands a few seconds to minutes later.
 - `GcpAttestationVerifier` contract + public-settlement fallback path.
 - Agent accounts: identity, capability tokens, session keys, one working agent type
   (trading agent), Nanopayments-integrated.
-- Frontend (Next.js, Circle Developer Controlled Wallets), Arc Testnet deployment.
+- Frontend (`app/`, Vite + React), Arc Testnet deployment.
 
 **Phase 1 — hardening**: AWS Nitro second deployment (`NitroAttestationRegistry`, full
 on-chain COSE/X.509 verification replacing the interim relayer); dual-cloud quorum for
