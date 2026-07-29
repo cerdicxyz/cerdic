@@ -158,6 +158,10 @@ pub struct AppState {
     /// production deployment would expire entries or move this to a
     /// bounded LRU; fine for the traffic volumes this MVP targets.
     last_nonce: Mutex<HashMap<Address, u64>>,
+    /// Groth16 keys for `MatchCorrectness`, see `proof.rs`'s module docs
+    /// on why these are freshly generated, not loaded from a real
+    /// trusted-setup ceremony.
+    proof_keys: Arc<crate::proof::ProofKeys>,
 }
 
 impl AppState {
@@ -166,6 +170,7 @@ impl AppState {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
+            proof_keys: crate::proof::ProofKeys::shared(),
         }
     }
 }
@@ -236,6 +241,50 @@ async fn post_order(
         "order accepted"
     );
 
+    let taker_is_buy = matches!(payload.side, OrderSide::Buy);
+    for fill in &result.fills {
+        if !crate::proof::should_prove(fill.qty) {
+            continue;
+        }
+        let witness = crate::proof::MatchWitness {
+            side_a: taker_is_buy,
+            price_a: payload.tick,
+            size_a: fill.taker_size_before,
+            side_b: !taker_is_buy,
+            price_b: fill.tick,
+            size_b: fill.maker_size_before,
+            match_price: fill.tick,
+            match_size: fill.qty,
+        };
+        let state_for_proof = state.clone();
+        let maker_id = fill.maker_id;
+        // Never awaited by the caller: per ARCHITECTURE.md's ZK
+        // Correctness Layer, settlement (the response already sent
+        // above) must never wait on proof generation. spawn_blocking
+        // because Groth16 proving is CPU-bound, not something to run on
+        // the async runtime's cooperative worker threads.
+        tokio::task::spawn_blocking(move || {
+            let proof_result = crate::proof::generate_match_proof(&state_for_proof.proof_keys, witness);
+            // Logged, not yet submitted anywhere: on-chain submission
+            // (IZkVerifier.submitMatchProof, per
+            // docs/spec-contracts-tee.md section 3.4) isn't wired up
+            // yet, see settle.rs. This is what that module will consume.
+            let proof_hex = hex::encode(canonical_bytes(&proof_result.proof));
+            let public_inputs_hex: Vec<String> =
+                proof_result.public_inputs.iter().map(|fr| hex::encode(canonical_bytes(fr))).collect();
+            if proof_result.self_verified {
+                tracing::info!(
+                    maker_id,
+                    proof = %proof_hex,
+                    public_inputs = ?public_inputs_hex,
+                    "MatchCorrectness proof generated and self-verified"
+                );
+            } else {
+                tracing::error!(maker_id, "MatchCorrectness proof failed self-verification");
+            }
+        });
+    }
+
     if result.post_only_rejected {
         return Ok(Json(OrderResponse::Rejected { reason: "post_only order would have crossed".into() }));
     }
@@ -261,6 +310,15 @@ async fn post_order(
 fn signer_owner_id(signer: Address) -> u64 {
     let bytes = signer.as_slice();
     u64::from_be_bytes(bytes[12..20].try_into().expect("Address is 20 bytes"))
+}
+
+/// Canonical (arkworks-standard) byte encoding, for logging proof
+/// material as hex until `settle.rs` exists to submit it on-chain in
+/// its real binary form instead.
+fn canonical_bytes<T: ark_serialize::CanonicalSerialize>(value: &T) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    value.serialize_compressed(&mut bytes).expect("serialization into a Vec<u8> cannot fail");
+    bytes
 }
 
 #[cfg(test)]
@@ -373,6 +431,58 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "filled");
         assert_eq!(body["fills"], 1);
+    }
+
+    /// The proof-generation branch in `post_order` is only reached when
+    /// a fill's traded size is >= NOTIONAL_THRESHOLD, every other test
+    /// in this module trades small sizes and never exercises it. This
+    /// test exists specifically to prove that wiring (constructing a
+    /// MatchWitness from a real Fill, spawning it) actually runs
+    /// end-to-end without panicking, not just that MatchCorrectness's
+    /// own proving logic works in isolation (proof.rs already covers
+    /// that).
+    #[tokio::test]
+    async fn large_crossing_fill_triggers_proof_generation_without_panicking() {
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let taker = wallet();
+        let large_qty = crate::proof::NOTIONAL_THRESHOLD;
+
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: large_qty,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: large_qty,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(crossing, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "filled");
+
+        // The spawned task is fire-and-forget from the handler's point
+        // of view; give it a moment to actually run under the test
+        // runtime so a panic inside it (which tokio would otherwise
+        // swallow silently) has a chance to surface before the test
+        // exits.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     #[tokio::test]

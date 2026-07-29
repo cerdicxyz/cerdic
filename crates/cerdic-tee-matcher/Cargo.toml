@@ -32,6 +32,13 @@ rand = "0.8"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["limit", "timeout", "trace"] }
 
+zk-circuits = { path = "../zk-circuits" }
+ark-bn254 = "0.5"
+ark-groth16 = "0.5"
+ark-snark = "0.5"
+ark-std = { version = "0.5", features = ["std"] }
+ark-serialize = "0.5"
+
 [dev-dependencies]
 proptest.workspace = true
 http-body-util = "0.1"
