@@ -409,6 +409,34 @@ impl OrderBook {
         }
     }
 
+    /// Accesses a live arena slot. Every call site holds an index that
+    /// came from a level's `head`/`tail`, or a node's `prev`/`next`,
+    /// which by construction is either `NIL` (checked separately by the
+    /// caller) or a currently-live slot — a slot ever going missing here
+    /// means the arena's own invariants broke, not a normal runtime
+    /// condition, hence the panic rather than an `Option` return the
+    /// caller would have to handle everywhere for a case that can't
+    /// legitimately happen.
+    fn slot(&self, idx: u32) -> &OrderNode {
+        self.arena[idx as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!("book invariant violated: arena slot {idx} referenced but empty"))
+    }
+
+    fn slot_mut(&mut self, idx: u32) -> &mut OrderNode {
+        self.arena[idx as usize]
+            .as_mut()
+            .unwrap_or_else(|| panic!("book invariant violated: arena slot {idx} referenced but empty"))
+    }
+
+    /// Removes and returns a live arena slot's contents, freeing it for
+    /// reuse. Same invariant as `slot`/`slot_mut`.
+    fn take_slot(&mut self, idx: u32) -> OrderNode {
+        self.arena[idx as usize]
+            .take()
+            .unwrap_or_else(|| panic!("book invariant violated: arena slot {idx} referenced but empty"))
+    }
+
     fn push_back(&mut self, side: Side, tick: Tick, idx: u32) {
         let level_idx = self.ladder_mut(side).ensure(tick);
         let ladder = self.ladder_mut(side);
@@ -419,11 +447,11 @@ impl OrderBook {
             level.tail = idx;
             self.ladder_mut(side).mark_occupied(level_idx);
         } else {
-            self.arena[tail as usize].as_mut().unwrap().next = idx;
-            self.arena[idx as usize].as_mut().unwrap().prev = tail;
+            self.slot_mut(tail).next = idx;
+            self.slot_mut(idx).prev = tail;
             self.ladder_mut(side).level_mut(level_idx).tail = idx;
         }
-        let qty = self.arena[idx as usize].as_ref().unwrap().qty;
+        let qty = self.slot(idx).qty;
         self.ladder_mut(side).level_mut(level_idx).qty += qty;
         self.raise_best(side, tick);
     }
@@ -460,7 +488,8 @@ impl OrderBook {
                 };
             }
             Side::Short => {
-                self.best_ask = self.ladder(side).next_occupied_from(start + 1).map(|i| self.ladder(side).tick_at(i));
+                self.best_ask =
+                    self.ladder(side).next_occupied_from(start + 1).map(|i| self.ladder(side).tick_at(i));
             }
         }
     }
@@ -469,19 +498,19 @@ impl OrderBook {
     /// frees the slot. Does not touch `best_bid`/`best_ask` — the caller
     /// decides whether the level emptied and advances the cursor.
     fn unlink(&mut self, idx: u32) -> OrderNode {
-        let node = self.arena[idx as usize].take().unwrap();
+        let node = self.take_slot(idx);
         self.free.push(idx);
 
         let ladder = self.ladder_mut(node.side);
         let Some(level_idx) = ladder.index_of(node.tick) else { return node };
 
         if node.prev != NIL {
-            self.arena[node.prev as usize].as_mut().unwrap().next = node.next;
+            self.slot_mut(node.prev).next = node.next;
         } else {
             self.ladder_mut(node.side).level_mut(level_idx).head = node.next;
         }
         if node.next != NIL {
-            self.arena[node.next as usize].as_mut().unwrap().prev = node.prev;
+            self.slot_mut(node.next).prev = node.prev;
         } else {
             self.ladder_mut(node.side).level_mut(level_idx).tail = node.prev;
         }
@@ -501,11 +530,12 @@ impl OrderBook {
         if (idx as usize) >= self.arena.len() || self.arena[idx as usize].is_none() {
             return None;
         }
-        let side = self.arena[idx as usize].as_ref().unwrap().side;
-        let tick = self.arena[idx as usize].as_ref().unwrap().tick;
+        let side = self.slot(idx).side;
+        let tick = self.slot(idx).tick;
         let node = self.unlink(idx);
 
-        let now_empty = self.ladder(side).index_of(tick).map(|i| self.ladder(side).level(i).is_empty()).unwrap_or(true);
+        let now_empty =
+            self.ladder(side).index_of(tick).map(|i| self.ladder(side).level(i).is_empty()).unwrap_or(true);
         let was_best = match side {
             Side::Long => self.best_bid == Some(tick),
             Side::Short => self.best_ask == Some(tick),
@@ -528,22 +558,27 @@ impl OrderBook {
         };
 
         while qty > 0 {
+            let opposite_best = match opposite {
+                Side::Long => self.best_bid,
+                Side::Short => self.best_ask,
+            };
+            let Some(level_tick) = opposite_best else { break };
             let crosses = match side {
-                Side::Long => self.best_ask.is_some_and(|ask| tick >= ask),
-                Side::Short => self.best_bid.is_some_and(|bid| tick <= bid),
+                Side::Long => tick >= level_tick,
+                Side::Short => tick <= level_tick,
             };
             if !crosses {
                 break;
             }
-            let level_tick = match opposite {
-                Side::Long => self.best_bid.unwrap(),
-                Side::Short => self.best_ask.unwrap(),
-            };
-            let level_idx = self.ladder(opposite).index_of(level_tick).unwrap();
+
+            let level_idx = self
+                .ladder(opposite)
+                .index_of(level_tick)
+                .expect("best_bid/best_ask must always reference an allocated level (raise_best only ever sets them to a tick that ensure() just allocated)");
             let head = self.ladder(opposite).level(level_idx).head;
             debug_assert_ne!(head, NIL, "cached best price must point at a non-empty level");
 
-            let maker_qty = self.arena[head as usize].as_ref().unwrap().qty;
+            let maker_qty = self.slot(head).qty;
             let traded = qty.min(maker_qty);
             qty -= traded;
 
@@ -554,7 +589,7 @@ impl OrderBook {
                 // `traded` here, that would double-count it.
                 self.unlink(head);
             } else {
-                self.arena[head as usize].as_mut().unwrap().qty -= traded;
+                self.slot_mut(head).qty -= traded;
                 self.ladder_mut(opposite).level_mut(level_idx).qty -= traded;
             }
 

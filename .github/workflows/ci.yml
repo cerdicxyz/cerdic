@@ -29,6 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Scoped to the crates that are already rustfmt-clean; clob/risk
+      # predate this check and still have formatting drift. Widen to a
+      # bare `cargo fmt --check` once those are brought into line.
+      - run: cargo fmt --check -p cerdic-tee-matcher -p common
+        working-directory: crates
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: crates
       - run: cargo build --workspace
         working-directory: crates
       - run: cargo test --workspace

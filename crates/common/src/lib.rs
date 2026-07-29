@@ -9,8 +9,8 @@
 //!
 //! Numeric surface (load-bearing — must match Solidity ABI):
 //! - `size: i128`              (mirrors Solidity `int256`; on the wire we
-//!                              use the lower 256 bits; i128 keeps arithmetic
-//!                              ergonomic in Rust and overflows in debug mode)
+//!   use the lower 256 bits; i128 keeps arithmetic ergonomic in Rust and
+//!   overflows in debug mode)
 //! - `entryPrice: u128`        (mirrors Solidity `uint256`)
 //! - `margin: u128`            (mirrors Solidity `uint256`)
 //! - `leverage: u128`          (mirrors Solidity `uint256`)

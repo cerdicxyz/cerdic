@@ -14,14 +14,14 @@
 use nu_ansi_term::{Color, Style};
 use std::fmt;
 use time::format_description::well_known::Rfc3339;
-use tracing::{Event, Level, Subscriber, field::{Field, Visit}};
+use tracing::{
+    field::{Field, Visit},
+    Event, Level, Subscriber,
+};
 use tracing_subscriber::{
-    EnvFilter,
-    fmt::{
-        FmtContext, FormatEvent, FormatFields,
-        format::Writer,
-    },
+    fmt::{format::Writer, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
+    EnvFilter,
 };
 
 /// Reads `CERDIC_LOG` (falling back to `RUST_LOG`, then `info`) and installs
