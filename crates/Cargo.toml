@@ -4,6 +4,7 @@ members = [
     "risk",
     "cerdic-tee-matcher",
     "common",
+    "zk-circuits",
 ]
 resolver = "2"
 

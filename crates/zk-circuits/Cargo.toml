@@ -1,0 +1,24 @@
+[package]
+name = "zk-circuits"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MatchCorrectness / MarginCorrectness R1CS circuits (arkworks, Groth16/BN254). See ARCHITECTURE.md's ZK Correctness Layer and docs/spec-contracts-tee.md section 3.4."
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-ec = "0.5"
+ark-relations = "0.5"
+ark-r1cs-std = "0.5"
+ark-groth16 = "0.5"
+ark-snark = "0.5"
+ark-std = { version = "0.5", features = ["std"] }
+rand_chacha = "0.3"
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
