@@ -23,21 +23,13 @@ jobs:
       - run: npm run build
         working-directory: app
 
-  engine:
-    name: Engine (Rust workspace)
+  crates:
+    name: Crates (Rust workspace)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace
-        working-directory: infra/engine
+        working-directory: crates
       - run: cargo test --workspace
-        working-directory: infra/engine
-
-  crates:
-    name: Crates (Rust)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --manifest-path crates/Cargo.toml || true
+        working-directory: crates

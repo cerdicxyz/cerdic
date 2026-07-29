@@ -1,5 +1,4 @@
 packages:
   - "packages/contracts"
-  - "infra/engine"
   - "packages/frontend"
   - "packages/shared"

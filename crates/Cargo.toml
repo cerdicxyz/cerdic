@@ -1,3 +1,31 @@
 [workspace]
-members = []
+members = [
+    "clob",
+    "risk",
+    "cerdic-tee-matcher",
+    "common",
+]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cerdic/cerdic"
+
+[workspace.dependencies]
+# Async runtime + test helpers.
+tokio = "1"
+# Serde for FFI/ABI serialization across the engine boundary.
+serde = "1"
+serde_json = "1"
+# Typed error surfaces for the engine crates.
+thiserror = "1"
+# EVM RPC + ABI bindings for the CLOB and risk crates (settlement calls).
+alloy = "0.3"
+# Property-based test harness for the matching + risk engines.
+proptest = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

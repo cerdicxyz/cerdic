@@ -583,16 +583,15 @@ correctness guarantee that lands a few seconds to minutes later.
 │
 ├── app/                           # Vite + React frontend
 │
-├── crates/                        # Rust workspace scaffold for non-engine crates (empty — TODO)
+├── crates/                        # Rust workspace — off-chain matching/risk/TEE-matcher
+│   ├── clob/                     # off-chain matching engine (built, ~1.2k lines)
+│   ├── risk/                     # margin engine — isolated only today, needs
+│   │                             # f_S/f_C/f_L/f_K upgrade
+│   ├── cerdic-tee-matcher/       # the TEE binary — see docs/spec-contracts-tee.md
+│   └── common/                   # shared types
 │
-├── infra/
-│   └── engine/                   # Rust — the off-chain matching/risk/TEE-matcher workspace
-│       └── crates/
-│           ├── clob/             # off-chain matching engine (built, ~1.2k lines)
-│           ├── risk/             # margin engine — isolated only today, needs
-│           │                     # f_S/f_C/f_L/f_K upgrade
-│           ├── rfq-matcher/      # TEE-hosted matcher (stub — TODO)
-│           └── common/           # shared types
+├── infra/                         # deployment/infra config — Docker, TEE deploy scripts,
+│                                   # IaC (empty — TODO)
 │
 ├── mobile/                        # mobile client (empty — TODO)
 │

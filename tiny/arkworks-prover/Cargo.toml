@@ -1,6 +1,6 @@
 [workspace]
 # Empty — marks this as its own workspace root so Cargo doesn't walk up and
-# attach it to the repo root's packages/engine workspace.
+# attach it to the repo root's crates workspace.
 
 [package]
 name = "arkworks-prover"
