@@ -69,8 +69,55 @@ pub type OrderId = u32;
 /// oracle-scaled unit (e.g. 1e18) the rest of the kernel uses.
 pub type Tick = u64;
 pub type Qty = u64;
+/// Opaque owner identifier, used only for self-trade prevention — the
+/// caller owns the mapping to a real identity (e.g. `portfolioKey`).
+pub type OwnerId = u64;
+/// Expiry timestamp, in whatever monotonic unit the caller's `now` (see
+/// `OrderBook::submit`) is denominated in (block number, unix seconds,
+/// etc.) — the book itself is agnostic, it only ever compares `now` to a
+/// stored expiry with `>=`.
+pub type Timestamp = u64;
 
 const NIL: u32 = u32::MAX;
+
+fn opposite_side(side: Side) -> Side {
+    match side {
+        Side::Long => Side::Short,
+        Side::Short => Side::Long,
+    }
+}
+
+/// What to do with any quantity that doesn't fill immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeInForce {
+    /// Rest any unfilled remainder in the book until cancelled.
+    GoodTilCancel,
+    /// Rest the remainder, but drop it once `now >= expiry` — checked
+    /// lazily, the moment matching would otherwise touch it, not on a
+    /// timer (see module docs, "Lazy expiry").
+    GoodTilTime(Timestamp),
+    /// Fill whatever crosses immediately; cancel anything left over.
+    /// Never rests.
+    ImmediateOrCancel,
+    /// All or nothing: fill the entire quantity immediately, or match
+    /// none of it and rest nothing. No partial fills.
+    FillOrKill,
+}
+
+/// A new order to submit. See `OrderBook::submit`.
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrder {
+    pub side: Side,
+    pub tick: Tick,
+    pub qty: Qty,
+    pub owner: OwnerId,
+    pub tif: TimeInForce,
+    /// Reject the order outright if it would take any resting liquidity
+    /// (cross the book), instead of only ever adding it. Standard
+    /// maker-only semantics: an order that would cross is rejected in
+    /// full, not truncated to its non-crossing portion.
+    pub post_only: bool,
+}
 
 /// One resting order, as a node in a level's intrusive FIFO list.
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +125,8 @@ struct OrderNode {
     tick: Tick,
     qty: Qty,
     side: Side,
+    owner: OwnerId,
+    expiry: Option<Timestamp>,
     prev: u32,
     next: u32,
 }
@@ -295,6 +344,19 @@ impl Ladder {
         self.occupancy.prev_set_from(idx)
     }
 
+    /// Next occupied level strictly worse than `from_idx` on this side —
+    /// bids get worse as the index decreases (best bid is the highest
+    /// tick), asks get worse as the index increases (best ask is the
+    /// lowest tick). Shared by `advance_best_from` (mutating) and
+    /// `available_to_match` (read-only), so the two can't drift apart on
+    /// which direction "worse" means.
+    fn next_worse_level(&self, side: Side, from_idx: usize) -> Option<usize> {
+        match side {
+            Side::Long => from_idx.checked_sub(1).and_then(|i| self.prev_occupied_from(i)),
+            Side::Short => self.next_occupied_from(from_idx + 1),
+        }
+    }
+
     /// Index for `tick` if that level has ever been allocated (does not
     /// grow the array — used on the read/cancel path where a miss just
     /// means "no such level").
@@ -325,6 +387,7 @@ impl Ladder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fill {
     pub maker_id: OrderId,
+    pub maker_owner: OwnerId,
     pub tick: Tick,
     pub qty: Qty,
     /// True when the maker order was fully consumed and removed from the
@@ -339,6 +402,23 @@ pub struct SubmitResult {
     pub fills: Vec<Fill>,
     pub resting_id: Option<OrderId>,
     pub resting_qty: Qty,
+    /// Resting orders the matching walk removed because they'd expired
+    /// (`now >= expiry`) when it reached them — not traded against, just
+    /// pruned in passing. The caller should treat these as cancelled,
+    /// not filled.
+    pub expired: Vec<OrderId>,
+    /// Resting orders cancelled because they belonged to the same
+    /// `owner` as this incoming order (self-trade prevention, "cancel
+    /// resting" policy — the standing order loses, not the incoming
+    /// one). Not traded against.
+    pub self_trade_cancelled: Vec<OrderId>,
+    /// Set when `post_only` was true and the order would have crossed
+    /// the book. The order was rejected in full — `fills` is empty and
+    /// nothing rests.
+    pub post_only_rejected: bool,
+    /// Set when `tif` was `FillOrKill` and the book could not fill the
+    /// entire quantity immediately. Nothing was matched or rested.
+    pub fill_or_kill_failed: bool,
 }
 
 /// Price-time priority limit order book for one market. See module docs
@@ -479,18 +559,10 @@ impl OrderBook {
     fn advance_best_from(&mut self, side: Side, emptied_tick: Tick) {
         let ladder = self.ladder(side);
         let Some(start) = ladder.index_of(emptied_tick) else { return };
+        let next = self.ladder(side).next_worse_level(side, start).map(|i| self.ladder(side).tick_at(i));
         match side {
-            Side::Long => {
-                self.best_bid = if start == 0 {
-                    None
-                } else {
-                    self.ladder(side).prev_occupied_from(start - 1).map(|i| self.ladder(side).tick_at(i))
-                };
-            }
-            Side::Short => {
-                self.best_ask =
-                    self.ladder(side).next_occupied_from(start + 1).map(|i| self.ladder(side).tick_at(i));
-            }
+            Side::Long => self.best_bid = next,
+            Side::Short => self.best_ask = next,
         }
     }
 
@@ -550,12 +622,87 @@ impl OrderBook {
     /// opposite side at prices that cross, then rests any remainder.
     /// Price-time priority: at each price level, the resting order that
     /// arrived first (the level's FIFO head) fills first.
-    pub fn submit(&mut self, side: Side, tick: Tick, mut qty: Qty) -> SubmitResult {
-        let mut result = SubmitResult::default();
-        let opposite = match side {
-            Side::Long => Side::Short,
-            Side::Short => Side::Long,
+    /// Read-only walk mirroring `submit`'s matching loop, used only to
+    /// answer "could a Fill-or-Kill order for `qty` be fully satisfied
+    /// right now?" before committing any state change. Must skip exactly
+    /// the same orders `submit` would skip (expired, self-owned) — if
+    /// this ever drifts from `submit`'s real skip logic, FOK can
+    /// overestimate available liquidity and let a partial fill through
+    /// as if it were all-or-nothing, which is the one bug this order
+    /// type exists specifically to prevent.
+    fn available_to_match(&self, side: Side, tick: Tick, needed: Qty, owner: OwnerId, now: Timestamp) -> Qty {
+        let opposite = opposite_side(side);
+        let mut level_tick = match opposite {
+            Side::Long => self.best_bid,
+            Side::Short => self.best_ask,
         };
+        let mut total: Qty = 0;
+
+        while let Some(lt) = level_tick {
+            let crosses = match side {
+                Side::Long => tick >= lt,
+                Side::Short => tick <= lt,
+            };
+            if !crosses {
+                break;
+            }
+            let Some(level_idx) = self.ladder(opposite).index_of(lt) else { break };
+
+            let mut cur = self.ladder(opposite).level(level_idx).head;
+            while cur != NIL {
+                let node = self.slot(cur);
+                let expired = node.expiry.is_some_and(|e| now >= e);
+                if !expired && node.owner != owner {
+                    total = total.saturating_add(node.qty);
+                    if total >= needed {
+                        return total;
+                    }
+                }
+                cur = node.next;
+            }
+
+            level_tick = self
+                .ladder(opposite)
+                .next_worse_level(opposite, level_idx)
+                .map(|i| self.ladder(opposite).tick_at(i));
+        }
+
+        total
+    }
+
+    /// Submits a new order per `order.tif`/`order.post_only`: matches
+    /// immediately against the opposite side at prices that cross, then
+    /// rests any remainder (unless `tif` says not to). Price-time
+    /// priority: at each price level, the resting order that arrived
+    /// first (the level's FIFO head) fills first — except any head found
+    /// expired or owned by `order.owner` is pruned/cancelled in passing
+    /// rather than matched.
+    ///
+    /// `now` is the caller's clock (block number, unix seconds — the
+    /// book doesn't care which, as long as it's consistent with whatever
+    /// `TimeInForce::GoodTilTime` expiries were stamped with). Passed
+    /// in, not read from a system clock, so matching stays deterministic
+    /// and testable.
+    pub fn submit(&mut self, order: NewOrder, now: Timestamp) -> SubmitResult {
+        let mut result = SubmitResult::default();
+        let NewOrder { side, tick, mut qty, owner, tif, post_only: _ } = order;
+        let opposite = opposite_side(side);
+
+        if order.post_only {
+            let would_cross = match opposite {
+                Side::Long => self.best_bid.is_some_and(|bid| tick <= bid),
+                Side::Short => self.best_ask.is_some_and(|ask| tick >= ask),
+            };
+            if would_cross {
+                result.post_only_rejected = true;
+                return result;
+            }
+        }
+
+        if tif == TimeInForce::FillOrKill && self.available_to_match(side, tick, qty, owner, now) < qty {
+            result.fill_or_kill_failed = true;
+            return result;
+        }
 
         while qty > 0 {
             let opposite_best = match opposite {
@@ -578,7 +725,25 @@ impl OrderBook {
             let head = self.ladder(opposite).level(level_idx).head;
             debug_assert_ne!(head, NIL, "cached best price must point at a non-empty level");
 
-            let maker_qty = self.slot(head).qty;
+            let head_node = self.slot(head);
+            let expired = head_node.expiry.is_some_and(|e| now >= e);
+            let self_trade = head_node.owner == owner;
+
+            if expired || self_trade {
+                self.unlink(head);
+                if expired {
+                    result.expired.push(head);
+                } else {
+                    result.self_trade_cancelled.push(head);
+                }
+                if self.ladder(opposite).level(level_idx).is_empty() {
+                    self.advance_best_from(opposite, level_tick);
+                }
+                continue;
+            }
+
+            let maker_qty = head_node.qty;
+            let maker_owner = head_node.owner;
             let traded = qty.min(maker_qty);
             qty -= traded;
 
@@ -593,15 +758,22 @@ impl OrderBook {
                 self.ladder_mut(opposite).level_mut(level_idx).qty -= traded;
             }
 
-            result.fills.push(Fill { maker_id: head, tick: level_tick, qty: traded, maker_filled });
+            result.fills.push(Fill {
+                maker_id: head,
+                maker_owner,
+                tick: level_tick,
+                qty: traded,
+                maker_filled,
+            });
 
             if self.ladder(opposite).level(level_idx).is_empty() {
                 self.advance_best_from(opposite, level_tick);
             }
         }
 
-        if qty > 0 {
-            let node = OrderNode { tick, qty, side, prev: NIL, next: NIL };
+        if qty > 0 && !matches!(tif, TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill) {
+            let expiry = if let TimeInForce::GoodTilTime(t) = tif { Some(t) } else { None };
+            let node = OrderNode { tick, qty, side, owner, expiry, prev: NIL, next: NIL };
             let idx = self.alloc(node);
             self.push_back(side, tick, idx);
             result.resting_id = Some(idx);
@@ -705,10 +877,21 @@ mod occupancy_tests {
 mod tests {
     use super::*;
 
+    /// Good-til-cancel order from `owner`, not post-only. Tests that
+    /// don't care about self-trade prevention use distinct owners for
+    /// maker/taker (as real distinct traders would be) so the new
+    /// same-owner-cancels-resting behavior doesn't change their meaning.
+    fn gtc(side: Side, tick: Tick, qty: Qty, owner: OwnerId) -> NewOrder {
+        NewOrder { side, tick, qty, owner, tif: TimeInForce::GoodTilCancel, post_only: false }
+    }
+
+    const MAKER: OwnerId = 1;
+    const TAKER: OwnerId = 2;
+
     #[test]
     fn resting_order_sets_best_price() {
         let mut book = OrderBook::new();
-        let r = book.submit(Side::Long, 100, 10);
+        let r = book.submit(gtc(Side::Long, 100, 10, MAKER), 0);
         assert_eq!(r.resting_qty, 10);
         assert_eq!(book.best_bid(), Some(100));
         assert_eq!(book.best_ask(), None);
@@ -717,8 +900,8 @@ mod tests {
     #[test]
     fn crossing_order_fills_immediately() {
         let mut book = OrderBook::new();
-        book.submit(Side::Short, 100, 5);
-        let r = book.submit(Side::Long, 100, 5);
+        book.submit(gtc(Side::Short, 100, 5, MAKER), 0);
+        let r = book.submit(gtc(Side::Long, 100, 5, TAKER), 0);
         assert_eq!(r.fills.len(), 1);
         assert_eq!(r.fills[0].qty, 5);
         assert!(r.fills[0].maker_filled);
@@ -729,8 +912,8 @@ mod tests {
     #[test]
     fn partial_fill_leaves_maker_resting() {
         let mut book = OrderBook::new();
-        book.submit(Side::Short, 100, 10);
-        let r = book.submit(Side::Long, 100, 4);
+        book.submit(gtc(Side::Short, 100, 10, MAKER), 0);
+        let r = book.submit(gtc(Side::Long, 100, 4, TAKER), 0);
         assert_eq!(r.fills[0].qty, 4);
         assert!(!r.fills[0].maker_filled);
         assert_eq!(book.depth_at(Side::Short, 100), 6);
@@ -740,18 +923,18 @@ mod tests {
     #[test]
     fn fifo_within_a_level() {
         let mut book = OrderBook::new();
-        let first = book.submit(Side::Short, 100, 5).resting_id.unwrap();
-        let _second = book.submit(Side::Short, 100, 5).resting_id.unwrap();
-        let r = book.submit(Side::Long, 100, 5);
+        let first = book.submit(gtc(Side::Short, 100, 5, MAKER), 0).resting_id.unwrap();
+        let _second = book.submit(gtc(Side::Short, 100, 5, MAKER), 0).resting_id.unwrap();
+        let r = book.submit(gtc(Side::Long, 100, 5, TAKER), 0);
         assert_eq!(r.fills[0].maker_id, first, "earlier resting order must fill first");
     }
 
     #[test]
     fn walks_multiple_price_levels_by_price_priority() {
         let mut book = OrderBook::new();
-        book.submit(Side::Short, 101, 5); // worse price
-        book.submit(Side::Short, 100, 5); // best price
-        let r = book.submit(Side::Long, 101, 10);
+        book.submit(gtc(Side::Short, 101, 5, MAKER), 0); // worse price
+        book.submit(gtc(Side::Short, 100, 5, MAKER), 0); // best price
+        let r = book.submit(gtc(Side::Long, 101, 10, TAKER), 0);
         assert_eq!(r.fills.len(), 2);
         assert_eq!(r.fills[0].tick, 100, "best (lowest ask) price must fill first");
         assert_eq!(r.fills[1].tick, 101);
@@ -761,8 +944,8 @@ mod tests {
     #[test]
     fn cancel_removes_order_and_advances_best() {
         let mut book = OrderBook::new();
-        let low = book.submit(Side::Long, 99, 5).resting_id.unwrap();
-        let high = book.submit(Side::Long, 100, 5).resting_id.unwrap();
+        let low = book.submit(gtc(Side::Long, 99, 5, MAKER), 0).resting_id.unwrap();
+        let high = book.submit(gtc(Side::Long, 100, 5, MAKER), 0).resting_id.unwrap();
         assert_eq!(book.best_bid(), Some(100));
 
         let cancelled = book.cancel(high);
@@ -782,8 +965,8 @@ mod tests {
     #[test]
     fn resting_order_below_current_base_rebases_ladder() {
         let mut book = OrderBook::new();
-        book.submit(Side::Long, 100, 1);
-        book.submit(Side::Long, 50, 1); // forces the ladder to re-base downward
+        book.submit(gtc(Side::Long, 100, 1, MAKER), 0);
+        book.submit(gtc(Side::Long, 50, 1, MAKER), 0); // forces the ladder to re-base downward
         assert_eq!(book.depth_at(Side::Long, 100), 1);
         assert_eq!(book.depth_at(Side::Long, 50), 1);
         assert_eq!(book.best_bid(), Some(100));
@@ -792,9 +975,116 @@ mod tests {
     #[test]
     fn arena_slot_is_reused_after_cancel() {
         let mut book = OrderBook::new();
-        let a = book.submit(Side::Long, 100, 1).resting_id.unwrap();
+        let a = book.submit(gtc(Side::Long, 100, 1, MAKER), 0).resting_id.unwrap();
         book.cancel(a).unwrap();
-        let b = book.submit(Side::Long, 100, 1).resting_id.unwrap();
+        let b = book.submit(gtc(Side::Long, 100, 1, MAKER), 0).resting_id.unwrap();
         assert_eq!(a, b, "freed arena slots must be recycled, not grown unboundedly");
+    }
+
+    // --- New order semantics: self-trade prevention, IOC, FOK, GTT expiry, post-only ---
+
+    #[test]
+    fn self_trade_cancels_resting_order_instead_of_filling() {
+        let mut book = OrderBook::new();
+        let resting = book.submit(gtc(Side::Short, 100, 5, MAKER), 0).resting_id.unwrap();
+        let r = book.submit(gtc(Side::Long, 100, 5, MAKER), 0); // same owner as resting
+        assert!(r.fills.is_empty(), "must not trade against its own resting order");
+        assert_eq!(r.self_trade_cancelled, vec![resting]);
+        assert_eq!(book.best_ask(), None, "the self-owned resting order must be gone, not just skipped");
+        // The cancelled order's arena slot is immediately recycled (see
+        // arena_slot_is_reused_after_cancel), so the taker's own resting
+        // remainder reuses the same id, not a fresh one.
+        assert_eq!(r.resting_id, Some(resting), "the taker's own remaining qty still rests");
+    }
+
+    #[test]
+    fn self_trade_prevention_falls_through_to_a_different_owner() {
+        let mut book = OrderBook::new();
+        let mine = book.submit(gtc(Side::Short, 100, 5, MAKER), 0).resting_id.unwrap();
+        let theirs = book.submit(gtc(Side::Short, 100, 5, TAKER), 0).resting_id.unwrap();
+        let r = book.submit(gtc(Side::Long, 100, 5, MAKER), 0);
+        assert_eq!(r.self_trade_cancelled, vec![mine]);
+        assert_eq!(r.fills.len(), 1);
+        assert_eq!(r.fills[0].maker_id, theirs);
+        assert_eq!(r.fills[0].maker_owner, TAKER);
+    }
+
+    #[test]
+    fn ioc_drops_unfilled_remainder_instead_of_resting() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 100, 3, MAKER), 0);
+        let order = NewOrder { tif: TimeInForce::ImmediateOrCancel, ..gtc(Side::Long, 100, 10, TAKER) };
+        let r = book.submit(order, 0);
+        assert_eq!(r.fills[0].qty, 3);
+        assert_eq!(r.resting_id, None, "IOC must never rest a remainder");
+        assert_eq!(r.resting_qty, 0);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn fok_fails_whole_order_when_liquidity_insufficient() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 100, 3, MAKER), 0);
+        let order = NewOrder { tif: TimeInForce::FillOrKill, ..gtc(Side::Long, 100, 10, TAKER) };
+        let r = book.submit(order, 0);
+        assert!(r.fill_or_kill_failed);
+        assert!(r.fills.is_empty(), "a failed FOK must not partially fill");
+        assert_eq!(book.depth_at(Side::Short, 100), 3, "the untouched maker order must still be resting");
+    }
+
+    #[test]
+    fn fok_fills_fully_when_liquidity_sufficient_across_levels() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 100, 4, MAKER), 0);
+        book.submit(gtc(Side::Short, 101, 4, MAKER), 0);
+        let order = NewOrder { tif: TimeInForce::FillOrKill, ..gtc(Side::Long, 101, 8, TAKER) };
+        let r = book.submit(order, 0);
+        assert!(!r.fill_or_kill_failed);
+        assert_eq!(r.fills.iter().map(|f| f.qty).sum::<Qty>(), 8);
+        assert_eq!(r.resting_id, None);
+    }
+
+    #[test]
+    fn expired_resting_order_is_pruned_not_matched() {
+        let mut book = OrderBook::new();
+        let order = NewOrder { tif: TimeInForce::GoodTilTime(100), ..gtc(Side::Short, 100, 5, MAKER) };
+        let expired = book.submit(order, 0).resting_id.unwrap();
+        let r = book.submit(gtc(Side::Long, 100, 5, TAKER), 100); // now == expiry, so expired
+        assert!(r.fills.is_empty());
+        assert_eq!(r.expired, vec![expired]);
+        assert_eq!(book.best_ask(), None);
+        // Same arena-slot recycling as arena_slot_is_reused_after_cancel.
+        assert_eq!(r.resting_id, Some(expired), "taker's qty rests since nothing was left to match");
+    }
+
+    #[test]
+    fn unexpired_gtt_order_still_matches_normally() {
+        let mut book = OrderBook::new();
+        let order = NewOrder { tif: TimeInForce::GoodTilTime(100), ..gtc(Side::Short, 100, 5, MAKER) };
+        book.submit(order, 0);
+        let r = book.submit(gtc(Side::Long, 100, 5, TAKER), 50); // now < expiry
+        assert_eq!(r.fills.len(), 1);
+        assert!(r.expired.is_empty());
+    }
+
+    #[test]
+    fn post_only_rejects_a_crossing_order_outright() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 100, 5, MAKER), 0);
+        let order = NewOrder { post_only: true, ..gtc(Side::Long, 100, 5, TAKER) };
+        let r = book.submit(order, 0);
+        assert!(r.post_only_rejected);
+        assert!(r.fills.is_empty());
+        assert_eq!(r.resting_id, None, "a rejected post-only order rests nothing, not even its own quantity");
+        assert_eq!(book.depth_at(Side::Short, 100), 5, "the resting maker order must be untouched");
+    }
+
+    #[test]
+    fn post_only_rests_normally_when_it_would_not_cross() {
+        let mut book = OrderBook::new();
+        let order = NewOrder { post_only: true, ..gtc(Side::Long, 100, 5, MAKER) };
+        let r = book.submit(order, 0);
+        assert!(!r.post_only_rejected);
+        assert_eq!(r.resting_qty, 5);
     }
 }
