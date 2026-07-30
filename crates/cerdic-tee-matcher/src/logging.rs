@@ -27,10 +27,30 @@ use tracing_subscriber::{
 /// Reads `CERDIC_LOG` (falling back to `RUST_LOG`, then `info`) and installs
 /// the formatter below as the process-wide default subscriber. Call once,
 /// at the top of `main`, before anything else logs.
+///
+/// # Why dependency crates are capped at `warn` by default
+///
+/// A bare level like `debug` is scoped to this crate only, not applied
+/// globally: `ark-r1cs-std` instruments its field arithmetic (called
+/// millions of times over a single Groth16 setup's FFT/MSM, not just
+/// once per constraint) with spans that eagerly `Debug`-format their
+/// operands. A 254-bit field element's `Debug` impl converts it to a
+/// decimal string, an expensive operation when done millions of times.
+/// A blanket `info`-or-lower filter enables those spans and turns a
+/// sub-second Groth16 setup into one that burns CPU and allocates
+/// gigabytes until the OS kills it, found the hard way while trying to
+/// demo this binary's logging. If `CERDIC_LOG`/`RUST_LOG` already
+/// contains a `target=level` directive (any `=`), it's assumed to be a
+/// deliberate, fully-specified filter and is used as-is.
 pub fn init() {
-    let filter = EnvFilter::try_from_env("CERDIC_LOG")
-        .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let requested = std::env::var("CERDIC_LOG").or_else(|_| std::env::var("RUST_LOG")).ok();
+
+    let directive = match requested {
+        Some(level) if !level.contains('=') => format!("warn,cerdic_tee_matcher={level}"),
+        Some(explicit) => explicit,
+        None => "warn,cerdic_tee_matcher=info".to_string(),
+    };
+    let filter = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("warn,cerdic_tee_matcher=info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
