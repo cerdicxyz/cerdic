@@ -50,7 +50,8 @@ pub fn init() {
         Some(explicit) => explicit,
         None => "warn,cerdic_tee_matcher=info".to_string(),
     };
-    let filter = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("warn,cerdic_tee_matcher=info"));
+    let filter =
+        EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("warn,cerdic_tee_matcher=info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
