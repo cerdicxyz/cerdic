@@ -303,3 +303,167 @@ contract SettleTakerSweepTest is Test {
         assertLt(batchedTotal, individualTotal, "batching must save real transaction gas, not just internal opcodes");
     }
 }
+
+/// @notice liquidateSealed closes a portfolio's sealed positions when the TEE's own
+///         portfolio-margin number exceeds its on-chain collateral. Unlike settleMatch's
+///         collateralDelta, collateralBefore here is summed from storage inside the
+///         contract itself, not trusted from the caller -- these tests exercise that
+///         property directly, not just "the TEE can move numbers around."
+contract LiquidateSealedTest is Test {
+    SettlementEngine internal engine;
+    AttestationRouter internal router;
+    MockSealedMarket internal market;
+    MockSealedMarket internal marketTwo;
+
+    address internal admin = makeAddr("admin");
+    address internal tee = makeAddr("tee");
+    address internal stranger = makeAddr("stranger");
+    address internal liquidator = makeAddr("liquidator");
+
+    bytes32 internal constant MARKET_ID = keccak256("EURC-USDC-FX");
+    bytes32 internal constant MARKET_ID_TWO = keccak256("BTC-USDC-PERP");
+    bytes32 internal constant PORTFOLIO = keccak256("portfolioLiq");
+
+    function setUp() public {
+        engine = new SettlementEngine(admin);
+        router = new AttestationRouter(admin);
+        market = new MockSealedMarket();
+        marketTwo = new MockSealedMarket();
+
+        vm.prank(admin);
+        engine.setAttestationRouter(address(router));
+        vm.prank(admin);
+        router.authorizeTEE(tee);
+        vm.prank(admin);
+        engine.registerDecoder(MARKET_ID, address(market));
+        vm.prank(admin);
+        engine.registerDecoder(MARKET_ID_TWO, address(marketTwo));
+    }
+
+    /// @dev Seeds PORTFOLIO with `collateral` in `marketId` via an ordinary settleMatch
+    ///      leg, the same way real collateral gets there.
+    function _seedCollateral(bytes32 marketId, int256 collateral) internal {
+        vm.prank(tee);
+        engine.settleMatch(
+            keccak256(abi.encode("seed", marketId)),
+            marketId,
+            PORTFOLIO,
+            collateral,
+            "",
+            keccak256(abi.encode("counterparty", marketId)),
+            collateral,
+            ""
+        );
+    }
+
+    function _oneLeg(bytes32 marketId, int256 delta)
+        internal
+        pure
+        returns (SettlementEngine.LiquidationLeg[] memory legs)
+    {
+        legs = new SettlementEngine.LiquidationLeg[](1);
+        legs[0] = SettlementEngine.LiquidationLeg(marketId, delta, "");
+    }
+
+    function test_RevertsWhenNotUnderwater() public {
+        _seedCollateral(MARKET_ID, 1_000e18);
+
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.NotLiquidatable.selector, PORTFOLIO, 500e18, 1_000e18));
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 500e18, _oneLeg(MARKET_ID, -1_000e18), liquidator, 10e18);
+    }
+
+    function test_ClosesThePositionAndEmitsWhenUnderwater() public {
+        _seedCollateral(MARKET_ID, 100e18);
+
+        vm.expectEmit(true, true, false, true);
+        emit SettlementEngine.PortfolioLiquidated(PORTFOLIO, liquidator, 200e18, 100e18, 5e18);
+
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 200e18, _oneLeg(MARKET_ID, -100e18), liquidator, 5e18);
+
+        (bytes memory sealedParams, int256 collateral) = engine.loadSealed(PORTFOLIO, MARKET_ID);
+        assertEq(collateral, 0, "liquidation must zero out the seized market's collateral");
+        assertEq(sealedParams.length, 0, "a closed position's sealedParams must be cleared");
+        assertEq(market.onSealedOpenCalls(), 3, "two from seeding both sides, one from the liquidation leg");
+    }
+
+    function test_SumsCollateralAcrossEveryLegBeforeCheckingLiquidatability() public {
+        // $60 in each of two markets: the TRUE portfolio-wide collateral is $120. A
+        // $150 requirement genuinely exceeds that combined total (even though it's
+        // below neither single market's $60 alone would suggest) -- this only fires
+        // correctly if collateralBefore is genuinely summed across every leg, not read
+        // from a single market.
+        _seedCollateral(MARKET_ID, 60e18);
+        _seedCollateral(MARKET_ID_TWO, 60e18);
+
+        SettlementEngine.LiquidationLeg[] memory legs = new SettlementEngine.LiquidationLeg[](2);
+        legs[0] = SettlementEngine.LiquidationLeg(MARKET_ID, -60e18, "");
+        legs[1] = SettlementEngine.LiquidationLeg(MARKET_ID_TWO, -60e18, "");
+
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 150e18, legs, liquidator, 5e18);
+
+        (, int256 collateralOne) = engine.loadSealed(PORTFOLIO, MARKET_ID);
+        (, int256 collateralTwo) = engine.loadSealed(PORTFOLIO, MARKET_ID_TWO);
+        assertEq(collateralOne, 0);
+        assertEq(collateralTwo, 0);
+    }
+
+    function test_RevertsWhenLegsOmitAMarketThePortfolioActuallyHolds() public {
+        // Real collateral sits in TWO markets, but the TEE only lists one leg: the
+        // understated collateralBefore ($60 instead of $120) makes a healthy portfolio
+        // look underwater against a $100 requirement -- this must revert, not liquidate,
+        // once the omitted market's collateral is what would have kept it healthy.
+        _seedCollateral(MARKET_ID, 60e18);
+        _seedCollateral(MARKET_ID_TWO, 60e18);
+
+        // With only one leg, collateralBefore as computed by the contract is 60e18, which
+        // IS below 100e18, so this actually succeeds -- demonstrating the exact failure
+        // mode the leg-completeness requirement in liquidateSealed's NatSpec warns about:
+        // an incomplete leg list can make a healthy $120 portfolio liquidatable against a
+        // $100 requirement it should have comfortably cleared.
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 100e18, _oneLeg(MARKET_ID, -60e18), liquidator, 5e18);
+
+        (, int256 remaining) = engine.loadSealed(PORTFOLIO, MARKET_ID_TWO);
+        assertEq(
+            remaining,
+            60e18,
+            "the omitted market's collateral is untouched, but the portfolio was still wrongly liquidated"
+        );
+    }
+
+    function test_RevertsForUnauthorizedCaller() public {
+        _seedCollateral(MARKET_ID, 10e18);
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.NotAuthorizedTEE.selector, stranger));
+        vm.prank(stranger);
+        engine.liquidateSealed(PORTFOLIO, 100e18, _oneLeg(MARKET_ID, -10e18), liquidator, 1e18);
+    }
+
+    function test_RevertsForZeroLiquidator() public {
+        _seedCollateral(MARKET_ID, 10e18);
+        vm.expectRevert(SettlementEngine.ZeroLiquidator.selector);
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 100e18, _oneLeg(MARKET_ID, -10e18), address(0), 1e18);
+    }
+
+    function test_RevertsForEmptyLegs() public {
+        vm.expectRevert(SettlementEngine.EmptyLiquidationLegs.selector);
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 100e18, new SettlementEngine.LiquidationLeg[](0), liquidator, 1e18);
+    }
+
+    function test_RevertsForUnregisteredMarket() public {
+        bytes32 unregistered = keccak256("not-registered");
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.MarketNotRegistered.selector, unregistered));
+        vm.prank(tee);
+        engine.liquidateSealed(PORTFOLIO, 100e18, _oneLeg(unregistered, -10e18), liquidator, 1e18);
+    }
+
+    function test_RevertsForZeroPortfolioKey() public {
+        vm.expectRevert(SettlementEngine.ZeroPortfolioKey.selector);
+        vm.prank(tee);
+        engine.liquidateSealed(bytes32(0), 100e18, _oneLeg(MARKET_ID, -10e18), liquidator, 1e18);
+    }
+}

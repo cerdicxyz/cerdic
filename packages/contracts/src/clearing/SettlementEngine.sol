@@ -72,6 +72,14 @@ contract SettlementEngine is PositionEngine {
         bytes sealedParams;
     }
 
+    /// @notice One market's leg of a liquidateSealed call: how that market's sealed
+    ///         position changes when the portfolio is closed out.
+    struct LiquidationLeg {
+        bytes32 marketId;
+        int256 collateralDelta;
+        bytes sealedParams;
+    }
+
     event TradeSettled(
         bytes32 indexed marketId,
         address indexed longTrader,
@@ -84,6 +92,16 @@ contract SettlementEngine is PositionEngine {
     event PositionCloseSettled(address indexed trader, bytes32 indexed marketId, int256 remainingSize);
     event AttestationRouterUpdated(address indexed router);
     event MatchSettled(bytes32 indexed matchId);
+    /// @notice liquidatorReward is informational only, no token transfer happens here --
+    ///         same no-real-token-movement scope collateralDelta already has everywhere
+    ///         else in this contract (see SealedPosition's doc), not yet a payout.
+    event PortfolioLiquidated(
+        bytes32 indexed portfolioKey,
+        address indexed liquidator,
+        uint256 marginRequirement,
+        uint256 collateralBefore,
+        uint256 liquidatorReward
+    );
 
     error MarketNotRegistered(bytes32 marketId);
     error InsufficientMargin(address trader, int256 size, uint256 margin);
@@ -98,6 +116,10 @@ contract SettlementEngine is PositionEngine {
     error ZeroPortfolioKey();
     error MatchAlreadySettled(bytes32 matchId);
     error InsufficientSealedCollateral(bytes32 portfolioKey, bytes32 marketId, int256 wouldBe);
+    error ZeroLiquidator();
+    error EmptyLiquidationLegs();
+    error NegativeSealedCollateral(bytes32 portfolioKey, bytes32 marketId);
+    error NotLiquidatable(bytes32 portfolioKey, uint256 marginRequirement, uint256 collateralBefore);
 
     constructor(address admin) PositionEngine(admin) {
         _grantRole(SETTLER_ROLE, admin);
@@ -245,6 +267,59 @@ contract SettlementEngine is PositionEngine {
 
             emit MatchSettled(leg.matchId);
         }
+    }
+
+    /// @notice TEE-only: closes every position a portfolioKey holds across the given
+    ///         markets when the TEE's own portfolio-margin computation
+    ///         (marginRequirement, M(P) = f_S+f_C+f_L+f_K, see crates/risk::portfolio)
+    ///         exceeds the portfolio's on-chain collateral. Unlike collateralDelta
+    ///         elsewhere in this contract, the aggregate collateral this checks against is
+    ///         NOT TEE-asserted -- it's summed here, from storage, across every leg
+    ///         supplied, before any leg is applied. Only marginRequirement itself is
+    ///         TEE-asserted (computing M(P) needs plaintext position data this contract
+    ///         never has); independently verifying it on-chain needs
+    ///         MarginCorrectness's Groth16 proof through IZkVerifier, a tracked follow-up,
+    ///         not this function's job today.
+    /// @dev    legs MUST cover every market this portfolioKey holds collateral in, not a
+    ///         subset -- an incomplete leg list understates collateralBefore and could let
+    ///         a healthy portfolio look underwater. The TEE builds this list from the same
+    ///         portfolio-to-markets index /liquidation-check already uses.
+    function liquidateSealed(
+        bytes32 portfolioKey,
+        uint256 marginRequirement,
+        LiquidationLeg[] calldata legs,
+        address liquidator,
+        uint256 liquidatorReward
+    ) external {
+        _requireAuthorizedTEE();
+        if (portfolioKey == bytes32(0)) revert ZeroPortfolioKey();
+        if (liquidator == address(0)) revert ZeroLiquidator();
+        if (legs.length == 0) revert EmptyLiquidationLegs();
+
+        uint256 count = legs.length;
+        uint256 collateralBefore;
+        for (uint256 i; i < count; ++i) {
+            bytes32 marketId = legs[i].marketId;
+            if (marketId == bytes32(0)) revert ZeroMarketId();
+            if (positionDecoders[marketId] == address(0)) revert MarketNotRegistered(marketId);
+
+            int256 existing = _sealedPositions[portfolioKey][marketId].collateral;
+            if (existing < 0) revert NegativeSealedCollateral(portfolioKey, marketId);
+            collateralBefore += uint256(existing);
+        }
+
+        if (marginRequirement <= collateralBefore) {
+            revert NotLiquidatable(portfolioKey, marginRequirement, collateralBefore);
+        }
+
+        for (uint256 i; i < count; ++i) {
+            LiquidationLeg calldata leg = legs[i];
+            address market = positionDecoders[leg.marketId];
+            _applySealedLeg(leg.marketId, portfolioKey, leg.collateralDelta, leg.sealedParams);
+            ISealedMarketLifecycle(market).onSealedOpen(portfolioKey, leg.marketId);
+        }
+
+        emit PortfolioLiquidated(portfolioKey, liquidator, marginRequirement, collateralBefore, liquidatorReward);
     }
 
     function _requireAuthorizedTEE() internal view {
