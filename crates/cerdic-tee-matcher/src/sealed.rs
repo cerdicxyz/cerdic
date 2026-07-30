@@ -78,9 +78,10 @@ impl SealedKey {
             return Err(SealError::Truncated);
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce_array: [u8; 12] = nonce_bytes.try_into().expect("split_at(12) guarantees a 12-byte slice");
+        let nonce = Nonce::from(nonce_array);
         let plaintext =
-            self.cipher.decrypt(nonce, ciphertext).map_err(|_| SealError::AuthenticationFailed)?;
+            self.cipher.decrypt(&nonce, ciphertext).map_err(|_| SealError::AuthenticationFailed)?;
         Ok(serde_json::from_slice(&plaintext)?)
     }
 }
