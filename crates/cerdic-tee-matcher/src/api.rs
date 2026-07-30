@@ -8,15 +8,16 @@
 //! GET  /health                 -> { status, attested }
 //! ```
 //!
-//! # `/liquidation-check`'s honest gap
+//! # `/liquidation-check`
 //!
-//! Per spec section 2.4, a real liquidation check reads sealed position
-//! state (`PositionEngine.load`) and the oracle price, decrypts
-//! in-enclave, and computes `IRiskMonitor.isLiquidatable`. This binary
-//! has no RPC client to either contract yet, the same gap `settle.rs`
-//! documents for settlement calls, so this endpoint always answers
-//! `false`, never a real computation dressed up as one. Wiring it up is
-//! contract-integration work, not TEE-matching work.
+//! Per spec section 2.4: reads sealed position state via
+//! `SettlementEngine.loadSealed` (see `settle::load_sealed`), unseals it
+//! with the enclave's own key, and runs `crates/risk`'s maintenance-margin
+//! formula (the same one `RiskMonitor.sol` enforces on-chain). One real
+//! gap remains: no oracle RPC client exists yet, so the position's own
+//! sealed entry price stands in for a live mark price (see
+//! `post_liquidation_check`'s doc comment) — catches collateral-driven
+//! breaches, not price-driven ones, until that client exists.
 //!
 //! # Auth and hardening, briefly
 //!
@@ -249,6 +250,15 @@ pub struct AppState {
     sealed_key: crate::sealed::SealedKey,
     /// Signs `settleMatch` calls, see `settle.rs`.
     settlement_signer: crate::settle::SettlementSigner,
+    /// Which markets each `portfolioKey` has ever been settled into.
+    /// `SettlementEngine` has no enumerable registry to read this back
+    /// from (it's a plain `mapping(bytes32 => mapping(bytes32 => ...))`,
+    /// per-key not per-portfolio), so `/liquidation-check` needs
+    /// somewhere to learn which markets to check for a given portfolio
+    /// key. The TEE originates every `settleMatch` call, so it's the
+    /// natural place to keep this index; same unbounded-growth caveat
+    /// as `last_nonce`.
+    portfolio_markets: Mutex<HashMap<FixedBytes<32>, std::collections::HashSet<MarketId>>>,
 }
 
 impl AppState {
@@ -261,6 +271,7 @@ impl AppState {
             owner_addresses: Mutex::new(HashMap::new()),
             sealed_key: crate::sealed::SealedKey::generate(),
             settlement_signer: crate::settle::SettlementSigner::generate(),
+            portfolio_markets: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -412,6 +423,13 @@ async fn post_order(
             fill.maker_owner,
             maker_address,
         );
+
+        {
+            let mut index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
+            index.entry(settlement.portfolio_key_a).or_default().insert(payload.market_id.clone());
+            index.entry(settlement.portfolio_key_b).or_default().insert(payload.market_id.clone());
+        }
+
         let state_for_settlement = state.clone();
         // Never awaited: settlement is async network I/O (or a no-op
         // when unconfigured, see settle.rs), not something the trader's
@@ -500,13 +518,79 @@ async fn post_offer(
 }
 
 async fn post_liquidation_check(
+    State(state): State<Arc<AppState>>,
     Json(request): Json<LiquidationCheckRequest>,
-) -> Json<LiquidationCheckResponse> {
-    tracing::debug!(portfolio_key = %request.portfolio_key, "liquidation check requested");
-    // See this module's docs on the honest gap here: a real answer needs
-    // PositionEngine.load + an oracle price + IRiskMonitor.isLiquidatable,
-    // none of which this binary reads yet.
-    Json(LiquidationCheckResponse { liquidatable: false })
+) -> Result<Json<LiquidationCheckResponse>, (StatusCode, String)> {
+    let portfolio_key = parse_portfolio_key(&request.portfolio_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad portfolio_key: {e}")))?;
+
+    let markets: Vec<MarketId> = {
+        let index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
+        index.get(&portfolio_key).map(|set| set.iter().cloned().collect()).unwrap_or_default()
+    };
+
+    if markets.is_empty() {
+        tracing::debug!(portfolio_key = %request.portfolio_key, "no known positions for this portfolio");
+        return Ok(Json(LiquidationCheckResponse { liquidatable: false }));
+    }
+
+    let mut positions = Vec::new();
+    let mut total_collateral: i128 = 0;
+    let mut mark_prices = HashMap::new();
+
+    for market_id in &markets {
+        let market_hash = keccak256(market_id.as_bytes());
+        let sealed = match crate::settle::load_sealed(portfolio_key, market_hash).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, market_id, "failed to read sealed position, skipping");
+                continue;
+            }
+        };
+        if sealed.sealed_params.is_empty() {
+            continue;
+        }
+        let params = match state.sealed_key.unseal(&sealed.sealed_params) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, market_id, "failed to unseal position, skipping");
+                continue;
+            }
+        };
+
+        let signed_size: i128 = if params.side_is_buy { params.size as i128 } else { -(params.size as i128) };
+        positions.push(risk::PositionState { market_id: market_id.clone(), size: signed_size });
+        // Not a live oracle price, see build_match_settlement's doc on the
+        // TEE/contract fixed-point gap: this is the position's own sealed
+        // entry price standing in for OracleHub.markPrice until a real
+        // oracle RPC client exists. Real deployment needs the live price;
+        // this at least catches collateral-driven breaches (repeated
+        // negative deltas against unchanged price), not price-driven ones.
+        mark_prices.insert(market_id.clone(), params.entry_price as u128);
+        total_collateral += i128::try_from(sealed.collateral).unwrap_or(0);
+    }
+
+    let account = risk::AccountState { positions, effective_collateral: total_collateral.max(0) as u128 };
+
+    let liquidatable = match risk::RiskMonitor::compute_margin(&account, &mark_prices) {
+        Ok(result) => result.maintenance_breached,
+        Err(e) => {
+            tracing::error!(error = %e, portfolio_key = %request.portfolio_key, "margin computation failed");
+            false
+        }
+    };
+
+    tracing::info!(portfolio_key = %request.portfolio_key, liquidatable, "liquidation check computed");
+    Ok(Json(LiquidationCheckResponse { liquidatable }))
+}
+
+/// Decodes a `0x`-prefixed (or bare) 32-byte hex string into a `portfolioKey`.
+fn parse_portfolio_key(s: &str) -> Result<FixedBytes<32>, String> {
+    let hex_str = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
+    let array: [u8; 32] =
+        bytes.try_into().map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+    Ok(FixedBytes::from(array))
 }
 
 /// Maps a signer's on-chain address to the book's opaque `OwnerId`. The
@@ -1032,6 +1116,29 @@ mod tests {
         let state = Arc::new(AppState::new());
         let app = router(state);
 
+        // Well-formed but unknown to this process: no order/fill has ever
+        // touched this portfolio key, so it has no markets on record.
+        let portfolio_key = format!("0x{}", "ab".repeat(32));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/liquidation-check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "portfolio_key": portfolio_key })).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["liquidatable"], false);
+    }
+
+    #[tokio::test]
+    async fn liquidation_check_rejects_malformed_portfolio_key() {
+        let state = Arc::new(AppState::new());
+        let app = router(state);
+
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/liquidation-check")
@@ -1039,9 +1146,63 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&serde_json::json!({ "portfolio_key": "0xabc" })).unwrap()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A portfolio key with a market on record (from a real settled fill)
+    /// but where the RPC read fails (nothing configured to read from, the
+    /// normal dev-mode state) must not panic, and must answer honestly
+    /// rather than fabricate a result — matching `settle_match`'s own
+    /// "nothing to submit to" posture for the read side.
+    #[tokio::test]
+    async fn liquidation_check_with_unreachable_rpc_does_not_panic() {
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
+
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let taker = wallet();
+
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        post_json(app.clone(), "/order", &envelope_for(crossing, &state)).await;
+
+        let portfolio_key = format!("{:x}", portfolio_key(taker.address()));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/liquidation-check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "portfolio_key": portfolio_key })).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["liquidatable"], false);
+        assert_eq!(json["liquidatable"], false, "an unreadable RPC must never fabricate liquidatable=true");
     }
 }

@@ -41,6 +41,11 @@ sol! {
             int256 collateralDeltaB,
             bytes calldata sealedParamsB
         ) external;
+
+        function loadSealed(bytes32 portfolioKey, bytes32 marketId)
+            external
+            view
+            returns (bytes memory sealedParams, int256 collateral);
     }
 }
 
@@ -139,6 +144,50 @@ pub async fn settle_match(signer: &SettlementSigner, settlement: &MatchSettlemen
             SettlementResult { calldata, broadcast_tx_hash: None }
         }
     }
+}
+
+/// One sealed position as read back from `SettlementEngine.loadSealed`.
+pub struct SealedPosition {
+    pub sealed_params: Bytes,
+    pub collateral: I256,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadSealedError {
+    #[error("SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set, nothing to read from")]
+    NotConfigured,
+    #[error("RPC call failed: {0}")]
+    Rpc(String),
+}
+
+/// Reads one sealed position via `eth_call` (no signing, no gas, no
+/// state change — a plain read). `None` config is an error here, unlike
+/// `settle_match`'s silent no-op: a caller asking to READ a position
+/// with nowhere configured to read it from is a real failure, not the
+/// normal "nothing to broadcast" dev-mode state.
+pub async fn load_sealed(
+    portfolio_key: FixedBytes<32>,
+    market_id: FixedBytes<32>,
+) -> Result<SealedPosition, LoadSealedError> {
+    use alloy::{
+        network::TransactionBuilder,
+        providers::{Provider, ProviderBuilder},
+        rpc::types::TransactionRequest,
+    };
+
+    let (rpc_url, contract) = broadcast_config().ok_or(LoadSealedError::NotConfigured)?;
+    let provider =
+        ProviderBuilder::new().on_http(rpc_url.parse().map_err(|e| LoadSealedError::Rpc(format!("{e}")))?);
+
+    let call = ISettlementEngine::loadSealedCall { portfolioKey: portfolio_key, marketId: market_id };
+    let calldata = Bytes::from(call.abi_encode());
+
+    let tx = TransactionRequest::default().with_to(contract).with_input(calldata);
+    let raw = provider.call(&tx).await.map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+
+    let decoded = ISettlementEngine::loadSealedCall::abi_decode_returns(&raw, true)
+        .map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+    Ok(SealedPosition { sealed_params: decoded.sealedParams, collateral: decoded.collateral })
 }
 
 async fn broadcast(
@@ -247,5 +296,27 @@ mod tests {
         let result = settle_match(&signer, &sample_settlement()).await;
         assert!(result.broadcast_tx_hash.is_none());
         assert!(!result.calldata.is_empty());
+    }
+
+    #[test]
+    fn load_sealed_calldata_starts_with_the_correct_selector() {
+        let call = ISettlementEngine::loadSealedCall {
+            portfolioKey: FixedBytes::from([1u8; 32]),
+            marketId: FixedBytes::from([2u8; 32]),
+        };
+        let calldata = call.abi_encode();
+        assert_eq!(&calldata[..4], &ISettlementEngine::loadSealedCall::SELECTOR[..]);
+    }
+
+    #[tokio::test]
+    async fn load_sealed_without_rpc_config_is_an_explicit_error() {
+        // Unlike settle_match's silent no-op, a caller asking to READ a
+        // position with nowhere to read it from must get a real error,
+        // not a fabricated empty result.
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
+
+        let result = load_sealed(FixedBytes::from([1u8; 32]), FixedBytes::from([2u8; 32])).await;
+        assert!(matches!(result, Err(LoadSealedError::NotConfigured)));
     }
 }

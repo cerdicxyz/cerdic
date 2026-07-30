@@ -1258,6 +1258,7 @@ dependencies = [
  "nu-ansi-term",
  "proptest",
  "rand 0.8.7",
+ "risk",
  "serde",
  "serde_json",
  "thiserror",
