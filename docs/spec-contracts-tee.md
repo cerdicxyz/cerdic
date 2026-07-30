@@ -192,6 +192,12 @@ POST /offer            Body: encrypted { marketId, side, tick, maxSize, expiry, 
 POST /liquidation-check  Body: { portfolioKey } (plaintext — this is public info by design,
                        see 2.4). → { liquidatable: bool }
 
+POST /liquidate         Body: { portfolioKey, liquidator } (plaintext, same posture as
+                       /liquidation-check — a keeper supplies its own address to receive
+                       liquidatorReward). Recomputes liquidatability fresh, then submits
+                       SettlementEngine.liquidateSealed if still underwater.
+                       → { executed: bool, txHash?: bytes32 }
+
 GET  /health           → { status: "ok", attested: bool }
 ```
 

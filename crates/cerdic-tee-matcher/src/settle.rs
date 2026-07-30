@@ -22,7 +22,7 @@
 //! "nothing to submit to" rather than a fake success.
 
 use alloy::{
-    primitives::{Address, Bytes, FixedBytes, I256},
+    primitives::{Address, Bytes, FixedBytes, I256, U256},
     signers::local::PrivateKeySigner,
     sol,
     sol_types::SolCall,
@@ -33,6 +33,12 @@ sol! {
     struct MakerLeg {
         bytes32 matchId;
         bytes32 portfolioKey;
+        int256 collateralDelta;
+        bytes sealedParams;
+    }
+
+    struct LiquidationLeg {
+        bytes32 marketId;
         int256 collateralDelta;
         bytes sealedParams;
     }
@@ -61,6 +67,14 @@ sol! {
             external
             view
             returns (bytes memory sealedParams, int256 collateral);
+
+        function liquidateSealed(
+            bytes32 portfolioKey,
+            uint256 marginRequirement,
+            LiquidationLeg[] calldata legs,
+            address liquidator,
+            uint256 liquidatorReward
+        ) external;
     }
 }
 
@@ -176,6 +190,82 @@ pub async fn settle_taker_sweep(signer: &SettlementSigner, sweep: &TakerSweep) -
         }
         Err(e) => {
             tracing::error!(error = %e, "taker sweep broadcast failed");
+            SettlementResult { calldata, broadcast_tx_hash: None }
+        }
+    }
+}
+
+/// One market's leg of a `liquidateSealed` call: how that market's sealed
+/// position changes when the portfolio is closed out. `collateral_delta`
+/// is typically the negative of that market's current sealed collateral
+/// (bringing it to zero), and `sealed_params` typically empty bytes
+/// (flat/no position), matching `/liquidation-check`'s own "empty
+/// sealedParams means no position" convention.
+pub struct LiquidationLegDelta {
+    pub market_id: FixedBytes<32>,
+    pub collateral_delta: I256,
+    pub sealed_params: Bytes,
+}
+
+/// One portfolio-wide liquidation: every market leg closed in a single
+/// call, per `SettlementEngine.liquidateSealed`. `margin_requirement` is
+/// the TEE's own computed `M(P)` (see `risk::portfolio`); the contract
+/// independently sums each leg's on-chain collateral itself rather than
+/// trusting a total from here, see that function's doc.
+pub struct LiquidationSweep {
+    pub portfolio_key: FixedBytes<32>,
+    pub margin_requirement: U256,
+    pub legs: Vec<LiquidationLegDelta>,
+    pub liquidator: Address,
+    pub liquidator_reward: U256,
+}
+
+/// ABI-encodes a `liquidateSealed` call.
+pub fn build_liquidate_calldata(sweep: &LiquidationSweep) -> Bytes {
+    let legs = sweep
+        .legs
+        .iter()
+        .map(|leg| LiquidationLeg {
+            marketId: leg.market_id,
+            collateralDelta: leg.collateral_delta,
+            sealedParams: leg.sealed_params.clone(),
+        })
+        .collect();
+
+    let call = ISettlementEngine::liquidateSealedCall {
+        portfolioKey: sweep.portfolio_key,
+        marginRequirement: sweep.margin_requirement,
+        legs,
+        liquidator: sweep.liquidator,
+        liquidatorReward: sweep.liquidator_reward,
+    };
+    Bytes::from(call.abi_encode())
+}
+
+/// Builds the liquidation calldata and, only if broadcasting is
+/// configured, signs and submits one real transaction. Same "nothing to
+/// submit to" posture as `settle_match` when unconfigured.
+pub async fn liquidate_sealed(signer: &SettlementSigner, sweep: &LiquidationSweep) -> SettlementResult {
+    let calldata = build_liquidate_calldata(sweep);
+
+    let Some((rpc_url, contract)) = broadcast_config() else {
+        tracing::debug!(
+            signer = %signer.address(),
+            portfolio_key = %sweep.portfolio_key,
+            legs = sweep.legs.len(),
+            calldata = %calldata,
+            "liquidation built and signed, not broadcast (SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set)"
+        );
+        return SettlementResult { calldata, broadcast_tx_hash: None };
+    };
+
+    match broadcast(signer, &rpc_url, contract, calldata.clone()).await {
+        Ok(tx_hash) => {
+            tracing::info!(tx_hash = %tx_hash, portfolio_key = %sweep.portfolio_key, "portfolio liquidated on-chain");
+            SettlementResult { calldata, broadcast_tx_hash: Some(tx_hash) }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, portfolio_key = %sweep.portfolio_key, "liquidation broadcast failed");
             SettlementResult { calldata, broadcast_tx_hash: None }
         }
     }
@@ -478,6 +568,59 @@ mod tests {
 
         let signer = SettlementSigner::generate();
         let result = settle_taker_sweep(&signer, &sample_sweep()).await;
+        assert!(result.broadcast_tx_hash.is_none());
+        assert!(!result.calldata.is_empty());
+    }
+
+    fn sample_liquidation() -> LiquidationSweep {
+        LiquidationSweep {
+            portfolio_key: FixedBytes::from([7u8; 32]),
+            margin_requirement: U256::from(150_000u64),
+            legs: vec![
+                LiquidationLegDelta {
+                    market_id: FixedBytes::from([9u8; 32]),
+                    collateral_delta: I256::try_from(-60_000i64).unwrap(),
+                    sealed_params: Bytes::new(),
+                },
+                LiquidationLegDelta {
+                    market_id: FixedBytes::from([10u8; 32]),
+                    collateral_delta: I256::try_from(-60_000i64).unwrap(),
+                    sealed_params: Bytes::new(),
+                },
+            ],
+            liquidator: Address::from([3u8; 20]),
+            liquidator_reward: U256::from(5_000u64),
+        }
+    }
+
+    #[test]
+    fn liquidation_calldata_starts_with_the_correct_selector() {
+        let calldata = build_liquidate_calldata(&sample_liquidation());
+        assert_eq!(&calldata[..4], &ISettlementEngine::liquidateSealedCall::SELECTOR[..]);
+    }
+
+    #[test]
+    fn liquidation_calldata_round_trips_every_leg() {
+        let sweep = sample_liquidation();
+        let calldata = build_liquidate_calldata(&sweep);
+        let decoded = ISettlementEngine::liquidateSealedCall::abi_decode(&calldata, true).unwrap();
+
+        assert_eq!(decoded.portfolioKey, sweep.portfolio_key);
+        assert_eq!(decoded.marginRequirement, sweep.margin_requirement);
+        assert_eq!(decoded.liquidator, sweep.liquidator);
+        assert_eq!(decoded.liquidatorReward, sweep.liquidator_reward);
+        assert_eq!(decoded.legs.len(), 2);
+        assert_eq!(decoded.legs[0].marketId, sweep.legs[0].market_id);
+        assert_eq!(decoded.legs[1].collateralDelta, sweep.legs[1].collateral_delta);
+    }
+
+    #[tokio::test]
+    async fn liquidate_sealed_without_broadcast_config_does_not_submit_anything() {
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
+
+        let signer = SettlementSigner::generate();
+        let result = liquidate_sealed(&signer, &sample_liquidation()).await;
         assert!(result.broadcast_tx_hash.is_none());
         assert!(!result.calldata.is_empty());
     }

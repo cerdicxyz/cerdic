@@ -133,10 +133,9 @@ impl RiskMonitor {
             let mark_price = oracle_mark_prices
                 .get(&position.market_id)
                 .ok_or_else(|| RiskError::MissingMarkPrice(position.market_id.clone()))?;
-            requirement += U256::from(position.size.unsigned_abs())
-                * U256::from(*mark_price)
-                * U256::from(MMR_BPS)
-                / (U256::from(SCALE) * U256::from(BPS_DENOMINATOR));
+            requirement +=
+                U256::from(position.size.unsigned_abs()) * U256::from(*mark_price) * U256::from(MMR_BPS)
+                    / (U256::from(SCALE) * U256::from(BPS_DENOMINATOR));
         }
         u128::try_from(requirement).map_err(|_| RiskError::RequirementOverflow)
     }
@@ -199,13 +198,9 @@ mod tests {
     #[test]
     fn requirement_matches_paper_example() {
         // 10 units at $100 = $1,000 notional; 3% MMR = $30.
-        let positions = vec![PositionState {
-            market_id: market(1),
-            size: e18(10) as i128,
-        }];
+        let positions = vec![PositionState { market_id: market(1), size: e18(10) as i128 }];
         let requirement =
-            RiskMonitor::current_margin_requirement(&positions, &prices(&[(market(1), e18(100))]))
-                .unwrap();
+            RiskMonitor::current_margin_requirement(&positions, &prices(&[(market(1), e18(100))])).unwrap();
         assert_eq!(requirement, e18(30));
     }
 
@@ -214,14 +209,8 @@ mod tests {
         // Isolated margin: long 10 in market 1 AND short 10 in market 2
         // pay the FULL sum — no cross-market hedging credit (scope-OUT).
         let positions = vec![
-            PositionState {
-                market_id: market(1),
-                size: e18(10) as i128,
-            },
-            PositionState {
-                market_id: market(2),
-                size: -(e18(10) as i128),
-            },
+            PositionState { market_id: market(1), size: e18(10) as i128 },
+            PositionState { market_id: market(2), size: -(e18(10) as i128) },
         ];
         let requirement = RiskMonitor::current_margin_requirement(
             &positions,
@@ -233,13 +222,9 @@ mod tests {
 
     #[test]
     fn short_size_uses_absolute_value() {
-        let positions = vec![PositionState {
-            market_id: market(1),
-            size: -(e18(10) as i128),
-        }];
+        let positions = vec![PositionState { market_id: market(1), size: -(e18(10) as i128) }];
         let requirement =
-            RiskMonitor::current_margin_requirement(&positions, &prices(&[(market(1), e18(100))]))
-                .unwrap();
+            RiskMonitor::current_margin_requirement(&positions, &prices(&[(market(1), e18(100))])).unwrap();
         assert_eq!(requirement, e18(30));
     }
 
@@ -251,10 +236,7 @@ mod tests {
 
     #[test]
     fn missing_mark_price_is_an_error() {
-        let positions = vec![PositionState {
-            market_id: market(1),
-            size: e18(1) as i128,
-        }];
+        let positions = vec![PositionState { market_id: market(1), size: e18(1) as i128 }];
         let err = RiskMonitor::current_margin_requirement(&positions, &HashMap::new()).unwrap_err();
         assert_eq!(err, RiskError::MissingMarkPrice(market(1)));
     }
@@ -263,12 +245,8 @@ mod tests {
     fn zero_size_position_skips_the_price_lookup() {
         // Mirrors the Solidity `size == 0` continue: a zero-size position
         // with a MISSING price is not an error and contributes nothing.
-        let positions = vec![PositionState {
-            market_id: market(1),
-            size: 0,
-        }];
-        let requirement =
-            RiskMonitor::current_margin_requirement(&positions, &HashMap::new()).unwrap();
+        let positions = vec![PositionState { market_id: market(1), size: 0 }];
+        let requirement = RiskMonitor::current_margin_requirement(&positions, &HashMap::new()).unwrap();
         assert_eq!(requirement, 0);
     }
 
@@ -276,25 +254,17 @@ mod tests {
     fn compute_margin_flags_maintenance_breach() {
         // $20 collateral against a $30 requirement breaches.
         let state = AccountState {
-            positions: vec![PositionState {
-                market_id: market(1),
-                size: e18(10) as i128,
-            }],
+            positions: vec![PositionState { market_id: market(1), size: e18(10) as i128 }],
             effective_collateral: e18(20),
         };
-        let result =
-            RiskMonitor::compute_margin(&state, &prices(&[(market(1), e18(100))])).unwrap();
+        let result = RiskMonitor::compute_margin(&state, &prices(&[(market(1), e18(100))])).unwrap();
         assert_eq!(result.margin_requirement, e18(30));
         assert_eq!(result.effective_collateral, e18(20));
         assert!(result.maintenance_breached);
 
         // $1,000 collateral against the same requirement is healthy.
-        let healthy = AccountState {
-            effective_collateral: e18(1_000),
-            ..state
-        };
-        let result =
-            RiskMonitor::compute_margin(&healthy, &prices(&[(market(1), e18(100))])).unwrap();
+        let healthy = AccountState { effective_collateral: e18(1_000), ..state };
+        let result = RiskMonitor::compute_margin(&healthy, &prices(&[(market(1), e18(100))])).unwrap();
         assert!(!result.maintenance_breached);
     }
 
@@ -303,10 +273,7 @@ mod tests {
         // C_eff $1,000, requirement $30: withdrawing $970 lands exactly at
         // the requirement (safe, the check is `>=`); one wei more is not.
         let state = AccountState {
-            positions: vec![PositionState {
-                market_id: market(1),
-                size: e18(10) as i128,
-            }],
+            positions: vec![PositionState { market_id: market(1), size: e18(10) as i128 }],
             effective_collateral: e18(1_000),
         };
         let price_map = prices(&[(market(1), e18(100))]);
