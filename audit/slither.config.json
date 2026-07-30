@@ -1,0 +1,4 @@
+{
+  "filter_paths": "(lib|test|node_modules)",
+  "detectors_to_run": "reentrancy-eth,reentrancy-no-eth,unchecked-lowlevel,unchecked-send,suicidal,uninitialized-state,uninitialized-local,unused-return,shadowing-state,shadowing-abstract,controlled-delegatecall,arbitrary-send-eth,incorrect-equality,boolean-cst,missing-zero-check,reentrancy-benign,reentrancy-events,timestamp,assembly,divide-before-multiply,boolean-equal,costly-loop"
+}
