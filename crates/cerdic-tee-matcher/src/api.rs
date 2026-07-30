@@ -179,10 +179,13 @@ pub struct LiquidationCheckResponse {
 #[derive(Debug, Serialize)]
 pub struct PubkeyResponse {
     pub pubkey_b64: String,
-    /// Real attestation wiring (GCP OIDC token / AWS COSE_Sign1 doc)
-    /// isn't implemented, see `docs/spec-contracts-tee.md` section 3.4
-    /// for the intended shape. `null` here is an honest "not attested",
-    /// not a placeholder value dressed up as a real one.
+    /// A real GCP OIDC token, fetched fresh from the Confidential Space
+    /// launcher on every call (see `attestation.rs`), when running in
+    /// Confidential Space. AWS Nitro's COSE_Sign1 document isn't wired
+    /// up yet, see `docs/spec-contracts-tee.md` section 3.4. `null`
+    /// outside Confidential Space (local dev, or the launcher socket
+    /// being briefly unavailable) is an honest "not attested", not a
+    /// placeholder value dressed up as a real one.
     pub attestation: Option<String>,
 }
 
@@ -263,12 +266,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// The `audience` claim requested on every attestation token, verified
+/// end-to-end against a real Intel TDX Confidential Space VM (see
+/// `docs/gcp-attestation-test-report.md`). A verifier checks this claim
+/// matches what it expects before trusting the token, so it has to be a
+/// fixed, known value, not something a caller can influence.
+const ATTESTATION_AUDIENCE: &str = "cerdic-tee-matcher";
+
 async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<PubkeyResponse> {
-    Json(PubkeyResponse { pubkey_b64: state.keystore.public_key_b64(), attestation: None })
+    let attestation = match crate::attestation::fetch_oidc_token(ATTESTATION_AUDIENCE).await {
+        Ok(token) => Some(token),
+        Err(crate::attestation::AttestationError::NoLauncherSocket) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "attestation token fetch failed");
+            None
+        }
+    };
+    Json(PubkeyResponse { pubkey_b64: state.keystore.public_key_b64(), attestation })
 }
 
 async fn get_health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok", attested: false })
+    let attested = crate::attestation::launcher_present().await;
+    Json(HealthResponse { status: "ok", attested })
 }
 
 async fn post_order(

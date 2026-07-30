@@ -6,6 +6,7 @@
 //! API this binary implements.
 
 pub mod api;
+pub mod attestation;
 pub mod book;
 pub mod decrypt;
 pub mod keystore;

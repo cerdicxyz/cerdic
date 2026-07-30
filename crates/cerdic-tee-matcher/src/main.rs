@@ -17,7 +17,12 @@ async fn main() {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "cerdic-tee-matcher starting");
     tracing::debug!("debug logging enabled, set CERDIC_LOG=debug or lower to see this");
-    tracing::warn!(reason = "no attestation backend wired yet", "running in local dev mode");
+    if !cerdic_tee_matcher::attestation::launcher_present().await {
+        tracing::warn!(
+            reason = "Confidential Space launcher socket not present",
+            "running in local dev mode, unattested"
+        );
+    }
 
     let state = Arc::new(api::AppState::new());
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
