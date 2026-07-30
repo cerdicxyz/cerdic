@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and fill in.
+
+project_id = "cer-perp-tee"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# Must already exist with Private Google Access enabled, see infra/README.md.
+subnetwork = "default"
+
+# Leave create_vm=false until deploy.sh has pushed a real image; then either
+# set container_image here and re-apply, or just let deploy.sh manage the
+# instance directly after the first apply has created the surrounding infra.
+create_vm       = false
+container_image = ""

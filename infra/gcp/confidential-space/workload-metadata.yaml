@@ -1,0 +1,30 @@
+# Reference only — Confidential Space doesn't actually read a YAML file,
+# it reads GCE instance metadata keys (see confidential-space.tf's
+# `metadata` block, which is the real, applied version of this). This file
+# exists so the shape of what gets launched is reviewable in one place
+# without reading Terraform HCL, and so `deploy.sh` has one source of
+# truth to render `gcloud compute instances add-metadata` flags from.
+#
+# Keys match GCP's Confidential Space container-launcher spec:
+# https://cloud.google.com/confidential-computing/confidential-space/docs/create-your-own-workload
+
+tee-image-reference: "REGION-docker.pkg.dev/PROJECT/cerdic-tee-matcher/cerdic-tee-matcher@sha256:REPLACE_ME"
+
+# "Always": the matcher should keep running across transient failures, this
+# isn't a one-shot job. See infra/README.md's note on `gcloud compute
+# instances reset` vs stop/start for why changing this metadata safely
+# requires a stop+start cycle, not a reset.
+tee-restart-policy: "Always"
+
+# false in production: true only ever temporarily, on the -debug image
+# family, for one-off debugging. Never leave this true on a workload
+# processing real trades — logs leaving the enclave to Cloud Logging is
+# exactly the leak `api.rs` had before it stopped logging proof internals,
+# don't reopen the same hole at the infra layer.
+tee-container-log-redirect: "false"
+
+# Populated from Terraform outputs (kms_key_name, state_bucket_name), see
+# crates/cerdic-tee-matcher/src/kms.rs for what each does.
+tee-env-CERDIC_KMS_KEY_NAME: "projects/PROJECT/locations/REGION/keyRings/cerdic-tee-keyring/cryptoKeys/cerdic-tee-secrets"
+tee-env-CERDIC_STATE_BUCKET: "PROJECT-cerdic-tee-state"
+tee-env-CERDIC_STATE_OBJECT: "enclave-secrets.bin"
