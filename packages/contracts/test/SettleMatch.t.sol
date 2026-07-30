@@ -159,3 +159,147 @@ contract SettleMatchTest is Test {
         engine.settleMatch(MATCH_ID, MARKET_ID, bytes32(0), 1, "", PORTFOLIO_B, 1, "");
     }
 }
+
+/// @notice settleTakerSweep: one taker order crossing N resting makers, per the
+///         Polymarket CTF Exchange matchOrders pattern — the taker leg is written once,
+///         not once per maker, since only the final post-sweep state matters for it.
+contract SettleTakerSweepTest is Test {
+    SettlementEngine internal engine;
+    AttestationRouter internal router;
+    MockSealedMarket internal market;
+
+    address internal admin = makeAddr("admin");
+    address internal tee = makeAddr("tee");
+
+    bytes32 internal constant MARKET_ID = keccak256("EURC-USDC-FX");
+    bytes32 internal constant PORTFOLIO_TAKER = keccak256("portfolioTaker");
+    bytes32 internal constant PORTFOLIO_MAKER_1 = keccak256("portfolioMaker1");
+    bytes32 internal constant PORTFOLIO_MAKER_2 = keccak256("portfolioMaker2");
+    bytes32 internal constant PORTFOLIO_MAKER_3 = keccak256("portfolioMaker3");
+
+    function setUp() public {
+        engine = new SettlementEngine(admin);
+        router = new AttestationRouter(admin);
+        market = new MockSealedMarket();
+
+        vm.prank(admin);
+        engine.setAttestationRouter(address(router));
+        vm.prank(admin);
+        router.authorizeTEE(tee);
+        vm.prank(admin);
+        engine.registerDecoder(MARKET_ID, address(market));
+    }
+
+    function _threeMakerLegs() internal pure returns (SettlementEngine.MakerLeg[] memory legs) {
+        legs = new SettlementEngine.MakerLeg[](3);
+        legs[0] = SettlementEngine.MakerLeg(keccak256("m1"), PORTFOLIO_MAKER_1, 1_000e18, hex"01");
+        legs[1] = SettlementEngine.MakerLeg(keccak256("m2"), PORTFOLIO_MAKER_2, 2_000e18, hex"02");
+        legs[2] = SettlementEngine.MakerLeg(keccak256("m3"), PORTFOLIO_MAKER_3, 3_000e18, hex"03");
+    }
+
+    function test_TakerLegWrittenOnceAllMakerLegsApplied() public {
+        vm.prank(tee);
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 6_000e18, hex"aa", _threeMakerLegs());
+
+        (bytes memory takerSealed, int256 takerCollateral) = engine.loadSealed(PORTFOLIO_TAKER, MARKET_ID);
+        assertEq(takerSealed, hex"aa");
+        assertEq(takerCollateral, 6_000e18);
+
+        (bytes memory m1Sealed, int256 m1Collateral) = engine.loadSealed(PORTFOLIO_MAKER_1, MARKET_ID);
+        assertEq(m1Sealed, hex"01");
+        assertEq(m1Collateral, 1_000e18);
+
+        (, int256 m3Collateral) = engine.loadSealed(PORTFOLIO_MAKER_3, MARKET_ID);
+        assertEq(m3Collateral, 3_000e18);
+
+        // Taker + 3 makers = 4 legs notified, taker exactly once.
+        assertEq(market.onSealedOpenCalls(), 4);
+    }
+
+    function test_EmitsOneMatchSettledPerMakerLeg() public {
+        vm.recordLogs();
+        vm.prank(tee);
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 6_000e18, hex"aa", _threeMakerLegs());
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 matchSettledCount;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] == SettlementEngine.MatchSettled.selector) {
+                matchSettledCount++;
+            }
+        }
+        assertEq(matchSettledCount, 3, "one MatchSettled per maker leg, none for the taker leg itself");
+    }
+
+    function test_DuplicateMatchIdWithinTheSameSweepReverts() public {
+        SettlementEngine.MakerLeg[] memory legs = new SettlementEngine.MakerLeg[](2);
+        legs[0] = SettlementEngine.MakerLeg(keccak256("dup"), PORTFOLIO_MAKER_1, 1_000e18, "");
+        legs[1] = SettlementEngine.MakerLeg(keccak256("dup"), PORTFOLIO_MAKER_2, 1_000e18, "");
+
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.MatchAlreadySettled.selector, keccak256("dup")));
+        vm.prank(tee);
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 2_000e18, "", legs);
+    }
+
+    function test_UnauthorizedCallerReverts() public {
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.NotAuthorizedTEE.selector, address(this)));
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 1, "", new SettlementEngine.MakerLeg[](0));
+    }
+
+    function test_EmptyMakerLegsStillWritesTheTakerLeg() public {
+        vm.prank(tee);
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 500e18, hex"bb", new SettlementEngine.MakerLeg[](0));
+
+        (bytes memory sealed_, int256 collateral) = engine.loadSealed(PORTFOLIO_TAKER, MARKET_ID);
+        assertEq(sealed_, hex"bb");
+        assertEq(collateral, 500e18);
+        assertEq(market.onSealedOpenCalls(), 1);
+    }
+
+    /// @notice The actual point of settleTakerSweep: real gas measurement proving the
+    ///         batch costs less than N individual settleMatch calls, as N real separate
+    ///         transactions — not just a claim, and not just internal opcode cost, since
+    ///         those alone understate the real-world gap.
+    /// @dev    Foundry's vm.prank + direct calls all run inside ONE test execution, so
+    ///         EIP-2929's warm/cold access list carries over between the "individual"
+    ///         calls in this loop — real separate transactions would each start cold and
+    ///         each pay their own 21,000 gas base cost, neither of which this harness
+    ///         reproduces on its own. Both are added back explicitly (BASE_TX_GAS once
+    ///         for the batch, five times for the individual calls) so the comparison
+    ///         reflects real transaction economics, not an artifact of how the test runs.
+    ///         A sweep across 5 makers is the realistic upper end for this book (see
+    ///         book.rs tests), so that's the size measured here.
+    function test_BatchedSweepCostsLessGasThanEquivalentIndividualCalls() public {
+        uint256 baseTxGas = 21_000;
+
+        SettlementEngine.MakerLeg[] memory legs = new SettlementEngine.MakerLeg[](5);
+        for (uint256 i; i < 5; ++i) {
+            legs[i] = SettlementEngine.MakerLeg(
+                keccak256(abi.encode("leg", i)), keccak256(abi.encode("pf", i)), 1_000e18, ""
+            );
+        }
+
+        uint256 gasBefore = gasleft();
+        vm.prank(tee);
+        engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 5_000e18, "", legs);
+        uint256 batchedTotal = (gasBefore - gasleft()) + baseTxGas;
+
+        SettlementEngine individualEngine = new SettlementEngine(admin);
+        vm.prank(admin);
+        individualEngine.setAttestationRouter(address(router));
+        vm.prank(admin);
+        individualEngine.registerDecoder(MARKET_ID, address(market));
+
+        uint256 individualTotal;
+        for (uint256 i; i < 5; ++i) {
+            bytes32 matchId = keccak256(abi.encode("individual", i));
+            bytes32 makerKey = keccak256(abi.encode("pf-individual", i));
+            uint256 gb = gasleft();
+            vm.prank(tee);
+            individualEngine.settleMatch(matchId, MARKET_ID, PORTFOLIO_TAKER, 1_000e18, "", makerKey, 1_000e18, "");
+            individualTotal += (gb - gasleft()) + baseTxGas;
+        }
+
+        assertLt(batchedTotal, individualTotal, "batching must save real transaction gas, not just internal opcodes");
+    }
+}

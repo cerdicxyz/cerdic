@@ -50,6 +50,28 @@ contract SettlementEngine is PositionEngine {
     /// @notice matchId replay guard — the kernel's own "no double-settlement" invariant.
     mapping(bytes32 => bool) public settledMatches;
 
+    /// @notice One settleMatch call's worth of arguments; the shape settleMatch itself
+    ///         still takes as loose parameters, factored out so settleTakerSweep's internal
+    ///         helper can share the same per-leg apply logic.
+    struct SealedMatch {
+        bytes32 matchId;
+        bytes32 marketId;
+        bytes32 portfolioKeyA;
+        int256 collateralDeltaA;
+        bytes sealedParamsA;
+        bytes32 portfolioKeyB;
+        int256 collateralDeltaB;
+        bytes sealedParamsB;
+    }
+
+    /// @notice One maker leg of a settleTakerSweep call.
+    struct MakerLeg {
+        bytes32 matchId;
+        bytes32 portfolioKey;
+        int256 collateralDelta;
+        bytes sealedParams;
+    }
+
     event TradeSettled(
         bytes32 indexed marketId,
         address indexed longTrader,
@@ -167,29 +189,90 @@ contract SettlementEngine is PositionEngine {
         int256 collateralDeltaB,
         bytes calldata sealedParamsB
     ) external {
-        AttestationRouter router = attestationRouter;
-        if (address(router) == address(0)) revert AttestationRouterNotSet();
-        if (!router.isAuthorizedTEE(msg.sender)) revert NotAuthorizedTEE(msg.sender);
+        _requireAuthorizedTEE();
+        _settleOneMatch(
+            SealedMatch(
+                matchId,
+                marketId,
+                portfolioKeyA,
+                collateralDeltaA,
+                sealedParamsA,
+                portfolioKeyB,
+                collateralDeltaB,
+                sealedParamsB
+            )
+        );
+    }
 
-        if (matchId == bytes32(0)) revert ZeroMatchId();
-        if (settledMatches[matchId]) revert MatchAlreadySettled(matchId);
+    /// @notice One taker order matched against N resting makers in one call — the shape a
+    ///         taker sweep across several price levels actually produces, and the pattern
+    ///         Polymarket's CTF Exchange matchOrders uses for the same reason: the taker
+    ///         leg is written ONCE (its collateral delta already nets the whole sweep, its
+    ///         sealedParams already reflect the final resulting position), not once per
+    ///         maker crossed — settleMatches-style per-fill batching would redundantly
+    ///         re-seal and overwrite the taker's own position on every iteration for no
+    ///         reason, since only the last write would matter anyway.
+    /// @param  collateralDeltaTaker/sealedParamsTaker The taker's single post-sweep state.
+    /// @param  makerLegs One entry per maker crossed; each still gets its own matchId,
+    ///         portfolioKey, delta, and sealed params, and its own onSealedOpen stamp.
+    function settleTakerSweep(
+        bytes32 marketId,
+        bytes32 portfolioKeyTaker,
+        int256 collateralDeltaTaker,
+        bytes calldata sealedParamsTaker,
+        MakerLeg[] calldata makerLegs
+    ) external {
+        _requireAuthorizedTEE();
         if (marketId == bytes32(0)) revert ZeroMarketId();
-        if (portfolioKeyA == bytes32(0) || portfolioKeyB == bytes32(0)) revert ZeroPortfolioKey();
+        if (portfolioKeyTaker == bytes32(0)) revert ZeroPortfolioKey();
 
         address market = positionDecoders[marketId];
         if (market == address(0)) revert MarketNotRegistered(marketId);
 
-        settledMatches[matchId] = true;
+        _applySealedLeg(marketId, portfolioKeyTaker, collateralDeltaTaker, sealedParamsTaker);
+        ISealedMarketLifecycle(market).onSealedOpen(portfolioKeyTaker, marketId);
 
-        _applySealedLeg(marketId, portfolioKeyA, collateralDeltaA, sealedParamsA);
-        _applySealedLeg(marketId, portfolioKeyB, collateralDeltaB, sealedParamsB);
+        uint256 count = makerLegs.length;
+        for (uint256 i; i < count; ++i) {
+            MakerLeg calldata leg = makerLegs[i];
+            if (leg.matchId == bytes32(0)) revert ZeroMatchId();
+            if (settledMatches[leg.matchId]) revert MatchAlreadySettled(leg.matchId);
+            if (leg.portfolioKey == bytes32(0)) revert ZeroPortfolioKey();
+
+            settledMatches[leg.matchId] = true;
+            _applySealedLeg(marketId, leg.portfolioKey, leg.collateralDelta, leg.sealedParams);
+            ISealedMarketLifecycle(market).onSealedOpen(leg.portfolioKey, marketId);
+
+            emit MatchSettled(leg.matchId);
+        }
+    }
+
+    function _requireAuthorizedTEE() internal view {
+        AttestationRouter router = attestationRouter;
+        if (address(router) == address(0)) revert AttestationRouterNotSet();
+        if (!router.isAuthorizedTEE(msg.sender)) revert NotAuthorizedTEE(msg.sender);
+    }
+
+    function _settleOneMatch(SealedMatch memory m) internal {
+        if (m.matchId == bytes32(0)) revert ZeroMatchId();
+        if (settledMatches[m.matchId]) revert MatchAlreadySettled(m.matchId);
+        if (m.marketId == bytes32(0)) revert ZeroMarketId();
+        if (m.portfolioKeyA == bytes32(0) || m.portfolioKeyB == bytes32(0)) revert ZeroPortfolioKey();
+
+        address market = positionDecoders[m.marketId];
+        if (market == address(0)) revert MarketNotRegistered(m.marketId);
+
+        settledMatches[m.matchId] = true;
+
+        _applySealedLeg(m.marketId, m.portfolioKeyA, m.collateralDeltaA, m.sealedParamsA);
+        _applySealedLeg(m.marketId, m.portfolioKeyB, m.collateralDeltaB, m.sealedParamsB);
 
         // No size/price/side passed, see ISealedMarketLifecycle: this only lets the
         // market checkpoint per-portfolioKey state (e.g. a funding-index stamp).
-        ISealedMarketLifecycle(market).onSealedOpen(portfolioKeyA, marketId);
-        ISealedMarketLifecycle(market).onSealedOpen(portfolioKeyB, marketId);
+        ISealedMarketLifecycle(market).onSealedOpen(m.portfolioKeyA, m.marketId);
+        ISealedMarketLifecycle(market).onSealedOpen(m.portfolioKeyB, m.marketId);
 
-        emit MatchSettled(matchId);
+        emit MatchSettled(m.matchId);
     }
 
     /// @notice Opaque sealedParams plus the plain running collateral for portfolioKey/marketId.
@@ -204,12 +287,9 @@ contract SettlementEngine is PositionEngine {
 
     /// @dev Collateral bound is the kernel's own invariant (paper/cerdic.tex:369): it never
     ///      goes negative, regardless of what the TEE's delta claims.
-    function _applySealedLeg(
-        bytes32 marketId,
-        bytes32 portfolioKey,
-        int256 collateralDelta,
-        bytes calldata sealedParams
-    ) internal {
+    function _applySealedLeg(bytes32 marketId, bytes32 portfolioKey, int256 collateralDelta, bytes memory sealedParams)
+        internal
+    {
         SealedPosition storage position = _sealedPositions[portfolioKey][marketId];
         int256 newCollateral = position.collateral + collateralDelta;
         if (newCollateral < 0) revert InsufficientSealedCollateral(portfolioKey, marketId, newCollateral);
