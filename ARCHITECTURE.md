@@ -28,7 +28,7 @@ security story end to end, and we already have both GCP and AWS to deploy on.
 
 | Layer | Technology | Purpose | Trust model |
 |---|---|---|---|
-| Execution privacy | Custom Rust matcher, dual-deployed on **GCP Confidential Space (AMD SEV-SNP)** and **AWS Nitro Enclaves** | Order matching without exposing order flow | Enclave attestation, two independent hardware TEE implementations |
+| Execution privacy | Custom Rust matcher, dual-deployed on **GCP Confidential Space (Intel TDX)** and **AWS Nitro Enclaves** | Order matching without exposing order flow | Enclave attestation, two independent hardware TEE implementations |
 | Position privacy | Sealed-params blob (AES-256-GCM, enclave-held key) | Hide side, leverage, entry price, size, TP/SL post-settlement | Enclave holds decryption key |
 | Settlement authority | Single authorized-TEE caller pattern | Kernel trusts attested output, never recomputes from plaintext | On-chain attestation check, custom verifier per cloud |
 | Key custody | AWS Nitro path: KMS key policy conditioned on enclave `PCR0` (image measurement) | Decrypt key never releasable to anything but the exact measured enclave, enforced by KMS itself, not just client-side attestation checking | AWS KMS + Nitro Attestation Document |
@@ -274,13 +274,18 @@ and portfolio-margin logic runs on both; they attest independently and the kerne
 require agreement from either (liveness/failover) or both (defense-in-depth quorum,
 Phase 1+) before honoring a settlement.
 
-### Primary: GCP Confidential Space (AMD SEV-SNP)
+### Primary: GCP Confidential Space (Intel TDX)
 
-The proven pattern — same shape as our earlier `cer-perp` build.
+Tested end-to-end on `c3-standard-4` (2026-07-30, see `docs/gcp-attestation-test-report.md`):
+real Intel TDX quote, real Google-signed OIDC token back from `v1.VerifyConfidentialSpace`.
+AMD SEV-SNP was the original target here — same image, same container, `n2d-standard-2` —
+but as tested, Google's own attestation service rejects SEV-SNP evidence with
+`UNSUPPORTED_CC_TECHNOLOGY`; the hardware works, the verification API doesn't accept it (yet).
+TDX hit no such wall, so it's primary until SEV-SNP support lands.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│               GCP Confidential Space (AMD SEV-SNP)             │
+│                GCP Confidential Space (Intel TDX)               │
 │                                                               │
 │  workload.operator.google.com/confidential-space               │
 │                                                               │
@@ -289,12 +294,12 @@ The proven pattern — same shape as our earlier `cer-perp` build.
 │  │                                                          │  │
 │  │  ┌────────────────────┐  ┌───────────────────────────┐  │  │
 │  │  │  Decryption Key     │  │  Attestation Token         │  │  │
-│  │  │  (X25519, generated │  │  (OIDC, signed by AMD       │  │  │
-│  │  │   on first boot,    │  │   SEV-SNP hardware, incl.   │  │  │
-│  │  │   never leaves)     │  │   container image digest)   │  │  │
-│  │  └────────────────────┘  └───────────────────────────┘  │  │
-│  │                                                          │  │
-│  │  Memory: encrypted by AMD SEV-SNP hardware                │  │
+│  │  │  (X25519, generated │  │  (OIDC, signed via TDX       │  │  │
+│  │  │   on first boot,    │  │   quote + RTMR measurement, │  │  │
+│  │  │   never leaves)     │  │   incl. container image     │  │  │
+│  │  └────────────────────┘  │   digest)                   │  │  │
+│  │                          └───────────────────────────┘  │  │
+│  │  Memory: encrypted/isolated by Intel TDX hardware        │  │
 │  │  - Order/position plaintext exists only in enclave RAM   │  │
 │  │  - Hypervisor / GCP operator cannot read enclave memory   │  │
 │  └──────────────────────────────────────────────────────────┘  │
@@ -625,7 +630,7 @@ correctness guarantee that lands a few seconds to minutes later.
    (Section: On-chain footprint).
 5. **Portfolio unlinkability**: cross-margined positions are grouped by a TEE-derived
    `portfolioKey` hash, not the trader's address.
-6. **Two independent hardware trust domains**: GCP (AMD SEV-SNP, memory-encryption-based)
+6. **Two independent hardware trust domains**: GCP (Intel TDX, memory-encryption-based)
    and AWS (Nitro, hypervisor-isolation-based) are different TEE technologies on different
    clouds — a single-vendor or single-cloud compromise doesn't take down the other path.
 7. **Key custody enforced outside the client, not just by it**: on the AWS path, KMS's key
@@ -677,7 +682,7 @@ vaults; migration path to Arc's protocol-level privacy roadmap (APS) if/when it 
 - [Circle Arc](https://circle.com/arc)
 - [Circle StableFX](https://www.circle.com/blog/introducing-circle-stablefx-and-circle-partner-stablecoins)
 - [Ostium](https://www.ostium.com) — closest live precedent for leveraged onchain FX/RWA
-- [GCP Confidential Space](https://cloud.google.com/confidential-computing/confidential-space/docs) — primary TEE deployment target, AMD SEV-SNP + OIDC attestation
+- [GCP Confidential Space](https://cloud.google.com/confidential-computing/confidential-space/docs) — primary TEE deployment target, Intel TDX + OIDC attestation
 - [AWS Nitro Enclaves](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html) — secondary TEE deployment, hypervisor-isolation + KMS-enforced key custody
 - [Automata DCAP Attestation](https://github.com/automata-network/automata-dcap-attestation) — reference for on-chain attestation verification patterns and gas costs, not currently depended on
 - [Marlin Kalypso](https://marlin.org/kalypso) — ZK-compressed TEE attestation verification, reference for a possible Phase 3 optimization
