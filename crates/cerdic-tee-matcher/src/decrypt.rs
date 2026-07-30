@@ -111,11 +111,12 @@ pub fn decrypt_and_authenticate<T: SignedPayload>(
     Ok((payload, signer))
 }
 
-/// Test helper: encrypts `payload` the way a client would, so tests
-/// don't have to hand-roll the box construction. Not used on the
-/// enclave's own decrypt path.
-#[cfg(test)]
-pub(crate) fn encrypt_for<T: Serialize>(
+/// Encrypts `payload` the way a real client would: fresh ephemeral
+/// keypair, box against the enclave's public key. Used by tests and by
+/// `src/bin/demo_client.rs`; never called from the enclave's own
+/// decrypt path (the enclave only ever decrypts, it has no reason to
+/// encrypt to itself).
+pub fn encrypt_for<T: Serialize>(
     recipient: &crypto_box::PublicKey,
     payload: &T,
 ) -> Result<Envelope, serde_json::Error> {

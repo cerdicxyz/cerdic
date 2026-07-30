@@ -1,14 +1,7 @@
 //! `cerdic-tee-matcher` entrypoint. See `docs/spec-contracts-tee.md` for
 //! the full module layout and HTTP API this binary implements.
 
-mod api;
-mod book;
-mod decrypt;
-mod keystore;
-mod logging;
-mod proof;
-mod settle;
-
+use cerdic_tee_matcher::{api, logging};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
