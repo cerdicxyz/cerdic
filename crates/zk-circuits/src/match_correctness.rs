@@ -182,6 +182,93 @@ impl ConstraintSynthesizer<Fr> for MatchCorrectnessCircuit {
     }
 }
 
+/// How many matches one `BatchMatchCorrectnessCircuit` proof covers.
+/// Groth16 circuits have a fixed shape, so this has to be a constant a
+/// sweep's fill count is padded up to (or chunked across, if a sweep has
+/// more fills than this), not something that varies per proof. Chosen as
+/// a reasonable typical sweep depth, not derived from any hard
+/// constraint; revisit if real sweeps regularly exceed it.
+pub const MAX_BATCH_SIZE: usize = 8;
+
+/// Proves `MatchCorrectness` for up to `MAX_BATCH_SIZE` matches in one
+/// Groth16 proof instead of one proof per match.
+///
+/// # Why this exists
+///
+/// On-chain Groth16 verification cost is dominated by a fixed number of
+/// pairing checks, almost independent of how many constraints the circuit
+/// has. So N separate `MatchCorrectnessCircuit` proofs cost roughly N
+/// times a fixed verification gas cost on-chain, while one proof over N
+/// matches costs that fixed cost once. This is the proof-side analog of
+/// why `SettlementEngine.settleTakerSweep` batches N maker legs into one
+/// call instead of N separate `settleMatch` calls, see that function's
+/// doc comment.
+///
+/// # Padding
+///
+/// Fewer than `MAX_BATCH_SIZE` real matches are padded with a trivially
+/// self-consistent dummy match (a zero-price, zero-size buy/sell pair,
+/// see `padding_match`), not left as unconstrained slots, so every batch
+/// proof has the exact same fixed circuit shape regardless of how many
+/// real matches it covers.
+#[derive(Clone)]
+pub struct BatchMatchCorrectnessCircuit {
+    pub matches: Vec<MatchCorrectnessCircuit>,
+}
+
+impl BatchMatchCorrectnessCircuit {
+    /// Pads `matches` up to `MAX_BATCH_SIZE`. Panics if `matches` already
+    /// has more than `MAX_BATCH_SIZE` entries — the caller (see
+    /// `cerdic-tee-matcher`'s `proof.rs`) is responsible for chunking a
+    /// larger set of fills into multiple batches before calling this,
+    /// not this constructor's job to silently drop or split anything.
+    pub fn new(matches: Vec<MatchCorrectnessCircuit>) -> Self {
+        assert!(
+            matches.len() <= MAX_BATCH_SIZE,
+            "batch of {} matches exceeds MAX_BATCH_SIZE {MAX_BATCH_SIZE}, chunk the caller's fills first",
+            matches.len()
+        );
+        let mut padded = matches;
+        while padded.len() < MAX_BATCH_SIZE {
+            padded.push(Self::padding_match());
+        }
+        Self { matches: padded }
+    }
+
+    /// A buyer and seller both quoting zero, matching for zero size:
+    /// satisfies every one of `MatchCorrectnessCircuit`'s constraints
+    /// trivially (same-side check, commitment check, crossing-range
+    /// check all hold at zero), so it's safe filler that never weakens
+    /// what the batch actually proves about its real matches.
+    fn padding_match() -> MatchCorrectnessCircuit {
+        let zero = Fr::from(0u64);
+        MatchCorrectnessCircuit::new(true, zero, zero, false, zero, zero, zero, zero)
+    }
+
+    /// The public inputs in slot order, each slot contributing
+    /// `[cmt_a, cmt_b, match_price, match_size]` — `4 * MAX_BATCH_SIZE`
+    /// field elements total, including padding slots' (public, but
+    /// meaningless beyond "this slot was padding") values.
+    pub fn public_inputs(&self) -> Vec<Fr> {
+        self.matches.iter().flat_map(|m| m.public_inputs()).collect()
+    }
+
+    /// An empty circuit (all slots unset) for Groth16 parameter
+    /// generation, matching `MatchCorrectnessCircuit::empty`'s role.
+    pub fn empty() -> Self {
+        Self { matches: (0..MAX_BATCH_SIZE).map(|_| MatchCorrectnessCircuit::empty()).collect() }
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for BatchMatchCorrectnessCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        for one_match in self.matches {
+            one_match.generate_constraints(cs.clone())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +422,95 @@ mod tests {
         tampered_inputs[3] = Fr::from(999u64); // claim a different match_size
         let invalid = Groth16::<ark_bn254::Bn254>::verify(&vk, &tampered_inputs, &proof).unwrap();
         assert!(!invalid, "a proof must not verify against different public inputs");
+    }
+
+    fn valid_match(match_price: u64, match_size: u64) -> MatchCorrectnessCircuit {
+        MatchCorrectnessCircuit::new(
+            true,
+            Fr::from(105u64),
+            Fr::from(20u64),
+            false,
+            Fr::from(95u64),
+            Fr::from(15u64),
+            Fr::from(match_price),
+            Fr::from(match_size),
+        )
+    }
+
+    #[test]
+    fn empty_has_max_batch_size_slots() {
+        // `empty()`'s all-None witnesses only synthesize successfully
+        // under Groth16's setup mode (see `batch_groth16_end_to_end_prove_and_verify`,
+        // which exercises that path directly); this just checks the slot
+        // count `Groth16::circuit_specific_setup` will fix the proof's
+        // shape to.
+        assert_eq!(BatchMatchCorrectnessCircuit::empty().matches.len(), MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn a_partial_batch_pads_to_max_batch_size_and_is_satisfiable() {
+        let circuit = BatchMatchCorrectnessCircuit::new(vec![valid_match(100, 10), valid_match(96, 5)]);
+        assert_eq!(circuit.matches.len(), MAX_BATCH_SIZE);
+        assert_eq!(circuit.public_inputs().len(), 4 * MAX_BATCH_SIZE);
+
+        let cs = ark_relations::r1cs::ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(cs.is_satisfied().unwrap(), "real matches plus padding must together satisfy the batch");
+    }
+
+    #[test]
+    fn a_full_batch_of_max_batch_size_needs_no_padding() {
+        let matches: Vec<_> = (0..MAX_BATCH_SIZE).map(|i| valid_match(100, 1 + i as u64)).collect();
+        let circuit = BatchMatchCorrectnessCircuit::new(matches);
+        let cs = ark_relations::r1cs::ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_BATCH_SIZE")]
+    fn more_than_max_batch_size_matches_panics_instead_of_silently_dropping_one() {
+        let matches: Vec<_> = (0..=MAX_BATCH_SIZE).map(|_| valid_match(100, 1)).collect();
+        BatchMatchCorrectnessCircuit::new(matches);
+    }
+
+    #[test]
+    fn one_invalid_match_in_an_otherwise_valid_batch_is_unsatisfiable() {
+        let mut invalid = valid_match(100, 10);
+        invalid.cmt_a = Some(Fr::from(999u64)); // tampered, same trick as tampered_commitment_is_unsatisfiable
+        let circuit = BatchMatchCorrectnessCircuit::new(vec![valid_match(100, 10), invalid]);
+
+        let cs = ark_relations::r1cs::ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(
+            !cs.is_satisfied().unwrap(),
+            "a single bad match must fail the whole batch, not just be ignored"
+        );
+    }
+
+    /// Real Groth16 setup/prove/verify over a batch, the same guarantee
+    /// `groth16_end_to_end_prove_and_verify` proves for a single match:
+    /// a real proof verifies, and tampering any one public input (here,
+    /// a middle slot's match_size, not just the last one) breaks it.
+    #[test]
+    fn batch_groth16_end_to_end_prove_and_verify() {
+        let mut r = rng();
+        let (pk, vk) = Groth16::<ark_bn254::Bn254>::circuit_specific_setup(
+            BatchMatchCorrectnessCircuit::empty(),
+            &mut r,
+        )
+        .unwrap();
+
+        let circuit = BatchMatchCorrectnessCircuit::new(vec![valid_match(100, 10), valid_match(96, 5)]);
+        let public_inputs = circuit.public_inputs();
+        let proof = Groth16::<ark_bn254::Bn254>::prove(&pk, circuit, &mut r).unwrap();
+
+        let valid = Groth16::<ark_bn254::Bn254>::verify(&vk, &public_inputs, &proof).unwrap();
+        assert!(valid, "a correctly generated batch proof must verify");
+
+        let mut tampered_inputs = public_inputs.clone();
+        tampered_inputs[7] = Fr::from(999u64); // second slot's match_size (index 4+3)
+        let invalid = Groth16::<ark_bn254::Bn254>::verify(&vk, &tampered_inputs, &proof).unwrap();
+        assert!(!invalid, "a batch proof must not verify against a tampered public input in any slot");
     }
 }

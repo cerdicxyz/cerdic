@@ -235,10 +235,12 @@ pub struct AppState {
     /// production deployment would expire entries or move this to a
     /// bounded LRU; fine for the traffic volumes this MVP targets.
     last_nonce: Mutex<HashMap<Address, u64>>,
-    /// Groth16 keys for `MatchCorrectness`, see `proof.rs`'s module docs
-    /// on why these are freshly generated, not loaded from a real
-    /// trusted-setup ceremony.
-    proof_keys: Arc<crate::proof::ProofKeys>,
+    /// Groth16 keys for `BatchMatchCorrectnessCircuit`, see `proof.rs`'s
+    /// module docs on why these are freshly generated, not loaded from a
+    /// real trusted-setup ceremony. Every provable fill in a sweep goes
+    /// through this one batch circuit, not a separate single-match proof
+    /// per fill, see `BatchMatchCorrectnessCircuit`'s doc for why.
+    batch_proof_keys: Arc<crate::proof::BatchProofKeys>,
     /// The book's truncated `OwnerId` back to the real signer address,
     /// needed to derive a fill's maker-side `portfolioKey` and seal its
     /// position params at settlement time. Populated on every accepted
@@ -275,7 +277,7 @@ impl AppState {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
-            proof_keys: crate::proof::ProofKeys::shared(),
+            batch_proof_keys: crate::proof::BatchProofKeys::shared(),
             owner_addresses: Mutex::new(HashMap::new()),
             sealed_key: crate::sealed::SealedKey::generate(),
             settlement_signer: crate::settle::SettlementSigner::generate(),
@@ -295,7 +297,7 @@ impl AppState {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
-            proof_keys: crate::proof::ProofKeys::shared(),
+            batch_proof_keys: crate::proof::BatchProofKeys::shared(),
             owner_addresses: Mutex::new(HashMap::new()),
             sealed_key: crate::sealed::SealedKey::from_bytes(&secrets.sealed_key),
             settlement_signer: crate::settle::SettlementSigner::from_bytes(&secrets.settlement_signer_seed),
@@ -397,9 +399,10 @@ async fn post_order(
     let mut taker_total_qty: u128 = 0;
     let mut taker_weighted_price: u128 = 0;
     let mut taker_total_margin: u128 = 0;
+    let mut provable_fills = Vec::new();
     for (fill_index, fill) in result.fills.iter().enumerate() {
         if crate::proof::should_prove(fill.qty) {
-            let witness = crate::proof::MatchWitness {
+            provable_fills.push(crate::proof::MatchWitness {
                 side_a: taker_is_buy,
                 price_a: payload.tick,
                 size_a: fill.taker_size_before,
@@ -408,27 +411,6 @@ async fn post_order(
                 size_b: fill.maker_size_before,
                 match_price: fill.tick,
                 match_size: fill.qty,
-            };
-            let state_for_proof = state.clone();
-            let maker_id = fill.maker_id;
-            // Never awaited by the caller: per ARCHITECTURE.md's ZK
-            // Correctness Layer, settlement (the response already sent
-            // above) must never wait on proof generation. spawn_blocking
-            // because Groth16 proving is CPU-bound, not something to run on
-            // the async runtime's cooperative worker threads.
-            tokio::task::spawn_blocking(move || {
-                let proof_result = crate::proof::generate_match_proof(&state_for_proof.proof_keys, witness);
-                // Never log `proof_result.proof` or `.public_inputs`: the public inputs are
-                // [cmt_a, cmt_b, match_price, match_size], so logging them would print the
-                // sealed match price and size in plaintext, exactly what sealing is meant to
-                // hide (ARCHITECTURE.md's privacy table: the TEE operator does not see
-                // decrypted order/position data). The proof itself is submitted on-chain
-                // where it belongs, not echoed to process logs.
-                if proof_result.self_verified {
-                    tracing::info!(maker_id, "MatchCorrectness proof generated and self-verified");
-                } else {
-                    tracing::error!(maker_id, "MatchCorrectness proof failed self-verification");
-                }
             });
         }
 
@@ -465,6 +447,36 @@ async fn post_order(
         taker_weighted_price += fill.tick as u128 * fill.qty as u128;
         taker_total_margin += required_margin(fill.tick, fill.qty);
         maker_legs.push(maker_leg);
+    }
+
+    // One Groth16 proof per MAX_BATCH_SIZE-sized chunk of this sweep's
+    // provable fills, not one proof per fill, see
+    // `BatchMatchCorrectnessCircuit`'s doc for why that matters (on-chain
+    // verification gas is roughly fixed per proof, so this turns what
+    // would be N verifications into ceil(N / MAX_BATCH_SIZE), usually 1).
+    for chunk in crate::proof::chunk_for_batching(provable_fills) {
+        let state_for_proof = state.clone();
+        let chunk_size = chunk.len();
+        // Never awaited by the caller: per ARCHITECTURE.md's ZK
+        // Correctness Layer, settlement (the response already sent
+        // above) must never wait on proof generation. spawn_blocking
+        // because Groth16 proving is CPU-bound, not something to run on
+        // the async runtime's cooperative worker threads.
+        tokio::task::spawn_blocking(move || {
+            let proof_result =
+                crate::proof::generate_batch_match_proof(&state_for_proof.batch_proof_keys, chunk);
+            // Never log `proof_result.proof` or `.public_inputs`: the public inputs are
+            // [cmt_a, cmt_b, match_price, match_size] per slot, so logging them would print
+            // the sealed match price and size in plaintext, exactly what sealing is meant to
+            // hide (ARCHITECTURE.md's privacy table: the TEE operator does not see
+            // decrypted order/position data). The proof itself is submitted on-chain
+            // where it belongs, not echoed to process logs.
+            if proof_result.self_verified {
+                tracing::info!(chunk_size, "MatchCorrectness batch proof generated and self-verified");
+            } else {
+                tracing::error!(chunk_size, "MatchCorrectness batch proof failed self-verification");
+            }
+        });
     }
 
     if !maker_legs.is_empty() {
