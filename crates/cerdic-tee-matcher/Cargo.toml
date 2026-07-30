@@ -26,6 +26,7 @@ nu-ansi-term = "0.50"
 time = { version = "0.3", features = ["formatting"] }
 
 crypto_box = { version = "0.9", features = ["std", "chacha20"] }
+aes-gcm = "0.10"
 base64 = "0.22"
 hex = "0.4"
 httparse = "1.9"

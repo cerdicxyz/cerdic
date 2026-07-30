@@ -29,10 +29,12 @@
 //! middleware (request body size cap, timeout, request tracing) wired
 //! in `main.rs` around this router, not inside the handlers themselves.
 
-use crate::book::{NewOrder, OrderBook, TimeInForce};
+use crate::book::{NewOrder, OrderBook, OwnerId, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
-use alloy::primitives::{Address, PrimitiveSignature as Signature};
+use crate::sealed::SealedParams;
+use crate::settle::MatchSettlement;
+use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, PrimitiveSignature as Signature, I256};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -237,6 +239,16 @@ pub struct AppState {
     /// on why these are freshly generated, not loaded from a real
     /// trusted-setup ceremony.
     proof_keys: Arc<crate::proof::ProofKeys>,
+    /// The book's truncated `OwnerId` back to the real signer address,
+    /// needed to derive a fill's maker-side `portfolioKey` and seal its
+    /// position params at settlement time. Populated on every accepted
+    /// order/offer; same unbounded-growth caveat as `last_nonce`.
+    owner_addresses: Mutex<HashMap<OwnerId, Address>>,
+    /// Seals TEE-private position parameters into `settleMatch`'s
+    /// `sealedParams`, see `sealed.rs`.
+    sealed_key: crate::sealed::SealedKey,
+    /// Signs `settleMatch` calls, see `settle.rs`.
+    settlement_signer: crate::settle::SettlementSigner,
 }
 
 impl AppState {
@@ -246,6 +258,9 @@ impl AppState {
             books: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
             proof_keys: crate::proof::ProofKeys::shared(),
+            owner_addresses: Mutex::new(HashMap::new()),
+            sealed_key: crate::sealed::SealedKey::generate(),
+            settlement_signer: crate::settle::SettlementSigner::generate(),
         }
     }
 }
@@ -307,11 +322,14 @@ async fn post_order(
         last_nonce.insert(signer, payload.nonce);
     }
 
+    let owner = signer_owner_id(signer);
+    state.owner_addresses.lock().expect("owner_addresses mutex poisoned").insert(owner, signer);
+
     let order = NewOrder {
         side: payload.side.into(),
         tick: payload.tick,
         qty: payload.qty,
-        owner: signer_owner_id(signer),
+        owner,
         tif: payload.tif,
         post_only: payload.post_only,
     };
@@ -335,45 +353,74 @@ async fn post_order(
     );
 
     let taker_is_buy = matches!(payload.side, OrderSide::Buy);
-    for fill in &result.fills {
-        if !crate::proof::should_prove(fill.qty) {
-            continue;
+    for (fill_index, fill) in result.fills.iter().enumerate() {
+        if crate::proof::should_prove(fill.qty) {
+            let witness = crate::proof::MatchWitness {
+                side_a: taker_is_buy,
+                price_a: payload.tick,
+                size_a: fill.taker_size_before,
+                side_b: !taker_is_buy,
+                price_b: fill.tick,
+                size_b: fill.maker_size_before,
+                match_price: fill.tick,
+                match_size: fill.qty,
+            };
+            let state_for_proof = state.clone();
+            let maker_id = fill.maker_id;
+            // Never awaited by the caller: per ARCHITECTURE.md's ZK
+            // Correctness Layer, settlement (the response already sent
+            // above) must never wait on proof generation. spawn_blocking
+            // because Groth16 proving is CPU-bound, not something to run on
+            // the async runtime's cooperative worker threads.
+            tokio::task::spawn_blocking(move || {
+                let proof_result = crate::proof::generate_match_proof(&state_for_proof.proof_keys, witness);
+                let proof_hex = hex::encode(canonical_bytes(&proof_result.proof));
+                let public_inputs_hex: Vec<String> =
+                    proof_result.public_inputs.iter().map(|fr| hex::encode(canonical_bytes(fr))).collect();
+                if proof_result.self_verified {
+                    tracing::info!(
+                        maker_id,
+                        proof = %proof_hex,
+                        public_inputs = ?public_inputs_hex,
+                        "MatchCorrectness proof generated and self-verified"
+                    );
+                } else {
+                    tracing::error!(maker_id, "MatchCorrectness proof failed self-verification");
+                }
+            });
         }
-        let witness = crate::proof::MatchWitness {
-            side_a: taker_is_buy,
-            price_a: payload.tick,
-            size_a: fill.taker_size_before,
-            side_b: !taker_is_buy,
-            price_b: fill.tick,
-            size_b: fill.maker_size_before,
-            match_price: fill.tick,
-            match_size: fill.qty,
+
+        let Some(&maker_address) =
+            state.owner_addresses.lock().expect("owner_addresses mutex poisoned").get(&fill.maker_owner)
+        else {
+            // Can't happen in practice: a resting order's owner is always
+            // registered before it can rest. Settling nothing is safer
+            // than settling against a wrong/zero address.
+            tracing::error!(maker_owner = fill.maker_owner, "unknown maker address, skipping settlement");
+            continue;
         };
-        let state_for_proof = state.clone();
-        let maker_id = fill.maker_id;
-        // Never awaited by the caller: per ARCHITECTURE.md's ZK
-        // Correctness Layer, settlement (the response already sent
-        // above) must never wait on proof generation. spawn_blocking
-        // because Groth16 proving is CPU-bound, not something to run on
-        // the async runtime's cooperative worker threads.
-        tokio::task::spawn_blocking(move || {
-            let proof_result = crate::proof::generate_match_proof(&state_for_proof.proof_keys, witness);
-            // Logged, not yet submitted anywhere: on-chain submission
-            // (IZkVerifier.submitMatchProof, per
-            // docs/spec-contracts-tee.md section 3.4) isn't wired up
-            // yet, see settle.rs. This is what that module will consume.
-            let proof_hex = hex::encode(canonical_bytes(&proof_result.proof));
-            let public_inputs_hex: Vec<String> =
-                proof_result.public_inputs.iter().map(|fr| hex::encode(canonical_bytes(fr))).collect();
-            if proof_result.self_verified {
-                tracing::info!(
-                    maker_id,
-                    proof = %proof_hex,
-                    public_inputs = ?public_inputs_hex,
-                    "MatchCorrectness proof generated and self-verified"
-                );
-            } else {
-                tracing::error!(maker_id, "MatchCorrectness proof failed self-verification");
+
+        let settlement = build_match_settlement(
+            &state.sealed_key,
+            signer,
+            payload.nonce,
+            fill_index,
+            &payload.market_id,
+            fill.tick,
+            fill.qty,
+            taker_is_buy,
+            fill.maker_owner,
+            maker_address,
+        );
+        let state_for_settlement = state.clone();
+        // Never awaited: settlement is async network I/O (or a no-op
+        // when unconfigured, see settle.rs), not something the trader's
+        // response should wait on.
+        tokio::spawn(async move {
+            let result =
+                crate::settle::settle_match(&state_for_settlement.settlement_signer, &settlement).await;
+            if let Some(tx_hash) = result.broadcast_tx_hash {
+                tracing::info!(tx_hash = %tx_hash, match_id = %settlement.match_id, "match settled on-chain");
             }
         });
     }
@@ -409,11 +456,14 @@ async fn post_offer(
         last_nonce.insert(signer, payload.nonce);
     }
 
+    let owner = signer_owner_id(signer);
+    state.owner_addresses.lock().expect("owner_addresses mutex poisoned").insert(owner, signer);
+
     let order = NewOrder {
         side: payload.side.into(),
         tick: payload.tick,
         qty: payload.max_size,
-        owner: signer_owner_id(signer),
+        owner,
         tif: match payload.expiry {
             Some(expiry) => TimeInForce::GoodTilTime(expiry),
             None => TimeInForce::GoodTilCancel,
@@ -460,25 +510,115 @@ async fn post_liquidation_check(
 }
 
 /// Maps a signer's on-chain address to the book's opaque `OwnerId`. The
-/// low 8 bytes of the address, collisions are not a soundness issue for
+/// low 8 bytes of the address; collisions are not a soundness issue for
 /// self-trade prevention specifically (a false-positive collision would
 /// only ever make STP marginally more conservative, cancelling a
 /// resting order that happened to share a truncated id with a different
-/// real owner), but this is a placeholder mapping, a real deployment
-/// should key owners by `portfolioKey` (see `docs/spec-contracts-tee.md`),
-/// not a truncated wallet address.
+/// real owner). This is the book's own internal id, separate from the
+/// settlement-facing `portfolio_key` below, which hashes the full
+/// address, not a truncated one.
 fn signer_owner_id(signer: Address) -> u64 {
     let bytes = signer.as_slice();
     u64::from_be_bytes(bytes[12..20].try_into().expect("Address is 20 bytes"))
 }
 
 /// Canonical (arkworks-standard) byte encoding, for logging proof
-/// material as hex until `settle.rs` exists to submit it on-chain in
-/// its real binary form instead.
+/// material as hex until on-chain proof submission (`IZkVerifier`, per
+/// `docs/spec-contracts-tee.md` section 3.4) is wired up.
 fn canonical_bytes<T: ark_serialize::CanonicalSerialize>(value: &T) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.serialize_compressed(&mut bytes).expect("serialization into a Vec<u8> cannot fail");
     bytes
+}
+
+/// The kernel's TEE-derived account grouping key (`docs/spec-contracts-tee.md`
+/// section 2.2), `keccak256(address)` until real cross-margin account
+/// grouping exists to group multiple addresses under one portfolio.
+fn portfolio_key(address: Address) -> FixedBytes<32> {
+    keccak256(address.as_slice())
+}
+
+const IMR_BPS: u128 = 500;
+const BPS_DENOMINATOR: u128 = 10_000;
+
+/// Mirrors `SettlementEngine.requiredMargin`'s formula shape (full
+/// product before one floor division), but `tick`/`qty` here are the
+/// TEE's raw order-book units, not the contract's 1e18-scaled USD.
+/// Real deployment needs a shared fixed-point convention between the
+/// TEE and the contract; tracked as a follow-up, not invented here.
+fn required_margin(tick: u64, qty: u64) -> u128 {
+    (tick as u128) * (qty as u128) * IMR_BPS / BPS_DENOMINATOR
+}
+
+/// Deterministic, unique per fill: combines the taker's identity and
+/// nonce (already required strictly increasing per signer) with the
+/// maker and the fill's position within this submit call, so a single
+/// sweep across several resting makers never collides.
+#[allow(clippy::too_many_arguments)]
+fn match_id_for(
+    taker: Address,
+    maker_owner: OwnerId,
+    market_id: &str,
+    tick: u64,
+    fill_index: usize,
+    taker_nonce: u64,
+) -> FixedBytes<32> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(taker.as_slice());
+    bytes.extend_from_slice(&maker_owner.to_be_bytes());
+    bytes.extend_from_slice(market_id.as_bytes());
+    bytes.extend_from_slice(&tick.to_be_bytes());
+    bytes.extend_from_slice(&taker_nonce.to_be_bytes());
+    bytes.extend_from_slice(&(fill_index as u64).to_be_bytes());
+    keccak256(&bytes)
+}
+
+/// Builds and seals a `MatchSettlement` for one fill. Both legs lock the
+/// same margin (each leg's own commitment, not a zero-sum transfer
+/// between them, matching `SettlementEngine.settleTrade`'s model of
+/// each side independently posting its own margin).
+#[allow(clippy::too_many_arguments)]
+fn build_match_settlement(
+    sealed_key: &crate::sealed::SealedKey,
+    taker: Address,
+    taker_nonce: u64,
+    fill_index: usize,
+    market_id: &str,
+    tick: u64,
+    qty: u64,
+    taker_is_buy: bool,
+    maker_owner: OwnerId,
+    maker_address: Address,
+) -> MatchSettlement {
+    let margin = I256::try_from(required_margin(tick, qty)).expect("margin fits in I256");
+
+    let taker_params = SealedParams {
+        side_is_buy: taker_is_buy,
+        entry_price: tick,
+        size: qty,
+        leverage: 1,
+        take_profit: None,
+        stop_loss: None,
+    };
+    let maker_params = SealedParams {
+        side_is_buy: !taker_is_buy,
+        entry_price: tick,
+        size: qty,
+        leverage: 1,
+        take_profit: None,
+        stop_loss: None,
+    };
+
+    MatchSettlement {
+        match_id: match_id_for(taker, maker_owner, market_id, tick, fill_index, taker_nonce),
+        market_id: keccak256(market_id.as_bytes()),
+        portfolio_key_a: portfolio_key(taker),
+        collateral_delta_a: margin,
+        sealed_params_a: Bytes::from(sealed_key.seal(&taker_params)),
+        portfolio_key_b: portfolio_key(maker_address),
+        collateral_delta_b: margin,
+        sealed_params_b: Bytes::from(sealed_key.seal(&maker_params)),
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +731,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "filled");
         assert_eq!(body["fills"], 1);
+    }
+
+    /// Unlike ZK proof generation (threshold-gated), settlement is attempted for
+    /// every fill. This proves that wiring (resolving the maker's address,
+    /// sealing both legs' params, spawning the settle_match call) runs
+    /// end-to-end without panicking, at a trade size far below
+    /// `proof::NOTIONAL_THRESHOLD` so it's exercising the settlement path
+    /// specifically, not incidentally riding along with the proof path.
+    #[tokio::test]
+    async fn crossing_fill_triggers_settlement_without_panicking() {
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let taker = wallet();
+
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(crossing, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "filled");
+
+        // Fire-and-forget from the handler's point of view; give the spawned
+        // task a moment to actually run so a panic inside it surfaces here.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     /// The proof-generation branch in `post_order` is only reached when

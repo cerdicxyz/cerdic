@@ -9,13 +9,10 @@
 //! ) external; // onlyAuthorizedTEE
 //! ```
 //!
-//! # What this doesn't do yet
-//!
-//! `sealedParamsA`/`sealedParamsB` (AES-256-GCM-encrypted position
-//! details, per the spec's Section 2.2) aren't implemented, that's a
-//! separate encryption concern from this module's job of building and
-//! signing the settlement call itself; empty bytes stand in for them
-//! here, clearly marked, not disguised as real ciphertext.
+//! `sealedParamsA`/`sealedParamsB` are real AES-256-GCM ciphertext, see
+//! `sealed.rs`; this module only builds and signs the call, it doesn't
+//! seal anything itself. Wired into `post_order` (`api.rs`) for every
+//! fill.
 //!
 //! Broadcasting is real but optional: if `SETTLEMENT_RPC_URL` and
 //! `SETTLEMENT_CONTRACT_ADDRESS` are both set, this signs and submits a
@@ -23,15 +20,6 @@
 //! has no deployed `SettlementEngine` to point at), it builds and signs
 //! the call, logs what would have been sent, and stops there, an honest
 //! "nothing to submit to" rather than a fake success.
-//!
-//! Not wired into `post_order` yet: doing so needs a real `portfolioKey`
-//! (currently only the truncated address stand-in in `api.rs`) and a
-//! real `collateralDelta` (margin/PnL-derived, and margin computation
-//! was explicitly scoped to the smart contract, not this binary). Wiring
-//! this up with placeholder numbers would present fake settlement
-//! amounts as real ones, worth avoiding even in a dev build. Fully
-//! tested in isolation in the meantime.
-#![allow(dead_code)]
 
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, I256},
@@ -86,8 +74,10 @@ pub struct MatchSettlement {
     pub market_id: FixedBytes<32>,
     pub portfolio_key_a: FixedBytes<32>,
     pub collateral_delta_a: I256,
+    pub sealed_params_a: Bytes,
     pub portfolio_key_b: FixedBytes<32>,
     pub collateral_delta_b: I256,
+    pub sealed_params_b: Bytes,
 }
 
 /// The result of building a settlement call: always the calldata (so a
@@ -99,18 +89,17 @@ pub struct SettlementResult {
     pub broadcast_tx_hash: Option<FixedBytes<32>>,
 }
 
-/// ABI-encodes a `settleMatch` call. Sealed params are empty, see
-/// module docs, real encryption isn't implemented here.
+/// ABI-encodes a `settleMatch` call.
 pub fn build_settle_match_calldata(settlement: &MatchSettlement) -> Bytes {
     let call = ISettlementEngine::settleMatchCall {
         matchId: settlement.match_id,
         marketId: settlement.market_id,
         portfolioKeyA: settlement.portfolio_key_a,
         collateralDeltaA: settlement.collateral_delta_a,
-        sealedParamsA: Bytes::new(),
+        sealedParamsA: settlement.sealed_params_a.clone(),
         portfolioKeyB: settlement.portfolio_key_b,
         collateralDeltaB: settlement.collateral_delta_b,
-        sealedParamsB: Bytes::new(),
+        sealedParamsB: settlement.sealed_params_b.clone(),
     };
     Bytes::from(call.abi_encode())
 }
@@ -184,8 +173,10 @@ mod tests {
             market_id: FixedBytes::from([2u8; 32]),
             portfolio_key_a: FixedBytes::from([3u8; 32]),
             collateral_delta_a: I256::try_from(1000i64).unwrap(),
+            sealed_params_a: Bytes::from(vec![0xaa, 0xbb]),
             portfolio_key_b: FixedBytes::from([4u8; 32]),
             collateral_delta_b: I256::try_from(-1000i64).unwrap(),
+            sealed_params_b: Bytes::from(vec![0xcc, 0xdd]),
         }
     }
 
@@ -208,6 +199,29 @@ mod tests {
         assert_eq!(decoded.collateralDeltaA, settlement.collateral_delta_a);
         assert_eq!(decoded.portfolioKeyB, settlement.portfolio_key_b);
         assert_eq!(decoded.collateralDeltaB, settlement.collateral_delta_b);
+        assert_eq!(decoded.sealedParamsA, settlement.sealed_params_a);
+        assert_eq!(decoded.sealedParamsB, settlement.sealed_params_b);
+    }
+
+    #[test]
+    fn sealed_params_round_trip_through_calldata_and_back_through_the_key() {
+        let key = crate::sealed::SealedKey::generate();
+        let params = crate::sealed::SealedParams {
+            side_is_buy: true,
+            entry_price: 100,
+            size: 10,
+            leverage: 5,
+            take_profit: None,
+            stop_loss: Some(90),
+        };
+        let mut settlement = sample_settlement();
+        settlement.sealed_params_a = Bytes::from(key.seal(&params));
+
+        let calldata = build_settle_match_calldata(&settlement);
+        let decoded = ISettlementEngine::settleMatchCall::abi_decode(&calldata, true).unwrap();
+
+        let reopened = key.unseal(&decoded.sealedParamsA).unwrap();
+        assert_eq!(reopened, params);
     }
 
     #[test]

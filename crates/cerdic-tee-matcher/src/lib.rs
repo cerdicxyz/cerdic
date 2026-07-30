@@ -12,4 +12,5 @@ pub mod decrypt;
 pub mod keystore;
 pub mod logging;
 pub mod proof;
+pub mod sealed;
 pub mod settle;
