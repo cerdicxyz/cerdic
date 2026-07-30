@@ -4,6 +4,19 @@ import {Test, Vm} from "forge-std/Test.sol";
 
 import {SettlementEngine} from "../src/clearing/SettlementEngine.sol";
 import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
+import {ISealedMarketLifecycle} from "../src/clearing/IMarketLifecycle.sol";
+
+/// @dev Minimal market extension: just enough to register as a decoder and record
+///      onSealedOpen calls, so SettleMatchTest doesn't need a real PerpMarket.
+contract MockSealedMarket is ISealedMarketLifecycle {
+    mapping(bytes32 => bytes32) public lastMarketFor;
+    uint256 public onSealedOpenCalls;
+
+    function onSealedOpen(bytes32 portfolioKey, bytes32 marketId) external {
+        lastMarketFor[portfolioKey] = marketId;
+        onSealedOpenCalls++;
+    }
+}
 
 /// @notice settleMatch is the TEE-private path (docs/spec-contracts-tee.md section 2.2):
 ///         an attested TEE calls it with a computed collateral delta and an opaque sealed
@@ -11,6 +24,7 @@ import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
 contract SettleMatchTest is Test {
     SettlementEngine internal engine;
     AttestationRouter internal router;
+    MockSealedMarket internal market;
 
     address internal admin = makeAddr("admin");
     address internal tee = makeAddr("tee");
@@ -24,11 +38,14 @@ contract SettleMatchTest is Test {
     function setUp() public {
         engine = new SettlementEngine(admin);
         router = new AttestationRouter(admin);
+        market = new MockSealedMarket();
 
         vm.prank(admin);
         engine.setAttestationRouter(address(router));
         vm.prank(admin);
         router.authorizeTEE(tee);
+        vm.prank(admin);
+        engine.registerDecoder(MARKET_ID, address(market));
     }
 
     function _settle(int256 deltaA, int256 deltaB, bytes memory sealedA, bytes memory sealedB) internal {
@@ -48,6 +65,21 @@ contract SettleMatchTest is Test {
         assertEq(collateralA, 5_000e18);
         assertEq(storedB, sealedB);
         assertEq(collateralB, 3_000e18);
+    }
+
+    function test_SettleMatchNotifiesTheMarketForBothLegs() public {
+        _settle(1_000e18, 1_000e18, "", "");
+
+        assertEq(market.onSealedOpenCalls(), 2);
+        assertEq(market.lastMarketFor(PORTFOLIO_A), MARKET_ID);
+        assertEq(market.lastMarketFor(PORTFOLIO_B), MARKET_ID);
+    }
+
+    function test_UnregisteredMarketReverts() public {
+        bytes32 otherMarket = keccak256("unregistered");
+        vm.expectRevert(abi.encodeWithSelector(SettlementEngine.MarketNotRegistered.selector, otherMarket));
+        vm.prank(tee);
+        engine.settleMatch(MATCH_ID, otherMarket, PORTFOLIO_A, 1, "", PORTFOLIO_B, 1, "");
     }
 
     function test_SettleMatchEmitsOnlyMatchId() public {

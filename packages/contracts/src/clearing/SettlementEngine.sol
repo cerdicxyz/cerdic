@@ -2,7 +2,7 @@
 pragma solidity 0.8.35;
 import {PositionEngine} from "./PositionEngine.sol";
 import {IMarket} from "./IMarket.sol";
-import {IMarketLifecycle} from "./IMarketLifecycle.sol";
+import {IMarketLifecycle, ISealedMarketLifecycle} from "./IMarketLifecycle.sol";
 import {MarketImpactTwap} from "../oracle/MarketImpactTwap.sol";
 import {AttestationRouter} from "./AttestationRouter.sol";
 
@@ -176,10 +176,18 @@ contract SettlementEngine is PositionEngine {
         if (marketId == bytes32(0)) revert ZeroMarketId();
         if (portfolioKeyA == bytes32(0) || portfolioKeyB == bytes32(0)) revert ZeroPortfolioKey();
 
+        address market = positionDecoders[marketId];
+        if (market == address(0)) revert MarketNotRegistered(marketId);
+
         settledMatches[matchId] = true;
 
         _applySealedLeg(marketId, portfolioKeyA, collateralDeltaA, sealedParamsA);
         _applySealedLeg(marketId, portfolioKeyB, collateralDeltaB, sealedParamsB);
+
+        // No size/price/side passed, see ISealedMarketLifecycle: this only lets the
+        // market checkpoint per-portfolioKey state (e.g. a funding-index stamp).
+        ISealedMarketLifecycle(market).onSealedOpen(portfolioKeyA, marketId);
+        ISealedMarketLifecycle(market).onSealedOpen(portfolioKeyB, marketId);
 
         emit MatchSettled(matchId);
     }

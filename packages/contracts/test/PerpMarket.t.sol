@@ -2,12 +2,12 @@
 pragma solidity 0.8.35;
 import {Test} from "forge-std/Test.sol";
 
-import {BtcPerpMarket} from "../src/markets/BtcPerpMarket.sol";
+import {PerpMarket} from "../src/markets/PerpMarket.sol";
 import {IMarket} from "../src/clearing/IMarket.sol";
 import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 
 /// @dev Minimal oracle hub mock with configurable mark and primary prices.
-///      Exposes the same ABI surface `BtcPerpMarket` calls: `markPrice`
+///      Exposes the same ABI surface `PerpMarket` calls: `markPrice`
 ///      and `pythPrimary`. No circuit breaker, no staleness — just
 ///      deterministic prices for testing the funding and PnL formulas.
 contract MockOracleHub {
@@ -36,7 +36,7 @@ contract MockOracleHub {
     }
 }
 
-/// @title  BtcPerpMarketTest
+/// @title  PerpMarketTest
 /// @notice Unit + fuzz tests for the BTC/USDC perpetual market extension
 ///         (paper/cerdic.tex:561-575, plan todo #14). Covers the happy
 ///         open/close path, leverage and margin validation reverts,
@@ -46,8 +46,8 @@ contract MockOracleHub {
 ///         FundingIndexUpdated event, validateClose semantics, the
 ///         drift guard against ProtocolConstants, and all seven
 ///         lifecycle callbacks.
-contract BtcPerpMarketTest is Test {
-    BtcPerpMarket internal market;
+contract PerpMarketTest is Test {
+    PerpMarket internal market;
     MockOracleHub internal oracle;
     ProtocolConstants internal constants;
 
@@ -55,7 +55,7 @@ contract BtcPerpMarketTest is Test {
     address internal longTrader = makeAddr("longTrader");
     address internal shortTrader = makeAddr("shortTrader");
 
-    /// @dev BTC/USDC Pyth feed ID — same as `BtcPerpMarket.BTC_USDC_FEED`.
+    /// @dev BTC/USDC Pyth feed ID — same as `PerpMarket.BTC_USDC_FEED`.
     bytes32 internal constant FEED = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
 
     /// @dev Canonical trade: 1 BTC at $100k.
@@ -67,7 +67,7 @@ contract BtcPerpMarketTest is Test {
         oracle = new MockOracleHub();
         oracle.setBoth(PRICE, PRICE); // mark = index = $100k (stable)
 
-        market = new BtcPerpMarket(admin, address(oracle));
+        market = new PerpMarket(admin, address(oracle), FEED);
         constants = new ProtocolConstants();
 
         // Self-register as decoder for the BTC/USDC market.
@@ -206,7 +206,7 @@ contract BtcPerpMarketTest is Test {
         vm.roll(block.number + 100);
 
         vm.expectEmit(true, false, false, true, address(market));
-        emit BtcPerpMarket.FundingIndexUpdated(FEED, 0, block.number);
+        emit PerpMarket.FundingIndexUpdated(FEED, 0, block.number);
 
         market.updateFundingIndex(FEED);
 
@@ -338,7 +338,7 @@ contract BtcPerpMarketTest is Test {
         int256 expectedIndex = int256(3e15 * 50);
 
         vm.expectEmit(true, false, false, true, address(market));
-        emit BtcPerpMarket.FundingIndexUpdated(FEED, expectedIndex, block.number);
+        emit PerpMarket.FundingIndexUpdated(FEED, expectedIndex, block.number);
 
         market.updateFundingIndex(FEED);
     }
@@ -496,5 +496,30 @@ contract BtcPerpMarketTest is Test {
         // |-1e16| > 3e15 → clamped to -3e15
         // deltaF = -3e15 * 100 = -3e17
         assertEq(market.fundingIndex(FEED), -int256(3e15 * 100), "negative basis decreases index");
+    }
+
+    // -----------------------------------------------------------------
+    // onSealedOpen: settleMatch's privacy-preserving funding checkpoint.
+    // -----------------------------------------------------------------
+
+    bytes32 internal constant PORTFOLIO_KEY = keccak256("portfolioA");
+
+    /// @notice Stamps the current funding index for portfolioKey, no trader/size/price
+    ///         involved at all — the privacy-preserving counterpart to afterOpenPosition.
+    function test_OnSealedOpenStampsCurrentFundingIndex() public {
+        oracle.setMarkPrice(101_000e18);
+        oracle.setPythPrimary(100_000e18);
+        vm.roll(block.number + 10);
+
+        market.onSealedOpen(PORTFOLIO_KEY, FEED);
+
+        assertEq(market.sealedEntryFundingIndex(PORTFOLIO_KEY), market.fundingIndex(FEED));
+        assertGt(market.fundingIndex(FEED), 0, "sanity: basis actually moved the index");
+    }
+
+    function test_OnSealedOpenWrongMarketReverts() public {
+        bytes32 otherMarket = keccak256("other");
+        vm.expectRevert(abi.encodeWithSelector(PerpMarket.WrongMarket.selector, otherMarket, FEED));
+        market.onSealedOpen(PORTFOLIO_KEY, otherMarket);
     }
 }
