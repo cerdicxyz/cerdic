@@ -258,10 +258,15 @@ pub struct AppState {
     /// natural place to keep this index; same unbounded-growth caveat
     /// as `last_nonce`.
     portfolio_markets: Mutex<HashMap<FixedBytes<32>, std::collections::HashSet<MarketId>>>,
+    /// Enclave-only key for deriving `portfolioKey` from an address, see
+    /// `portfolio_key`'s doc. Never serialized, never leaves this process.
+    portfolio_key_secret: [u8; 32],
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let mut portfolio_key_secret = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut portfolio_key_secret);
         Self {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
@@ -271,6 +276,7 @@ impl AppState {
             sealed_key: crate::sealed::SealedKey::generate(),
             settlement_signer: crate::settle::SettlementSigner::generate(),
             portfolio_markets: Mutex::new(HashMap::new()),
+            portfolio_key_secret,
         }
     }
 }
@@ -388,16 +394,14 @@ async fn post_order(
             // the async runtime's cooperative worker threads.
             tokio::task::spawn_blocking(move || {
                 let proof_result = crate::proof::generate_match_proof(&state_for_proof.proof_keys, witness);
-                let proof_hex = hex::encode(canonical_bytes(&proof_result.proof));
-                let public_inputs_hex: Vec<String> =
-                    proof_result.public_inputs.iter().map(|fr| hex::encode(canonical_bytes(fr))).collect();
+                // Never log `proof_result.proof` or `.public_inputs`: the public inputs are
+                // [cmt_a, cmt_b, match_price, match_size], so logging them would print the
+                // sealed match price and size in plaintext, exactly what sealing is meant to
+                // hide (ARCHITECTURE.md's privacy table: the TEE operator does not see
+                // decrypted order/position data). The proof itself is submitted on-chain
+                // where it belongs, not echoed to process logs.
                 if proof_result.self_verified {
-                    tracing::info!(
-                        maker_id,
-                        proof = %proof_hex,
-                        public_inputs = ?public_inputs_hex,
-                        "MatchCorrectness proof generated and self-verified"
-                    );
+                    tracing::info!(maker_id, "MatchCorrectness proof generated and self-verified");
                 } else {
                     tracing::error!(maker_id, "MatchCorrectness proof failed self-verification");
                 }
@@ -416,6 +420,7 @@ async fn post_order(
 
         let maker_leg = build_maker_leg(
             &state.sealed_key,
+            &state.portfolio_key_secret,
             signer,
             payload.nonce,
             fill_index,
@@ -450,7 +455,7 @@ async fn post_order(
             take_profit: None,
             stop_loss: None,
         };
-        let taker_portfolio_key = portfolio_key(signer);
+        let taker_portfolio_key = portfolio_key(&state.portfolio_key_secret, signer);
         let sweep = crate::settle::TakerSweep {
             market_id: keccak256(payload.market_id.as_bytes()),
             portfolio_key_taker: taker_portfolio_key,
@@ -640,20 +645,27 @@ fn signer_owner_id(signer: Address) -> u64 {
     u64::from_be_bytes(bytes[12..20].try_into().expect("Address is 20 bytes"))
 }
 
-/// Canonical (arkworks-standard) byte encoding, for logging proof
-/// material as hex until on-chain proof submission (`IZkVerifier`, per
-/// `docs/spec-contracts-tee.md` section 3.4) is wired up.
-fn canonical_bytes<T: ark_serialize::CanonicalSerialize>(value: &T) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    value.serialize_compressed(&mut bytes).expect("serialization into a Vec<u8> cannot fail");
-    bytes
-}
-
 /// The kernel's TEE-derived account grouping key (`docs/spec-contracts-tee.md`
-/// section 2.2), `keccak256(address)` until real cross-margin account
-/// grouping exists to group multiple addresses under one portfolio.
-fn portfolio_key(address: Address) -> FixedBytes<32> {
-    keccak256(address.as_slice())
+/// section 2.2), keyed to an enclave-only secret until real cross-margin
+/// account grouping exists to group multiple addresses under one portfolio.
+///
+/// Deliberately NOT `keccak256(address)`: `ARCHITECTURE.md`'s privacy table
+/// requires the Arc EVM to not learn which account owns a `portfolioKey`, but
+/// a bare hash of a public address is trivially invertible by anyone willing
+/// to hash candidate addresses, so it gave that unlinkability away for free.
+/// Keying the hash to a secret only this enclave holds (keccak256 over a
+/// secret prefix is not vulnerable to length-extension the way SHA-2 would
+/// be, so this is a legitimate keyed hash, not just an obscured one) makes
+/// `portfolioKey` unrecoverable from an address without breaking the
+/// enclave, matching every other secret this TEE holds (`sealed_key`,
+/// `settlement_signer`). Keepers can still watch `portfolioKey` values
+/// publicly on-chain per spec 2.4, they just can't map one back to a
+/// specific trader.
+fn portfolio_key(secret: &[u8; 32], address: Address) -> FixedBytes<32> {
+    let mut bytes = Vec::with_capacity(32 + 20);
+    bytes.extend_from_slice(secret);
+    bytes.extend_from_slice(address.as_slice());
+    keccak256(&bytes)
 }
 
 const IMR_BPS: u128 = 500;
@@ -696,6 +708,7 @@ fn match_id_for(
 #[allow(clippy::too_many_arguments)]
 fn build_maker_leg(
     sealed_key: &crate::sealed::SealedKey,
+    portfolio_key_secret: &[u8; 32],
     taker: Address,
     taker_nonce: u64,
     fill_index: usize,
@@ -718,7 +731,7 @@ fn build_maker_leg(
 
     crate::settle::MakerFill {
         match_id: match_id_for(taker, maker_owner, market_id, tick, fill_index, taker_nonce),
-        portfolio_key: portfolio_key(maker_address),
+        portfolio_key: portfolio_key(portfolio_key_secret, maker_address),
         collateral_delta: margin,
         sealed_params: Bytes::from(sealed_key.seal(&maker_params)),
     }
@@ -734,6 +747,25 @@ mod tests {
 
     fn wallet() -> PrivateKeySigner {
         PrivateKeySigner::random()
+    }
+
+    /// Regression test for the leak `keccak256(address)` used to have: given only an
+    /// address, nobody outside this enclave should be able to compute its `portfolioKey`.
+    #[test]
+    fn portfolio_key_is_not_a_bare_hash_of_the_address() {
+        let address = wallet().address();
+        let secret = [7u8; 32];
+        let derived = portfolio_key(&secret, address);
+        let bare_hash = keccak256(address.as_slice());
+        assert_ne!(derived, bare_hash, "portfolioKey must not be recoverable from the address alone");
+    }
+
+    #[test]
+    fn portfolio_key_differs_across_enclave_secrets() {
+        let address = wallet().address();
+        let a = portfolio_key(&[1u8; 32], address);
+        let b = portfolio_key(&[2u8; 32], address);
+        assert_ne!(a, b, "the same address must not map to the same portfolioKey under a different secret");
     }
 
     fn sign(order: &mut OrderPayload, wallet: &PrivateKeySigner) {
@@ -1209,7 +1241,7 @@ mod tests {
         sign(&mut crossing, &taker);
         post_json(app.clone(), "/order", &envelope_for(crossing, &state)).await;
 
-        let portfolio_key = format!("{:x}", portfolio_key(taker.address()));
+        let portfolio_key = format!("{:x}", portfolio_key(&state.portfolio_key_secret, taker.address()));
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/liquidation-check")
