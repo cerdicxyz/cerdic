@@ -30,6 +30,13 @@ use alloy::{
 use std::env;
 
 sol! {
+    struct MakerLeg {
+        bytes32 matchId;
+        bytes32 portfolioKey;
+        int256 collateralDelta;
+        bytes sealedParams;
+    }
+
     interface ISettlementEngine {
         function settleMatch(
             bytes32 matchId,
@@ -40,6 +47,14 @@ sol! {
             bytes32 portfolioKeyB,
             int256 collateralDeltaB,
             bytes calldata sealedParamsB
+        ) external;
+
+        function settleTakerSweep(
+            bytes32 marketId,
+            bytes32 portfolioKeyTaker,
+            int256 collateralDeltaTaker,
+            bytes calldata sealedParamsTaker,
+            MakerLeg[] calldata makerLegs
         ) external;
 
         function loadSealed(bytes32 portfolioKey, bytes32 marketId)
@@ -83,6 +98,79 @@ pub struct MatchSettlement {
     pub portfolio_key_b: FixedBytes<32>,
     pub collateral_delta_b: I256,
     pub sealed_params_b: Bytes,
+}
+
+/// One maker leg of a `settleTakerSweep` batch — everything `MatchSettlement`'s B side
+/// carries, minus the market/taker fields the sweep already covers once.
+pub struct MakerFill {
+    pub match_id: FixedBytes<32>,
+    pub portfolio_key: FixedBytes<32>,
+    pub collateral_delta: I256,
+    pub sealed_params: Bytes,
+}
+
+/// One taker order settled against N resting makers in a single call, per
+/// `SettlementEngine.settleTakerSweep`: the Polymarket `matchOrders` shape,
+/// see `docs/spec-contracts-tee.md`. The taker's own state (its final
+/// post-sweep collateral delta and sealed params) is written once,
+/// regardless of how many makers it swept.
+pub struct TakerSweep {
+    pub market_id: FixedBytes<32>,
+    pub portfolio_key_taker: FixedBytes<32>,
+    pub collateral_delta_taker: I256,
+    pub sealed_params_taker: Bytes,
+    pub maker_legs: Vec<MakerFill>,
+}
+
+/// ABI-encodes a `settleTakerSweep` call.
+pub fn build_taker_sweep_calldata(sweep: &TakerSweep) -> Bytes {
+    let maker_legs = sweep
+        .maker_legs
+        .iter()
+        .map(|leg| MakerLeg {
+            matchId: leg.match_id,
+            portfolioKey: leg.portfolio_key,
+            collateralDelta: leg.collateral_delta,
+            sealedParams: leg.sealed_params.clone(),
+        })
+        .collect();
+
+    let call = ISettlementEngine::settleTakerSweepCall {
+        marketId: sweep.market_id,
+        portfolioKeyTaker: sweep.portfolio_key_taker,
+        collateralDeltaTaker: sweep.collateral_delta_taker,
+        sealedParamsTaker: sweep.sealed_params_taker.clone(),
+        makerLegs: maker_legs,
+    };
+    Bytes::from(call.abi_encode())
+}
+
+/// Builds the batch calldata and, only if broadcasting is configured, signs and submits
+/// one real transaction covering every maker leg. Same "nothing to submit to" posture as
+/// `settle_match` when unconfigured.
+pub async fn settle_taker_sweep(signer: &SettlementSigner, sweep: &TakerSweep) -> SettlementResult {
+    let calldata = build_taker_sweep_calldata(sweep);
+
+    let Some((rpc_url, contract)) = broadcast_config() else {
+        tracing::debug!(
+            signer = %signer.address(),
+            legs = sweep.maker_legs.len(),
+            calldata = %calldata,
+            "taker sweep built and signed, not broadcast (SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set)"
+        );
+        return SettlementResult { calldata, broadcast_tx_hash: None };
+    };
+
+    match broadcast(signer, &rpc_url, contract, calldata.clone()).await {
+        Ok(tx_hash) => {
+            tracing::info!(tx_hash = %tx_hash, legs = sweep.maker_legs.len(), "taker sweep settled on-chain");
+            SettlementResult { calldata, broadcast_tx_hash: Some(tx_hash) }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "taker sweep broadcast failed");
+            SettlementResult { calldata, broadcast_tx_hash: None }
+        }
+    }
 }
 
 /// The result of building a settlement call: always the calldata (so a
@@ -318,5 +406,71 @@ mod tests {
 
         let result = load_sealed(FixedBytes::from([1u8; 32]), FixedBytes::from([2u8; 32])).await;
         assert!(matches!(result, Err(LoadSealedError::NotConfigured)));
+    }
+
+    fn sample_sweep() -> TakerSweep {
+        TakerSweep {
+            market_id: FixedBytes::from([9u8; 32]),
+            portfolio_key_taker: FixedBytes::from([8u8; 32]),
+            collateral_delta_taker: I256::try_from(6_000i64).unwrap(),
+            sealed_params_taker: Bytes::from(vec![0xaa]),
+            maker_legs: vec![
+                MakerFill {
+                    match_id: FixedBytes::from([1u8; 32]),
+                    portfolio_key: FixedBytes::from([11u8; 32]),
+                    collateral_delta: I256::try_from(1_000i64).unwrap(),
+                    sealed_params: Bytes::from(vec![0x01]),
+                },
+                MakerFill {
+                    match_id: FixedBytes::from([2u8; 32]),
+                    portfolio_key: FixedBytes::from([12u8; 32]),
+                    collateral_delta: I256::try_from(2_000i64).unwrap(),
+                    sealed_params: Bytes::from(vec![0x02]),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn taker_sweep_calldata_starts_with_the_correct_selector() {
+        let calldata = build_taker_sweep_calldata(&sample_sweep());
+        assert_eq!(&calldata[..4], &ISettlementEngine::settleTakerSweepCall::SELECTOR[..]);
+    }
+
+    #[test]
+    fn taker_sweep_calldata_round_trips_every_maker_leg() {
+        let sweep = sample_sweep();
+        let calldata = build_taker_sweep_calldata(&sweep);
+        let decoded = ISettlementEngine::settleTakerSweepCall::abi_decode(&calldata, true).unwrap();
+
+        assert_eq!(decoded.marketId, sweep.market_id);
+        assert_eq!(decoded.portfolioKeyTaker, sweep.portfolio_key_taker);
+        assert_eq!(decoded.collateralDeltaTaker, sweep.collateral_delta_taker);
+        assert_eq!(decoded.sealedParamsTaker, sweep.sealed_params_taker);
+        assert_eq!(decoded.makerLegs.len(), 2);
+        assert_eq!(decoded.makerLegs[0].matchId, sweep.maker_legs[0].match_id);
+        assert_eq!(decoded.makerLegs[0].collateralDelta, sweep.maker_legs[0].collateral_delta);
+        assert_eq!(decoded.makerLegs[1].portfolioKey, sweep.maker_legs[1].portfolio_key);
+        assert_eq!(decoded.makerLegs[1].sealedParams, sweep.maker_legs[1].sealed_params);
+    }
+
+    #[test]
+    fn taker_sweep_with_no_maker_legs_still_encodes() {
+        let mut sweep = sample_sweep();
+        sweep.maker_legs.clear();
+        let calldata = build_taker_sweep_calldata(&sweep);
+        let decoded = ISettlementEngine::settleTakerSweepCall::abi_decode(&calldata, true).unwrap();
+        assert!(decoded.makerLegs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settle_taker_sweep_without_broadcast_config_does_not_submit_anything() {
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
+
+        let signer = SettlementSigner::generate();
+        let result = settle_taker_sweep(&signer, &sample_sweep()).await;
+        assert!(result.broadcast_tx_hash.is_none());
+        assert!(!result.calldata.is_empty());
     }
 }

@@ -34,7 +34,6 @@ use crate::book::{NewOrder, OrderBook, OwnerId, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
 use crate::sealed::SealedParams;
-use crate::settle::MatchSettlement;
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, PrimitiveSignature as Signature, I256};
 use axum::{
     extract::State,
@@ -364,6 +363,10 @@ async fn post_order(
     );
 
     let taker_is_buy = matches!(payload.side, OrderSide::Buy);
+    let mut maker_legs = Vec::with_capacity(result.fills.len());
+    let mut taker_total_qty: u128 = 0;
+    let mut taker_weighted_price: u128 = 0;
+    let mut taker_total_margin: u128 = 0;
     for (fill_index, fill) in result.fills.iter().enumerate() {
         if crate::proof::should_prove(fill.qty) {
             let witness = crate::proof::MatchWitness {
@@ -411,7 +414,7 @@ async fn post_order(
             continue;
         };
 
-        let settlement = build_match_settlement(
+        let maker_leg = build_maker_leg(
             &state.sealed_key,
             signer,
             payload.nonce,
@@ -426,8 +429,39 @@ async fn post_order(
 
         {
             let mut index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
-            index.entry(settlement.portfolio_key_a).or_default().insert(payload.market_id.clone());
-            index.entry(settlement.portfolio_key_b).or_default().insert(payload.market_id.clone());
+            index.entry(maker_leg.portfolio_key).or_default().insert(payload.market_id.clone());
+        }
+
+        taker_total_qty += fill.qty as u128;
+        taker_weighted_price += fill.tick as u128 * fill.qty as u128;
+        taker_total_margin += required_margin(fill.tick, fill.qty);
+        maker_legs.push(maker_leg);
+    }
+
+    if !maker_legs.is_empty() {
+        // VWAP entry price across every fill in this sweep, since the taker's
+        // one sealed leg must represent the whole order, not just one fill.
+        let taker_entry_price = (taker_weighted_price / taker_total_qty) as u64;
+        let taker_params = SealedParams {
+            side_is_buy: taker_is_buy,
+            entry_price: taker_entry_price,
+            size: taker_total_qty as u64,
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
+        };
+        let taker_portfolio_key = portfolio_key(signer);
+        let sweep = crate::settle::TakerSweep {
+            market_id: keccak256(payload.market_id.as_bytes()),
+            portfolio_key_taker: taker_portfolio_key,
+            collateral_delta_taker: I256::try_from(taker_total_margin).expect("margin fits in I256"),
+            sealed_params_taker: Bytes::from(state.sealed_key.seal(&taker_params)),
+            maker_legs,
+        };
+
+        {
+            let mut index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
+            index.entry(taker_portfolio_key).or_default().insert(payload.market_id.clone());
         }
 
         let state_for_settlement = state.clone();
@@ -436,9 +470,9 @@ async fn post_order(
         // response should wait on.
         tokio::spawn(async move {
             let result =
-                crate::settle::settle_match(&state_for_settlement.settlement_signer, &settlement).await;
+                crate::settle::settle_taker_sweep(&state_for_settlement.settlement_signer, &sweep).await;
             if let Some(tx_hash) = result.broadcast_tx_hash {
-                tracing::info!(tx_hash = %tx_hash, match_id = %settlement.match_id, "match settled on-chain");
+                tracing::info!(tx_hash = %tx_hash, market_id = %sweep.market_id, "taker sweep settled on-chain");
             }
         });
     }
@@ -560,7 +594,7 @@ async fn post_liquidation_check(
 
         let signed_size: i128 = if params.side_is_buy { params.size as i128 } else { -(params.size as i128) };
         positions.push(risk::PositionState { market_id: market_id.clone(), size: signed_size });
-        // Not a live oracle price, see build_match_settlement's doc on the
+        // Not a live oracle price, see required_margin's doc on the
         // TEE/contract fixed-point gap: this is the position's own sealed
         // entry price standing in for OracleHub.markPrice until a real
         // oracle RPC client exists. Real deployment needs the live price;
@@ -657,12 +691,10 @@ fn match_id_for(
     keccak256(&bytes)
 }
 
-/// Builds and seals a `MatchSettlement` for one fill. Both legs lock the
-/// same margin (each leg's own commitment, not a zero-sum transfer
-/// between them, matching `SettlementEngine.settleTrade`'s model of
-/// each side independently posting its own margin).
+/// Builds one fill's maker-side leg for a `settleTakerSweep` batch. The taker's own leg
+/// is built once for the whole sweep, not per fill, see `post_order`'s fill loop.
 #[allow(clippy::too_many_arguments)]
-fn build_match_settlement(
+fn build_maker_leg(
     sealed_key: &crate::sealed::SealedKey,
     taker: Address,
     taker_nonce: u64,
@@ -673,17 +705,8 @@ fn build_match_settlement(
     taker_is_buy: bool,
     maker_owner: OwnerId,
     maker_address: Address,
-) -> MatchSettlement {
+) -> crate::settle::MakerFill {
     let margin = I256::try_from(required_margin(tick, qty)).expect("margin fits in I256");
-
-    let taker_params = SealedParams {
-        side_is_buy: taker_is_buy,
-        entry_price: tick,
-        size: qty,
-        leverage: 1,
-        take_profit: None,
-        stop_loss: None,
-    };
     let maker_params = SealedParams {
         side_is_buy: !taker_is_buy,
         entry_price: tick,
@@ -693,15 +716,11 @@ fn build_match_settlement(
         stop_loss: None,
     };
 
-    MatchSettlement {
+    crate::settle::MakerFill {
         match_id: match_id_for(taker, maker_owner, market_id, tick, fill_index, taker_nonce),
-        market_id: keccak256(market_id.as_bytes()),
-        portfolio_key_a: portfolio_key(taker),
-        collateral_delta_a: margin,
-        sealed_params_a: Bytes::from(sealed_key.seal(&taker_params)),
-        portfolio_key_b: portfolio_key(maker_address),
-        collateral_delta_b: margin,
-        sealed_params_b: Bytes::from(sealed_key.seal(&maker_params)),
+        portfolio_key: portfolio_key(maker_address),
+        collateral_delta: margin,
+        sealed_params: Bytes::from(sealed_key.seal(&maker_params)),
     }
 }
 
@@ -819,7 +838,7 @@ mod tests {
 
     /// Unlike ZK proof generation (threshold-gated), settlement is attempted for
     /// every fill. This proves that wiring (resolving the maker's address,
-    /// sealing both legs' params, spawning the settle_match call) runs
+    /// sealing both legs' params, spawning the settle_taker_sweep call) runs
     /// end-to-end without panicking, at a trade size far below
     /// `proof::NOTIONAL_THRESHOLD` so it's exercising the settlement path
     /// specifically, not incidentally riding along with the proof path.
