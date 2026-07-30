@@ -4,124 +4,52 @@ import {PositionEngine} from "./PositionEngine.sol";
 import {IMarket} from "./IMarket.sol";
 import {IMarketLifecycle} from "./IMarketLifecycle.sol";
 import {MarketImpactTwap} from "../oracle/MarketImpactTwap.sol";
+import {AttestationRouter} from "./AttestationRouter.sol";
 
 /// @title  SettlementEngine
-/// @notice Settlement engine of the Cerdic clearing kernel
-///         (paper/cerdic.tex:413-420). Processes matched trades from the
-///         execution layer: validates each side against the market
-///         extension, applies collateral changes and position updates
-///         ATOMICALLY (paper line 419), and forwards any upfront premium
-///         from buyer to seller.
-/// @dev    Inheritance: `PositionEngine._store` is `internal` by design —
-///         only an inheriting settlement path may write position state
-///         (see `PositionEngine.sol`). This contract IS that path.
-///
-///         Market resolution: the market extension for `marketId` is the
-///         address registered in `PositionEngine.positionDecoders` — the
-///         extension is its own position decoder
-///         (`IPositionDecoder.getMetadata`), its own validator
-///         (`IMarket`), and its own lifecycle target
-///         (`IMarketLifecycle`). Registration stays admin-gated behind
-///         `CLEARING_ADMIN_ROLE`, so every hook target and validator this
-///         engine calls is a vetted kernel component.
-///
-///         Trade-settlement order (per paper lines 415-419):
-///           1. `beforeOpenPosition` for each side — a revert vetoes the
-///              trade before any state mutates.
-///           2. Margin validation via `IMarket.validateOpen` with the
-///              engine-computed initial-margin requirement
-///              (`|size| · price · IMR_BPS / 1e4`); a `false` from either
-///              side reverts the whole trade.
-///           3. Both position records written in one transaction — there
-///              is no interleaving point where one side is stored and the
-///              other is not; any later revert unwinds both (atomicity).
-///           4. `afterOpenPosition` for each side.
-///           5. Upfront premium (`StructuredProductLimit` path, paper
-///              line 419): `msg.value` must exactly equal `premium` and
-///              is forwarded to the seller (short side). Zero-premium
-///              trades must carry zero value, so the engine can never
-///              custody stray native balance.
-///           6. Impact-TWAP feed (todo #21): the execution print is
-///              recorded into `MarketImpactTwap` when wired, feeding
-///              the tertiary leg of `OracleHub.markPrice`. Guarded on
-///              `impactTwap != address(0)` so an unwired engine settles
-///              exactly as before.
-///
-///         Reentrancy: `_store` (effects) precedes all post-write
-///         external calls, and `settleTrade` is `SETTLER_ROLE`-gated —
-///         neither a premium recipient nor a hook can re-enter the
-///         settlement path without the role. No `ReentrancyGuard` is
-///         paid for, matching the `Account.sol` gas posture.
-///
-///         MVP scope guardrails:
-///         - No funding settlement — the lazy funding-index model lives
-///           in the perp extension (todo #14).
-///         - No liquidation DECISIONS — `LiquidationEntry` (todo #13)
-///           owns the default waterfall; this engine only exposes the
-///           `settlePositionClose` write seam the liquidation path uses
-///           to clear or rewrite a closed-out position record.
+/// @notice Settles matched trades: validates each side against its market extension,
+///         applies collateral + position updates atomically, forwards any upfront premium.
+///         Also exposes settleMatch, the TEE-private path: side/price/size never appear
+///         in calldata, only an attested TEE may call it, and it trusts the TEE's
+///         collateral delta rather than recomputing margin from plaintext.
+/// @dev    settleTrade order: beforeOpenPosition hooks -> margin validation -> both
+///         positions stored -> afterOpenPosition hooks -> premium transfer -> impact-TWAP
+///         feed. A revert at any step unwinds all prior state changes.
 contract SettlementEngine is PositionEngine {
-    // ---------------------------------------------------------------------
-    // Roles.
-    // ---------------------------------------------------------------------
-
     /// @notice Role permitted to submit matched trades for settlement.
-    ///         Granted to the clearing admin at construction; the on-chain
-    ///         order book (todo #17) and the batch submitter (todo #18)
-    ///         receive it when they come online. Gating matters: an
-    ///         ungated `settleTrade` would let anyone write positions onto
-    ///         arbitrary traders' accounts.
     bytes32 public constant SETTLER_ROLE = keccak256("SETTLER_ROLE");
 
-    /// @notice Role permitted to settle position close-outs (clear or
-    ///         rewrite a position record after the offsetting trade).
-    ///         Granted to `LiquidationEntry` (todo #13) — the standard
-    ///         liquidation path is the only MVP consumer. Kept distinct
-    ///         from `SETTLER_ROLE` so the execution layer can settle
-    ///         trades without gaining the power to erase positions.
+    /// @notice Role permitted to settle position close-outs (liquidation path).
     bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
 
-    // ---------------------------------------------------------------------
-    // Constants.
-    // ---------------------------------------------------------------------
-
-    /// @notice 1e18 price/size scaling shared with the position encodings.
     uint256 internal constant SCALE = 1e18;
-
-    /// @notice Basis-point denominator.
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    /// @notice MVP initial margin requirement in basis points. Mirrors
-    ///         `ProtocolConstants.IMR_BPS` (solc 0.8.24 cannot read
-    ///         another contract's `constant` via the type name; the drift
-    ///         guard in `SettlementEngineTest` pins the two together).
+    /// @notice Initial margin requirement in basis points; mirrors ProtocolConstants.IMR_BPS.
     uint256 internal constant IMR_BPS = 500;
 
-    /// @notice MVP per-market leverage ceiling in raw-multiplier form
-    ///         (mirrors `ProtocolConstants.MAX_LEVERAGE_BPS / 100` = 20).
-    ///         Stored on every settled `MarketPosition.leverage` — the
-    ///         per-market risk-tier ceiling, not effective leverage
-    ///         (paper line 410-411).
+    /// @notice Per-market leverage ceiling; mirrors ProtocolConstants.MAX_LEVERAGE_BPS / 100.
     uint256 internal constant LEVERAGE_CEILING = 20;
 
-    // ---------------------------------------------------------------------
-    // Storage.
-    // ---------------------------------------------------------------------
-
-    /// @notice On-chain impact-TWAP oracle (todo #21) fed with every
-    ///         settled trade's execution print. Zero until wired; while
-    ///         zero the engine settles without feeding the oracle —
-    ///         `OracleHub.markPrice` then falls back to the primary price
-    ///         for its tertiary leg (the todo #12 stub behavior).
+    /// @notice Zero until wired; while zero, settlement skips the impact-TWAP feed.
     MarketImpactTwap public impactTwap;
 
-    // ---------------------------------------------------------------------
-    // Events.
-    // ---------------------------------------------------------------------
+    /// @notice Gates settleMatch to attested TEE callers. Zero until wired.
+    AttestationRouter public attestationRouter;
 
-    /// @notice Emitted once per settled trade, after both positions are
-    ///         stored, both `afterOpenPosition` hooks have run, and the
-    ///         premium (if any) has been forwarded.
+    /// @dev One sealed position per portfolioKey per market. collateral is plaintext
+    ///      (the kernel's own solvency bound, see settleMatch); sealedParams (side,
+    ///      leverage, entryPrice, size, TP/SL) is opaque, only the TEE ever decrypts it.
+    struct SealedPosition {
+        bytes sealedParams;
+        int256 collateral;
+    }
+
+    mapping(bytes32 => mapping(bytes32 => SealedPosition)) internal _sealedPositions;
+
+    /// @notice matchId replay guard — the kernel's own "no double-settlement" invariant.
+    mapping(bytes32 => bool) public settledMatches;
+
     event TradeSettled(
         bytes32 indexed marketId,
         address indexed longTrader,
@@ -130,84 +58,33 @@ contract SettlementEngine is PositionEngine {
         uint256 price,
         uint256 premium
     );
-
-    /// @notice Emitted when the impact-TWAP oracle is (re)wired or unwired
-    ///         (zero address).
     event ImpactTwapUpdated(address indexed impactTwap);
-
-    // ---------------------------------------------------------------------
-    // Errors.
-    // ---------------------------------------------------------------------
-
-    /// @notice No market extension is registered for `marketId`.
-    error MarketNotRegistered(bytes32 marketId);
-
-    /// @notice The market extension rejected a side's open
-    ///         (`validateOpen == false`) — margin offered does not satisfy
-    ///         the market's initial-margin / leverage constraints.
-    error InsufficientMargin(address trader, int256 size, uint256 margin);
-
-    /// @notice `msg.value` did not exactly equal the trade's `premium`.
-    error IncorrectPremium(uint256 value, uint256 premium);
-
-    /// @notice The premium forward to the seller failed.
-    error PremiumTransferFailed(address shortTrader, uint256 premium);
-
-    /// @notice Emitted when a position close-out is settled for `trader`:
-    ///         `remainingSize == 0` means the record was cleared (full
-    ///         close), otherwise it was rewritten to the remaining size
-    ///         (partial close).
     event PositionCloseSettled(address indexed trader, bytes32 indexed marketId, int256 remainingSize);
+    event AttestationRouterUpdated(address indexed router);
+    event MatchSettled(bytes32 indexed matchId);
 
-    /// @notice Long and short trader must be distinct accounts.
+    error MarketNotRegistered(bytes32 marketId);
+    error InsufficientMargin(address trader, int256 size, uint256 margin);
+    error IncorrectPremium(uint256 value, uint256 premium);
+    error PremiumTransferFailed(address shortTrader, uint256 premium);
     error SameTrader(address trader);
-
-    /// @notice `size` must be positive; the short side is derived by
-    ///         negation.
     error NonPositiveSize(int256 size);
-
-    /// @notice `price` must be non-zero.
     error ZeroPrice();
+    error AttestationRouterNotSet();
+    error NotAuthorizedTEE(address caller);
+    error ZeroMatchId();
+    error ZeroPortfolioKey();
+    error MatchAlreadySettled(bytes32 matchId);
+    error InsufficientSealedCollateral(bytes32 portfolioKey, bytes32 marketId, int256 wouldBe);
 
-    // ---------------------------------------------------------------------
-    // Constructor.
-    // ---------------------------------------------------------------------
-
-    /// @param admin Receives `DEFAULT_ADMIN_ROLE` and `CLEARING_ADMIN_ROLE`
-    ///              (via `PositionEngine`) plus the initial `SETTLER_ROLE`
-    ///              grant so the admin can settle trades before the
-    ///              execution layer is wired.
     constructor(address admin) PositionEngine(admin) {
         _grantRole(SETTLER_ROLE, admin);
         _grantRole(LIQUIDATOR_ROLE, admin);
     }
 
-    // ---------------------------------------------------------------------
-    // Trade settlement.
-    // ---------------------------------------------------------------------
-
-    /// @notice Settles a matched trade between a long and a short trader,
-    ///         atomically updating both positions
-    ///         (paper/cerdic.tex:415-419).
-    /// @dev    `size` is expressed from the long side (positive); the
-    ///         short side's size is its negation. Reverts — with NO state
-    ///         mutation — when the market is unregistered, any
-    ///         `beforeOpenPosition` hook reverts, either side fails
-    ///         `validateOpen`, any `afterOpenPosition` hook reverts, or
-    ///         the premium wiring is wrong.
-    /// @param  marketId    Kernel market identifier with a registered
-    ///         market extension.
-    /// @param  longTrader  Buyer; receives the `+size` position and pays
-    ///         any upfront premium.
-    /// @param  shortTrader Seller; receives the `-size` position and
-    ///         receives any upfront premium.
-    /// @param  size        Position size in base units (1e18-scaled,
-    ///         strictly positive).
-    /// @param  price       Execution price (1e18-scaled USD).
-    /// @param  premium     Upfront premium for premium-bearing instruments
-    ///         (paper line 419); must equal `msg.value` and is forwarded
-    ///         to `shortTrader`. Zero for margin-based instruments
-    ///         (perps, FX).
+    /// @param size Long-side size (positive); short side is the negation.
+    /// @param premium Upfront premium for premium-bearing instruments, must equal msg.value.
+    ///        Zero for margin-based instruments (perps, FX).
     function settleTrade(
         bytes32 marketId,
         address longTrader,
@@ -225,15 +102,9 @@ contract SettlementEngine is PositionEngine {
         address market = positionDecoders[marketId];
         if (market == address(0)) revert MarketNotRegistered(marketId);
 
-        // 1. Pre-trade hooks. A revert here vetoes the trade before any
-        //    kernel state mutates.
         IMarketLifecycle(market).beforeOpenPosition(longTrader, marketId, size, price);
         IMarketLifecycle(market).beforeOpenPosition(shortTrader, marketId, -size, price);
 
-        // 2. Margin validation delegated to the market extension. The
-        //    engine supplies the MVP initial-margin requirement
-        //    (`|size| · price · IMR_BPS / 1e4`, paper lines 417-418); the
-        //    extension applies its own risk-tier constraints.
         uint256 margin = requiredMargin(size, price);
         if (!IMarket(market).validateOpen(size, margin)) {
             revert InsufficientMargin(longTrader, size, margin);
@@ -242,8 +113,6 @@ contract SettlementEngine is PositionEngine {
             revert InsufficientMargin(shortTrader, -size, margin);
         }
 
-        // 3. Atomic position writes for BOTH sides. Either both records
-        //    land or — via any later revert — neither does.
         IMarket.MarketPosition memory longPosition = IMarket.MarketPosition({
             marketId: marketId, size: size, entryPrice: price, margin: margin, leverage: LEVERAGE_CEILING
         });
@@ -253,26 +122,15 @@ contract SettlementEngine is PositionEngine {
         _store(longTrader, marketId, abi.encode(longPosition));
         _store(shortTrader, marketId, abi.encode(shortPosition));
 
-        // 4. Post-trade hooks over the stored records.
         IMarketLifecycle(market).afterOpenPosition(longTrader, marketId, longPosition);
         IMarketLifecycle(market).afterOpenPosition(shortTrader, marketId, shortPosition);
 
-        // 5. Upfront premium: buyer -> seller at settlement (paper line
-        //    419), wired as an exact `msg.value` transfer. Last external
-        //    call; a failure unwinds the entire trade.
         if (msg.value != premium) revert IncorrectPremium(msg.value, premium);
         if (premium > 0) {
             (bool ok,) = payable(shortTrader).call{value: premium}("");
             if (!ok) revert PremiumTransferFailed(shortTrader, premium);
         }
 
-        // 6. Feed the on-chain impact TWAP with the execution print
-        //    (todo #21). Guarded so an unwired engine settles exactly as
-        //    before; the call is direct (fail-closed) — the tertiary
-        //    mark-price oracle must observe every settled trade, and the
-        //    wired target is an admin-vetted kernel component. `size` is
-        //    strictly positive (checked above), so the cast is
-        //    value-preserving.
         MarketImpactTwap impact = impactTwap;
         if (address(impact) != address(0)) {
             // forge-lint: disable-next-line(unsafe-typecast)
@@ -282,35 +140,79 @@ contract SettlementEngine is PositionEngine {
         emit TradeSettled(marketId, longTrader, shortTrader, size, price, premium);
     }
 
-    // ---------------------------------------------------------------------
-    // Oracle wiring (todo #21).
-    // ---------------------------------------------------------------------
-
-    /// @notice Wires (or replaces) the impact-TWAP oracle fed by
-    ///         `settleTrade`. Accepts the zero address to unwire,
-    ///         returning the engine to its pre-feed behavior. Gated to
-    ///         `CLEARING_ADMIN_ROLE` like `registerDecoder`.
     function setImpactTwap(address twap) external onlyRole(CLEARING_ADMIN_ROLE) {
         impactTwap = MarketImpactTwap(twap);
         emit ImpactTwapUpdated(twap);
     }
 
-    // ---------------------------------------------------------------------
-    // Position close-out (liquidation path, todo #13).
-    // ---------------------------------------------------------------------
+    function setAttestationRouter(address router) external onlyRole(CLEARING_ADMIN_ROLE) {
+        attestationRouter = AttestationRouter(router);
+        emit AttestationRouterUpdated(router);
+    }
 
-    /// @notice Settles the close-out of `trader`'s position in `marketId`:
-    ///         clears the record on a full close (`remainingSize == 0`) or
-    ///         rewrites it to the remaining position after a partial close.
-    /// @dev    This is the full-close path `PositionEngine._clear` was
-    ///         provisioned for. The offsetting takeover trade itself is
-    ///         settled separately by the caller via `settleTrade`; because
-    ///         `settleTrade` OVERWRITES both sides' records (it does not
-    ///         net), the liquidated trader's record must be corrected
-    ///         afterwards — that correction is this function. Gated to
-    ///         `LIQUIDATOR_ROLE` (held by `LiquidationEntry`, todo #13).
-    ///         The remaining position keeps the original entry price; its
-    ///         margin is supplied by the caller (pro-rata of the original).
+    /// @notice TEE-private settlement, per docs/spec-contracts-tee.md section 2.2: the TEE
+    ///         recomputes margin in-enclave and calls this with its result, the kernel never
+    ///         reads side/price/size — it only checks the caller is attested and that its
+    ///         own collateral-bound and no-double-settlement invariants hold.
+    /// @param  collateralDeltaA/B Signed change to each side's tracked collateral; the TEE's
+    ///         margin computation, applied without re-derivation.
+    /// @param  sealedParamsA/B Opaque, TEE-encrypted (side, leverage, entryPrice, size, TP/SL).
+    function settleMatch(
+        bytes32 matchId,
+        bytes32 marketId,
+        bytes32 portfolioKeyA,
+        int256 collateralDeltaA,
+        bytes calldata sealedParamsA,
+        bytes32 portfolioKeyB,
+        int256 collateralDeltaB,
+        bytes calldata sealedParamsB
+    ) external {
+        AttestationRouter router = attestationRouter;
+        if (address(router) == address(0)) revert AttestationRouterNotSet();
+        if (!router.isAuthorizedTEE(msg.sender)) revert NotAuthorizedTEE(msg.sender);
+
+        if (matchId == bytes32(0)) revert ZeroMatchId();
+        if (settledMatches[matchId]) revert MatchAlreadySettled(matchId);
+        if (marketId == bytes32(0)) revert ZeroMarketId();
+        if (portfolioKeyA == bytes32(0) || portfolioKeyB == bytes32(0)) revert ZeroPortfolioKey();
+
+        settledMatches[matchId] = true;
+
+        _applySealedLeg(marketId, portfolioKeyA, collateralDeltaA, sealedParamsA);
+        _applySealedLeg(marketId, portfolioKeyB, collateralDeltaB, sealedParamsB);
+
+        emit MatchSettled(matchId);
+    }
+
+    /// @notice Opaque sealedParams plus the plain running collateral for portfolioKey/marketId.
+    function loadSealed(bytes32 portfolioKey, bytes32 marketId)
+        external
+        view
+        returns (bytes memory sealedParams, int256 collateral)
+    {
+        SealedPosition storage position = _sealedPositions[portfolioKey][marketId];
+        return (position.sealedParams, position.collateral);
+    }
+
+    /// @dev Collateral bound is the kernel's own invariant (paper/cerdic.tex:369): it never
+    ///      goes negative, regardless of what the TEE's delta claims.
+    function _applySealedLeg(
+        bytes32 marketId,
+        bytes32 portfolioKey,
+        int256 collateralDelta,
+        bytes calldata sealedParams
+    ) internal {
+        SealedPosition storage position = _sealedPositions[portfolioKey][marketId];
+        int256 newCollateral = position.collateral + collateralDelta;
+        if (newCollateral < 0) revert InsufficientSealedCollateral(portfolioKey, marketId, newCollateral);
+
+        position.collateral = newCollateral;
+        position.sealedParams = sealedParams;
+    }
+
+    /// @dev The offsetting takeover trade is settled separately via settleTrade, which
+    ///      overwrites both sides' records (doesn't net) — this corrects the liquidated
+    ///      trader's record afterward. Keeps the original entry price.
     function settlePositionClose(
         address trader,
         bytes32 marketId,
@@ -334,19 +236,8 @@ contract SettlementEngine is PositionEngine {
         emit PositionCloseSettled(trader, marketId, remainingSize);
     }
 
-    // ---------------------------------------------------------------------
-    // Margin computation.
-    // ---------------------------------------------------------------------
-
-    /// @notice MVP initial-margin requirement for `size` at `price`:
-    ///         `|size| · price · IMR_BPS / (1e18 · 1e4)` (1e18-scaled USD).
-    ///         With `IMR_BPS = 500` this is 5% of notional — exactly the
-    ///         20x leverage ceiling, so a market's `validateOpen` leverage
-    ///         check and the engine's margin offer coincide.
+    /// @notice `|size| * price * IMR_BPS / (1e18 * 1e4)`; 5% of notional = 20x leverage ceiling.
     function requiredMargin(int256 size, uint256 price) public pure returns (uint256) {
-        // Both casts are value-preserving: the ternary's operand is always
-        // non-negative (`int256.min` overflows on negation and reverts
-        // before the cast).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 absSize = size > 0 ? uint256(size) : uint256(-size);
         return absSize * price * IMR_BPS / (SCALE * BPS_DENOMINATOR);
