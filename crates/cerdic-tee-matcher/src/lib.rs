@@ -10,6 +10,7 @@ pub mod attestation;
 pub mod book;
 pub mod decrypt;
 pub mod keystore;
+pub mod kms;
 pub mod logging;
 pub mod proof;
 pub mod sealed;

@@ -52,6 +52,15 @@ impl SealedKey {
         Self { cipher: Aes256Gcm::new(&key) }
     }
 
+    /// Rebuilds this key from 32 raw bytes, the recovery half of
+    /// `generate`. Used to restore the exact same key across a restart,
+    /// see `kms::recover_or_generate_secrets` — without this, every
+    /// restart orphans every `sealedParams` blob already on chain, since
+    /// nothing else can ever unseal them again.
+    pub fn from_bytes(key: &[u8; 32]) -> Self {
+        Self { cipher: Aes256Gcm::new(key.into()) }
+    }
+
     /// Nonce-prefixed ciphertext, the standard AEAD wire format: the
     /// nonce isn't secret, it just has to be unique per encryption under
     /// this key, generated fresh every call.

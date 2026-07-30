@@ -264,6 +264,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Fully ephemeral: fresh random secrets every call, never recoverable.
+    /// Fine for tests and local dev; a real deployment should use
+    /// `from_secrets` with `kms::recover_or_generate`'s output instead, see
+    /// that module's docs on what a restart with ephemeral secrets breaks.
     pub fn new() -> Self {
         let mut portfolio_key_secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut portfolio_key_secret);
@@ -277,6 +281,26 @@ impl AppState {
             settlement_signer: crate::settle::SettlementSigner::generate(),
             portfolio_markets: Mutex::new(HashMap::new()),
             portfolio_key_secret,
+        }
+    }
+
+    /// Builds state from recovered (or freshly persisted) secrets, see
+    /// `kms::recover_or_generate`. `keystore` isn't part of that recovery
+    /// set: it's the order-decryption keypair traders encrypt to per
+    /// session, losing it on restart only means in-flight envelopes
+    /// encrypted to the old pubkey stop decrypting, not that any
+    /// already-settled state becomes unrecoverable.
+    pub fn from_secrets(secrets: crate::kms::EnclaveSecrets) -> Self {
+        Self {
+            keystore: Keystore::generate(),
+            books: Mutex::new(HashMap::new()),
+            last_nonce: Mutex::new(HashMap::new()),
+            proof_keys: crate::proof::ProofKeys::shared(),
+            owner_addresses: Mutex::new(HashMap::new()),
+            sealed_key: crate::sealed::SealedKey::from_bytes(&secrets.sealed_key),
+            settlement_signer: crate::settle::SettlementSigner::from_bytes(&secrets.settlement_signer_seed),
+            portfolio_markets: Mutex::new(HashMap::new()),
+            portfolio_key_secret: secrets.portfolio_key_secret,
         }
     }
 }

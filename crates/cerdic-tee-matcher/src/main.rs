@@ -24,7 +24,8 @@ async fn main() {
         );
     }
 
-    let state = Arc::new(api::AppState::new());
+    let secrets = cerdic_tee_matcher::kms::recover_or_generate().await;
+    let state = Arc::new(api::AppState::from_secrets(secrets));
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
     let app = api::router(state)

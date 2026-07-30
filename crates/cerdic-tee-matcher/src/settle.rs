@@ -84,6 +84,14 @@ impl SettlementSigner {
         Self { wallet: PrivateKeySigner::random() }
     }
 
+    /// Rebuilds this signer from a 32-byte seed, the recovery half of
+    /// `generate`. See `kms::recover_or_generate_secrets`: without this,
+    /// every restart requires re-authorizing a brand new signer address
+    /// on `AttestationRouter`.
+    pub fn from_bytes(seed: &[u8; 32]) -> Self {
+        Self { wallet: PrivateKeySigner::from_slice(seed).expect("32 bytes is always a valid seed") }
+    }
+
     pub fn address(&self) -> Address {
         self.wallet.address()
     }
