@@ -1,92 +1,52 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Header } from './components/Header';
+import { Sidebar } from './components/Sidebar';
+import { MarketBar } from './components/MarketBar';
+import { Panel } from './components/Panel';
+import { OrderBookDepth } from './components/OrderBookDepth';
+import { TradePanel } from './components/TradePanel';
 
-const DITHER_RAMP = ' .,:;irsXA253hMHGS#9B&@';
-const BAYER_4X4 = [
-  0, 8, 2, 10,
-  12, 4, 14, 6,
-  3, 11, 1, 9,
-  15, 7, 13, 5,
-];
-
-function generateAsciiDither(cols: number, rows: number) {
-  const canvas = document.createElement('canvas');
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-
-  if (!context) {
-    return Array.from({ length: rows }, () => ' '.repeat(cols)).join('\n');
-  }
-
-  canvas.width = cols;
-  canvas.height = rows;
-
-  context.clearRect(0, 0, cols, rows);
-  context.fillStyle = '#000';
-  context.fillRect(0, 0, cols, rows);
-  context.fillStyle = '#fff';
-  context.textAlign = 'center';
-  context.textBaseline = 'middle';
-  context.font = `700 ${Math.max(12, Math.floor(rows * 0.78))}px 'Courier New', monospace`;
-  context.fillText('syntra', cols / 2, rows / 2 + rows * 0.02);
-
-  const image = context.getImageData(0, 0, cols, rows).data;
-
-  return Array.from({ length: rows }, (_, y) => {
-    return Array.from({ length: cols }, (_, x) => {
-      const index = (y * cols + x) * 4;
-      const brightness = image[index] ?? 0;
-      const threshold = (BAYER_4X4[(y % 4) * 4 + (x % 4)] + 0.5) / 16;
-      const dithered = Math.max(0, Math.min(1, brightness / 255 + (threshold - 0.5) * 0.9));
-      const rampIndex = Math.min(
-        DITHER_RAMP.length - 1,
-        Math.floor(dithered * (DITHER_RAMP.length - 1)),
-      );
-
-      return DITHER_RAMP[rampIndex] ?? ' ';
-    }).join('');
-  }).join('\n');
-}
+// Layout ported from cer-perp's trade/route.tsx grid (24 cols × 12 rows:
+// chart/book/trade on top at h9, positions/stats/tape below at h3). Static
+// here, not react-grid-layout's draggable/resizable engine.
+//
+// Header is the site-level nav (Trade/Traders/Discover/Blog, Connect),
+// a separate level from Sidebar/MarketBar below it, which are specific
+// to the trade page.
+//
+// Chart/Positions/Stats/Trades stay empty — Order Book (mock depth-heatmap
+// data, see OrderBookDepth.tsx) and Trade (order ticket, see
+// TradePanel.tsx) are the two panels with real content so far.
 
 export default function App() {
-  const frameRef = useRef<HTMLDivElement | null>(null);
-  const [ascii, setAscii] = useState('');
-
-  useEffect(() => {
-    const frame = frameRef.current;
-
-    if (!frame) {
-      return;
-    }
-
-    const update = () => {
-      const width = frame.clientWidth;
-      const height = frame.clientHeight;
-      const cols = Math.max(48, Math.floor(width / 9));
-      const rows = Math.max(18, Math.floor(height / 18));
-
-      setAscii(generateAsciiDither(cols, rows));
-    };
-
-    update();
-
-    const resizeObserver = new ResizeObserver(() => {
-      update();
-    });
-
-    resizeObserver.observe(frame);
-
-    return () => {
-      resizeObserver.disconnect();
-    };
-  }, []);
-
-  const lines = useMemo(() => ascii.split('\n'), [ascii]);
-
   return (
-    <main className="scene" aria-label="Syntra landing page">
-      <div ref={frameRef} className="ascii-frame" aria-hidden="true">
-        <pre className="ascii-dither">{lines.join('\n')}</pre>
+    <div className="flex h-full flex-col overflow-hidden bg-surface-base">
+      <Header />
+      <div className="flex min-h-0 flex-1 overflow-hidden bg-surface-base">
+        <Sidebar />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <MarketBar />
+          <div className="trade-grid">
+            <div className="trade-grid-main">
+              <div className="trade-grid-row trade-grid-row--top">
+                <Panel label="Chart" area="chart" />
+                <Panel label="Order Book" area="book" noPadding>
+                  <OrderBookDepth />
+                </Panel>
+              </div>
+              <div className="trade-grid-row trade-grid-row--bottom">
+                <Panel label="Positions" area="positions" />
+                <Panel label="Stats" area="stats" />
+              </div>
+            </div>
+            <div className="trade-grid-side">
+              <Panel label="Trade" area="trade" noPadding>
+                <TradePanel />
+              </Panel>
+              <Panel label="Trades" area="tape" />
+            </div>
+          </div>
+        </div>
       </div>
-      <h1 className="sr-only">syntra</h1>
-    </main>
+    </div>
   );
 }

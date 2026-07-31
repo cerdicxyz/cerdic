@@ -1,0 +1,539 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap');
+@import 'tailwindcss';
+
+/* Design tokens — see design.md. Colors/font/radius live in Tailwind's
+   @theme namespace so they generate real utilities (bg-accent,
+   text-text-primary, rounded-md, font-sans, ...); spacing/duration stay
+   plain custom properties (used via arbitrary-value syntax,
+   e.g. gap-[var(--space-3)]) rather than under Tailwind's --spacing-*
+   namespace, which would otherwise override its default numeric p-1/p-2
+   scale for the whole app. */
+@theme {
+  --color-surface-base: #000000;
+  --color-surface-raised: oklch(1 0 0 / 0.045);
+  --color-surface-hover: oklch(1 0 0 / 0.08);
+  --color-surface-pressed: oklch(1 0 0 / 0.025);
+
+  --color-border-subtle: oklch(1 0 0 / 0.075);
+  --color-border-default: #2b2b30;
+  --color-border-focus: #ff0040;
+
+  --color-text-primary: oklch(0.964 0 0);
+  --color-text-secondary: oklch(0.741 0.005 258);
+  --color-text-tertiary: oklab(0.964 0 0 / 0.8);
+  --color-text-quaternary: oklch(0.559 0.006 275);
+
+  --color-accent: #ff0040;
+  --color-accent-dim: color-mix(in oklch, #ff0040 16%, transparent);
+  --color-accent-strong: #ff3363;
+
+  --color-long: oklch(0.72 0.19 152);
+  --color-short: #ff0040;
+  --color-warning: #ffb454;
+  /* Same lightness/chroma as --color-long, hue rotated — the trade
+     panel's "Private (shielded)" indicator needed its own color (it
+     isn't a long/short signal), so it's built the same way --color-long
+     itself was: matched brightness to the existing palette, not a color
+     picked freehand. */
+  --color-privacy: oklch(0.72 0.19 300);
+  --color-privacy-dim: color-mix(in oklch, oklch(0.72 0.19 300) 18%, transparent);
+
+  /* Order book depth-heatmap colors, matching the reference screenshot's
+     own genre-standard warm/cool pairing (amber asks, teal bids) —
+     deliberately its own pair, not --color-long/--color-short: those stay
+     the site's brand red/mint everywhere else, this view's palette is
+     borrowed straight from the reference, not from our own brand accent. */
+  --color-ask: #f0a020;
+  --color-ask-dim: color-mix(in oklch, #f0a020 22%, transparent);
+  --color-bid: #2dd4bf;
+  --color-bid-dim: color-mix(in oklch, #2dd4bf 22%, transparent);
+
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-pill: 9999px;
+}
+
+:root {
+  --space-1: 1.76px;
+  --space-2: 3.52px;
+  --space-3: 5.28px;
+  --space-4: 7.04px;
+  --space-5: 8.8px;
+  --space-6: 10.56px;
+  --space-7: 14.08px;
+  --space-8: 17.6px;
+  --space-9: 21.12px;
+
+  --duration-instant: 150ms;
+  --duration-fast: 150ms;
+
+  color-scheme: dark;
+}
+
+html {
+  height: 100%;
+  /* Default page zoom at 89%. Deliberately `zoom`, not
+     `transform: scale()` (cer-perp's own approach): transform is a
+     post-layout compositing scale, so 1px hairline borders end up at
+     0.89px and blur/anti-alias inconsistently across edges — confirmed
+     directly in a zoomed screenshot. `zoom` re-runs layout at the scaled
+     size instead, so borders come out crisp.
+
+     `vh` units still need manual compensation, though: unlike real
+     browser zoom (which effectively grows the viewport for CSS
+     purposes), the `zoom` PROPERTY does not — `vh`/`vw` are defined by
+     spec to always resolve against the true device viewport, ignoring
+     any ancestor's `zoom`. Confirmed directly: body's `height: 100vh`
+     measured 765px in an 860px-tall viewport (860 * 0.89), leaving a
+     real, easy-to-miss-against-black gap at the bottom. `calc(100vh /
+     0.89)` below grows body back to 1/0.89 of the real viewport BEFORE
+     zoom shrinks it, so the rendered result exactly fills the screen. */
+  zoom: 0.89;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  height: calc(100vh / 0.89);
+  overflow: hidden;
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.45;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+a,
+select,
+[role="button"] {
+  cursor: pointer;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* .panel, .page, .site-header*, .app-shell*, .sidebar*, .market-bar*, and
+   .grid-panel* used to live here — converted to Tailwind utility classes
+   directly in their components (Header.tsx, Sidebar.tsx, MarketBar.tsx,
+   Panel.tsx, App.tsx). .trade-grid stays custom CSS below: its named
+   grid-template-areas has no clean Tailwind utility equivalent. */
+
+/* Outer layout: a flexible main column (chart/book stacked over
+   positions/stats) beside a fixed-width right column that runs the full
+   page height — Trade and Trades (tape) don't need to align to the
+   chart/book row split above them, and the order ticket reads much
+   better with the room a full-height column gives it than squeezed into
+   just the top row's share of the height. */
+.trade-grid {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.trade-grid-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.trade-grid-row {
+  display: grid;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+.trade-grid-row--top {
+  flex: 3;
+  grid-template-columns: 15.8fr 3.2fr;
+  grid-template-areas: 'chart book';
+}
+
+.trade-grid-row--bottom {
+  flex: 1;
+  grid-template-columns: 1fr 1fr;
+  grid-template-areas: 'positions stats';
+}
+
+.trade-grid-side {
+  flex: 0 0 260px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+/* Trade (the order ticket) takes most of the column; Trades (the tape)
+   is cramped into a fixed, much smaller share rather than splitting the
+   height evenly — a recent-trades feed doesn't need as much room as the
+   order form. */
+.trade-grid-side > :first-child {
+  flex: 1;
+  min-height: 0;
+}
+
+.trade-grid-side > :last-child {
+  flex: 0 0 200px;
+}
+
+@media (max-width: 900px) {
+  .trade-grid {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .trade-grid-row--top,
+  .trade-grid-row--bottom {
+    grid-template-columns: 1fr;
+  }
+  .trade-grid-row--top {
+    grid-template-areas: 'chart' 'book';
+  }
+  .trade-grid-row--bottom {
+    grid-template-areas: 'positions' 'stats';
+  }
+  .trade-grid-side {
+    flex: none;
+  }
+  .trade-grid-side > :last-child {
+    flex-basis: auto;
+  }
+}
+
+/* ---- Landing hero: the ASCII-dithered wordmark. Not rendered on the
+   current page (see App.tsx), kept here so the treatment isn't lost. ---- */
+
+.scene {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-height: 100vh;
+  padding: 24px;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at top, rgba(118, 255, 214, 0.18), transparent 35%),
+    linear-gradient(135deg, #07111e 0%, #04070d 45%, #010205 100%);
+}
+
+.scene::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.08), transparent 28%),
+    radial-gradient(circle at center, rgba(120, 255, 214, 0.14), transparent 42%);
+  filter: blur(32px);
+  animation: drift 9s ease-in-out infinite alternate;
+}
+
+.scene::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: radial-gradient(circle at center, black 32%, transparent 80%);
+  opacity: 0.45;
+}
+
+.ascii-frame {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: min(92vw, 1120px);
+  height: min(72vh, 760px);
+}
+
+.ascii-dither {
+  position: relative;
+  margin: 0;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  padding: clamp(18px, 3vw, 28px);
+  background: rgba(5, 8, 12, 0.45);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.02) inset,
+    0 24px 80px rgba(0, 0, 0, 0.45);
+  color: rgba(236, 255, 248, 0.92);
+  font-family: var(--font-sans);
+  font-size: clamp(0.5rem, 0.95vw, 0.95rem);
+  line-height: 1.03;
+  letter-spacing: 0;
+  white-space: pre;
+  text-shadow:
+    0 0 10px rgba(120, 255, 214, 0.14),
+    0 0 1px rgba(255, 255, 255, 0.55);
+  animation:
+    float 7s ease-in-out infinite,
+    scan 4.5s steps(24) infinite;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+
+  50% {
+    transform: translateY(-10px) scale(1.01);
+  }
+}
+
+@keyframes drift {
+  0% {
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+
+  100% {
+    transform: scale(1.08) translate3d(2%, -2%, 0);
+  }
+}
+
+@keyframes scan {
+  0% {
+    transform: translateY(0);
+  }
+
+  100% {
+    transform: translateY(-4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scene::before,
+  .ascii-dither {
+    animation: none;
+  }
+}
+
+/* ---- Leverage control. See design.md's Component: Leverage control. ---- */
+
+.leverage-slider {
+  width: 100%;
+}
+
+.leverage-slider__header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+
+.leverage-slider__label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-tertiary);
+}
+
+.leverage-slider__value {
+  margin-left: var(--space-3);
+  font-size: 36px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--color-text-primary);
+}
+
+.leverage-slider__unit {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+.leverage-slider__track {
+  position: relative;
+  height: 84px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.leverage-slider__bars {
+  position: absolute;
+  inset: 0 0 18px 0;
+}
+
+.leverage-slider__bar {
+  position: absolute;
+  bottom: 6px;
+  width: 2px;
+  transform: translateX(-1px);
+  pointer-events: none;
+  transition: background-color var(--duration-fast) ease;
+}
+
+.leverage-slider__bar--major {
+  background-color: var(--color-border-default);
+}
+
+.leverage-slider__bar--major[data-active='true'] {
+  background-color: var(--color-privacy);
+}
+
+.leverage-slider__bar--minor {
+  width: 1.5px;
+  background-color: var(--color-border-subtle);
+  opacity: 0.6;
+}
+
+.leverage-slider__tick {
+  position: absolute;
+  bottom: 0;
+  width: 1.5px;
+  height: 5px;
+  transform: translateX(-0.75px);
+  pointer-events: none;
+}
+
+.leverage-slider__tick--major {
+  background-color: var(--color-text-quaternary);
+  opacity: 0.8;
+}
+
+.leverage-slider__tick--major[data-active='true'] {
+  background-color: var(--color-privacy);
+  opacity: 0.7;
+}
+
+.leverage-slider__tick--minor {
+  background-color: var(--color-border-subtle);
+  opacity: 0.4;
+}
+
+.leverage-slider__thumb-hit {
+  position: absolute;
+  left: 0;
+  bottom: 6px;
+  width: 12px;
+  height: 50px;
+  transform: translateX(-6px);
+  cursor: grab;
+  z-index: 10;
+}
+
+.leverage-slider__thumb-line {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+  background-color: var(--color-privacy);
+}
+
+.leverage-slider__handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.leverage-slider__handle-grip {
+  width: 22px;
+  height: 28px;
+  background-color: var(--color-privacy-dim);
+  border: 1px solid var(--color-privacy);
+  border-radius: var(--radius-xs);
+  display: grid;
+  grid-template-columns: repeat(2, 4px);
+  grid-template-rows: repeat(3, 4px);
+  gap: 2px;
+  place-content: center;
+  /* Deliberately no glow/box-shadow here — an earlier version had one and
+     it read as too bright against the panel's dark surface. */
+}
+
+.leverage-slider__handle-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-privacy);
+  opacity: 0.75;
+}
+
+.leverage-slider__step-labels {
+  position: absolute;
+  bottom: 0;
+  left: 4px;
+  right: 4px;
+  height: 18px;
+}
+
+.leverage-slider__step-label {
+  position: absolute;
+  transform: translateX(-50%);
+  background: none;
+  border: none;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+  padding: 0;
+  line-height: 1;
+  transition: color var(--duration-fast) ease;
+}
+
+.leverage-slider__step-label[data-current='true'] {
+  font-weight: 600;
+  color: var(--color-privacy);
+}
+
+.leverage-slider__step-label:disabled {
+  color: var(--color-text-quaternary);
+  cursor: default;
+}
