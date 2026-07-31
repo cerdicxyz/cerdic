@@ -7,7 +7,19 @@
 //! POST /liquidation-check      -> { liquidatable }
 //! POST /liquidate              -> { executed, txHash? }
 //! GET  /health                 -> { status, attested }
+//! GET  /orderbook/:market_id   -> { bestBid, bestAsk, bids, asks, ... }
+//! GET  /ws/orderbook/:market_id -> same shape, pushed on every book mutation
 //! ```
+//!
+//! # `/orderbook` and `/ws/orderbook`
+//!
+//! Public, aggregate market data, not covered by `docs/spec-contracts-tee.md`
+//! section 3.2's original list (added once the frontend needed a real book to
+//! render instead of mock data). Per-price-level size and the rolling 24h
+//! trade tape only, never `OwnerId` or order identity, the same boundary
+//! `ARCHITECTURE.md`'s privacy model draws elsewhere: the book's shape is
+//! public, who placed a resting order is not. See `book::OrderBook::snapshot`
+//! and `market_data::TradeTape`.
 //!
 //! # `/liquidation-check` and `/liquidate`
 //!
@@ -38,13 +50,17 @@
 //! middleware (request body size cap, timeout, request tracing) wired
 //! in `main.rs` around this router, not inside the handlers themselves.
 
-use crate::book::{NewOrder, OrderBook, OwnerId, TimeInForce};
+use crate::book::{BookSnapshot, NewOrder, OrderBook, OwnerId, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
+use crate::market_data::{MarketSnapshot, TradeTape};
 use crate::sealed::SealedParams;
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, PrimitiveSignature as Signature, I256, U256};
 use axum::{
-    extract::State,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -56,6 +72,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tokio::sync::broadcast;
 
 /// Wire-level side, kept separate from `common::types::Side` so this
 /// crate's HTTP surface doesn't force a serde dependency onto the
@@ -220,6 +237,31 @@ pub struct HealthResponse {
     pub attested: bool,
 }
 
+/// A market that has never seen an order returns this same shape with
+/// everything empty/`None`, not a 404, matches `OrderBook`'s own
+/// "created lazily on first order" posture (see `AppState::books`'s doc).
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderBookResponse {
+    pub market_id: MarketId,
+    pub best_bid: Option<u64>,
+    pub best_ask: Option<u64>,
+    pub bids: Vec<crate::book::PriceLevel>,
+    pub asks: Vec<crate::book::PriceLevel>,
+    #[serde(flatten)]
+    pub market: MarketSnapshot,
+}
+
+/// The most levels a depth query will ever return per side, regardless
+/// of what the caller asks for, so a request can't force an unbounded
+/// response.
+const MAX_DEPTH_LEVELS: usize = 200;
+const DEFAULT_DEPTH_LEVELS: usize = 50;
+
+#[derive(Debug, Deserialize)]
+pub struct DepthQuery {
+    pub levels: Option<usize>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error(transparent)]
@@ -253,6 +295,18 @@ pub struct AppState {
     /// duplicate that registry, it just needs somewhere to rest orders
     /// once one shows up.
     books: Mutex<HashMap<MarketId, OrderBook>>,
+    /// Rolling last-price/24h-change/volume per market, derived from
+    /// fills as they happen in `post_order` (see `market_data`'s module
+    /// docs). Separate from `books`: the order book itself only knows
+    /// resting liquidity, not trade history.
+    market_data: Mutex<HashMap<MarketId, TradeTape>>,
+    /// One broadcast channel per market with an active `/ws/orderbook`
+    /// subscriber, created lazily on first subscribe (see
+    /// `ws_orderbook`). `post_order`/`post_offer` publish a fresh
+    /// `OrderBookResponse` here after every mutation; publishing to a
+    /// market with no receivers is a harmless no-op broadcast::send
+    /// returning `Err`, not an error worth handling.
+    book_updates: Mutex<HashMap<MarketId, broadcast::Sender<OrderBookResponse>>>,
     /// Last accepted nonce per signer, replay protection (see module
     /// docs). Unbounded growth is a real, documented limitation, a
     /// production deployment would expire entries or move this to a
@@ -299,6 +353,8 @@ impl AppState {
         Self {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
+            market_data: Mutex::new(HashMap::new()),
+            book_updates: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
             batch_proof_keys: crate::proof::BatchProofKeys::shared(),
             owner_addresses: Mutex::new(HashMap::new()),
@@ -319,6 +375,8 @@ impl AppState {
         Self {
             keystore: Keystore::generate(),
             books: Mutex::new(HashMap::new()),
+            market_data: Mutex::new(HashMap::new()),
+            book_updates: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
             batch_proof_keys: crate::proof::BatchProofKeys::shared(),
             owner_addresses: Mutex::new(HashMap::new()),
@@ -344,6 +402,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/offer", post(post_offer))
         .route("/liquidation-check", post(post_liquidation_check))
         .route("/liquidate", post(post_liquidate))
+        .route("/orderbook/:market_id", get(get_orderbook))
+        .route("/ws/orderbook/:market_id", get(ws_orderbook))
         .with_state(state)
 }
 
@@ -417,6 +477,15 @@ async fn post_order(
         resting = result.resting_id.is_some(),
         "order accepted"
     );
+
+    if !result.fills.is_empty() {
+        let mut market_data = state.market_data.lock().expect("market_data mutex poisoned");
+        let tape = market_data.entry(payload.market_id.clone()).or_default();
+        for fill in &result.fills {
+            tape.record(now, fill.tick, fill.qty);
+        }
+    }
+    broadcast_orderbook_update(&state, &payload.market_id);
 
     let taker_is_buy = matches!(payload.side, OrderSide::Buy);
     let mut maker_legs = Vec::with_capacity(result.fills.len());
@@ -612,8 +681,105 @@ async fn post_offer(
     if result.post_only_rejected {
         return Ok(Json(OfferResponse::Rejected { reason: "offer would have crossed the book".into() }));
     }
+    broadcast_orderbook_update(&state, &payload.market_id);
     let offer_id = result.resting_id.expect("a non-rejected post-only submit always rests");
     Ok(Json(OfferResponse::Resting { offer_id }))
+}
+
+/// Builds the current `OrderBookResponse` for one market from `books` and
+/// `market_data`, the shared read path for both `GET /orderbook` and the
+/// WebSocket push. A market that has never seen an order isn't an error,
+/// it just yields an empty snapshot (see `OrderBookResponse`'s doc).
+fn build_orderbook_response(state: &AppState, market_id: &MarketId, levels: usize) -> OrderBookResponse {
+    let snapshot: BookSnapshot = {
+        let books = state.books.lock().expect("books mutex poisoned");
+        books.get(market_id).map(|book| book.snapshot(levels)).unwrap_or_default()
+    };
+    let market: MarketSnapshot = {
+        let market_data = state.market_data.lock().expect("market_data mutex poisoned");
+        market_data.get(market_id).map(|tape| tape.snapshot()).unwrap_or_default()
+    };
+    OrderBookResponse {
+        market_id: market_id.clone(),
+        best_bid: snapshot.best_bid,
+        best_ask: snapshot.best_ask,
+        bids: snapshot.bids,
+        asks: snapshot.asks,
+        market,
+    }
+}
+
+/// Publishes a fresh snapshot to every `/ws/orderbook` subscriber for
+/// `market_id` after a book mutation. A no-op when nobody's subscribed
+/// (`Sender::send` on a channel with zero receivers just returns `Err`,
+/// which is exactly "nothing to do here", not a failure worth logging).
+fn broadcast_orderbook_update(state: &AppState, market_id: &MarketId) {
+    let sender = {
+        let updates = state.book_updates.lock().expect("book_updates mutex poisoned");
+        updates.get(market_id).cloned()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(build_orderbook_response(state, market_id, DEFAULT_DEPTH_LEVELS));
+    }
+}
+
+async fn get_orderbook(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+    Query(query): Query<DepthQuery>,
+) -> Json<OrderBookResponse> {
+    let levels = query.levels.unwrap_or(DEFAULT_DEPTH_LEVELS).clamp(1, MAX_DEPTH_LEVELS);
+    Json(build_orderbook_response(&state, &market_id, levels))
+}
+
+async fn ws_orderbook(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+) -> Response {
+    ws.on_upgrade(move |socket| stream_orderbook(socket, state, market_id))
+}
+
+/// Sends an immediate snapshot on connect (a fresh subscriber shouldn't
+/// have to wait for the next mutation to see the current book), then
+/// forwards every subsequent `broadcast_orderbook_update` for this market
+/// until the client disconnects or the channel closes.
+async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id: MarketId) {
+    let mut updates = {
+        let mut senders = state.book_updates.lock().expect("book_updates mutex poisoned");
+        senders.entry(market_id.clone()).or_insert_with(|| broadcast::channel(64).0).subscribe()
+    };
+
+    let initial = build_orderbook_response(&state, &market_id, DEFAULT_DEPTH_LEVELS);
+    let Ok(initial_text) = serde_json::to_string(&initial) else { return };
+    if socket.send(Message::Text(initial_text)).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            update = updates.recv() => {
+                match update {
+                    Ok(response) => {
+                        let Ok(text) = serde_json::to_string(&response) else { continue };
+                        if socket.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A slow consumer missed some updates, not fatal: the
+                    // next one it does receive is still a full snapshot,
+                    // not a delta, so it's self-correcting.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = socket.recv() => {
+                if incoming.is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// One market's decrypted, unsealed state for a portfolio: everything
@@ -1420,5 +1586,111 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["liquidatable"], false, "an unreadable RPC must never fabricate liquidatable=true");
+    }
+
+    async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::get(path).body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn orderbook_for_an_unknown_market_is_empty_not_an_error() {
+        let state = Arc::new(AppState::new());
+        let (status, body) = get_json(router(state), "/orderbook/0xNEVERTRADED").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["bids"], serde_json::json!([]));
+        assert_eq!(body["asks"], serde_json::json!([]));
+        assert_eq!(body["best_bid"], serde_json::Value::Null);
+        assert_eq!(body["last_price"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn orderbook_reflects_resting_liquidity_on_both_sides() {
+        let state = Arc::new(AppState::new());
+        let bidder = wallet();
+        let asker = wallet();
+
+        let mut bid = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 99,
+            qty: 7,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut bid, &bidder);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(bid, &state)).await;
+
+        let mut ask = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 101,
+            qty: 4,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut ask, &asker);
+        post_json(app.clone(), "/order", &envelope_for(ask, &state)).await;
+
+        let (status, body) = get_json(app, "/orderbook/0xEURCUSDC").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["best_bid"], 99);
+        assert_eq!(body["best_ask"], 101);
+        assert_eq!(body["bids"][0]["tick"], 99);
+        assert_eq!(body["bids"][0]["qty"], 7);
+        assert_eq!(body["bids"][0]["cumulative"], 7);
+        assert_eq!(body["asks"][0]["tick"], 101);
+        assert_eq!(body["asks"][0]["qty"], 4);
+    }
+
+    #[tokio::test]
+    async fn orderbook_reports_last_trade_after_a_crossing_fill() {
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let taker = wallet();
+
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        post_json(app.clone(), "/order", &envelope_for(crossing, &state)).await;
+
+        let (status, body) = get_json(app, "/orderbook/0xEURCUSDC").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["last_price"], 100);
+        assert_eq!(body["volume_24h"], 5);
+        // Fully filled at the same tick it rested at: both sides are gone.
+        assert_eq!(body["bids"], serde_json::json!([]));
+        assert_eq!(body["asks"], serde_json::json!([]));
     }
 }

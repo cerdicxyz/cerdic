@@ -20,7 +20,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 alloy = { workspace = true, features = ["k256", "serde", "signer-local", "provider-http", "rpc-types-eth", "reqwest", "sol-types"] }
 
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "time"] }
 nu-ansi-term = "0.50"

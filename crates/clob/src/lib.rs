@@ -1,6 +1,14 @@
 //! Off-chain matching engine for the Cerdic public CLOB market extension
 //! (paper/cerdic.tex:619-651, plan todo #16).
 //!
+//! Not the TEE-matched private venue's order book — that's
+//! `cerdic-tee-matcher`'s `book::OrderBook`, a different (and currently
+//! live) implementation with different price/size types. This crate is a
+//! separate, deliberately out-of-scope-for-now future market type (a
+//! fully public CLOB, no order privacy), not wired into
+//! `cerdic-tee-matcher` and not a dependency of it. See "Scope
+//! guardrails" below for what it does and doesn't cover today.
+//!
 //! The engine maintains one [`OrderBook`] per market: asks live in a
 //! [`BTreeMap`] keyed ascending by price, bids in a mirror map keyed by
 //! [`Reverse`] (descending), and each price level holds its resting orders
