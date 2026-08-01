@@ -10,23 +10,30 @@ import { SettingsDropdown } from './SettingsDropdown';
 // not the unicode glyph (⧉) this had before. Settings is its own
 // component, see SettingsDropdown.tsx.
 
-const NAV_ITEMS = ['Trade', 'Traders', 'Discover', 'Blog'];
+const NAV_ITEMS = ['Trade', 'Agents', 'Discover', 'Blog'];
 const ICON_SIZE = 16;
 const ICON_STROKE = 1.75;
 
 export function Header() {
   return (
-    <header
-      className="flex h-12 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]"
-    >
-      <a href="/" className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline">
-        <span aria-hidden="true" className="text-[15px] leading-none text-accent">
+    <header className="flex h-12 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
+      <a
+        href="/"
+        className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline"
+      >
+        <span
+          aria-hidden="true"
+          className="text-[15px] leading-none text-accent"
+        >
           ↗
         </span>
         <span>Cerdic</span>
       </a>
 
-      <nav aria-label="Site" className="mx-auto flex items-center gap-[var(--space-7)]">
+      <nav
+        aria-label="Site"
+        className="mx-auto flex items-center gap-[var(--space-7)]"
+      >
         {NAV_ITEMS.map((item) => (
           <a
             key={item}
@@ -53,7 +60,12 @@ export function Header() {
         <SettingsDropdown />
         <button
           type="button"
-          onClick={() => toast.info('Wallet connection coming soon', 'No wallet integration is wired up yet.')}
+          onClick={() =>
+            toast.info(
+              'Wallet connection coming soon',
+              'No wallet integration is wired up yet.',
+            )
+          }
           className="rounded-pill bg-accent/10 px-[var(--space-6)] py-[var(--space-3)] text-[13px] font-semibold text-accent transition-colors duration-150 hover:bg-accent/20"
         >
           Connect

@@ -1,14 +1,18 @@
-// Top strip, layout-ported from cer-perp's market-bar.tsx. No live market
-// data wired yet — placeholders throughout, per app/design.md's content
-// rule (no fabricated numbers standing in as real ones).
+// Market stat row, embedded as ChartPanel's own top row (matching the
+// Lighter reference this chart widget follows: MARK/INDEX/24H/FUNDING
+// sit inside the chart card itself, not as a separate full-width strip
+// above it) — moved in from a page-level bar to close the visual gap
+// between it and the tabs/chart underneath.
+//
+// No live market data wired yet — placeholders throughout, per
+// app/design.md's content rule (no fabricated numbers standing in as
+// real ones).
 
 const STATS = ['Mark', '24h', 'Funding', 'OI'];
 
 export function MarketBar() {
   return (
-    <header
-      className="flex h-10 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]"
-    >
+    <div className="flex items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
       <button
         type="button"
         className="flex items-center gap-[var(--space-2)] rounded-md border border-border-subtle bg-surface-raised px-[var(--space-4)] py-[var(--space-2)] font-sans text-xs font-medium text-text-primary transition-colors duration-150 hover:bg-surface-hover"
@@ -24,6 +28,6 @@ export function MarketBar() {
           <span className="text-xs text-text-secondary">—</span>
         </div>
       ))}
-    </header>
+    </div>
   );
 }

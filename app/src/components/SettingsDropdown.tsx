@@ -89,8 +89,21 @@ export function SettingsDropdown() {
             </span>
           </div>
 
-          <div className="mt-[var(--space-4)] border-t border-border-subtle pt-[var(--space-3)] text-[10px] text-text-quaternary">
-            Cerdic — trade page v0.1.0
+          <div className="mt-[var(--space-4)] flex items-center justify-between border-t border-border-subtle pt-[var(--space-3)] text-[10px] text-text-quaternary">
+            <span>Cerdic — trade page v0.1.0</span>
+            {/* ChartPanel's candlestick chart runs on TradingView's
+                lightweight-charts (Apache 2.0) — the license requires a
+                visible link back to tradingview.com somewhere users can
+                reach. Moved here (out of Sidebar's persistent icon rail)
+                since it only needs to be reachable, not always on screen. */}
+            <a
+              href="https://www.tradingview.com/"
+              target="_blank"
+              rel="noreferrer"
+              className="text-text-quaternary underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-text-tertiary"
+            >
+              Charts by TradingView
+            </a>
           </div>
         </div>
       )}

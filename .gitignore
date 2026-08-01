@@ -14,3 +14,6 @@ app/package-lock.json
 app/vite.config.d.ts
 app/vite.config.js
 .DS_Store
+*.aux
+*.out
+*.toc

@@ -1,30 +1,35 @@
-import {
-  IconBriefcase,
-  IconChartCandle,
-  IconChartLine,
-  IconHelpCircle,
-  IconReceipt2,
-} from '@tabler/icons-react';
+import { Link, useLocation } from 'react-router';
+import { IconBriefcase, IconChartCandle, IconHelpCircle, IconReceipt2 } from '@tabler/icons-react';
 
 // Icon rail, ported layout-only from cer-perp's sidebar.tsx (56px
-// collapsed width). Nav targets are placeholders — no routing yet.
+// collapsed width). Real SVG icons (@tabler/icons-react, the same set
+// cer-perp's own sidebar uses), not the unicode glyphs (⌗▤≡?) this had
+// before.
 //
-// Real SVG icons (@tabler/icons-react, the same set cer-perp's own
-// sidebar uses), not the unicode glyphs (⌗▤≡?) this had before — those
-// render at inconsistent visual weights depending on the system font and
-// never really looked like a matched icon set.
+// Trade is a real route (react-router, see App.tsx). Portfolio opens a
+// modal instead (PortfolioModal.tsx) rather than navigating — it's an
+// account overview reachable from wherever you are, not its own screen.
+// Orders and Docs stay disabled with a "Coming soon" title — there's no
+// page/modal behind them yet, same honesty convention as the chart's
+// TradingView/Depth tabs rather than a link to nowhere.
+//
+// The TradingView attribution link that used to live here moved to
+// SettingsDropdown.tsx's footer — see that file for why it can't just be
+// deleted outright.
 
 const ICON_SIZE = 18;
 const ICON_STROKE = 1.75;
 
-const NAV_ITEMS = [
-  { key: 'trade', Icon: IconChartCandle, label: 'Trade' },
-  { key: 'portfolio', Icon: IconBriefcase, label: 'Portfolio' },
-  { key: 'orders', Icon: IconReceipt2, label: 'Orders' },
-  { key: 'docs', Icon: IconHelpCircle, label: 'Docs' },
-];
+export function Sidebar({
+  onOpenPortfolio,
+  portfolioOpen,
+}: {
+  onOpenPortfolio: () => void;
+  portfolioOpen: boolean;
+}) {
+  const location = useLocation();
+  const tradeActive = location.pathname.startsWith('/trade');
 
-export function Sidebar() {
   return (
     <nav
       aria-label="Primary"
@@ -37,40 +42,47 @@ export function Sidebar() {
         c
       </div>
       <div className="flex flex-col gap-[var(--space-2)]">
-        {NAV_ITEMS.map(({ key, Icon, label }) => {
-          const active = key === 'trade';
-          return (
-            <button
-              key={key}
-              type="button"
-              title={label}
-              aria-label={label}
-              className={
-                active
-                  ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
-                  : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
-              }
-            >
-              <Icon size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
-            </button>
-          );
-        })}
+        <Link
+          to="/trade"
+          title="Trade"
+          aria-label="Trade"
+          className={
+            tradeActive
+              ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
+              : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
+          }
+        >
+          <IconChartCandle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </Link>
+        <button
+          type="button"
+          onClick={onOpenPortfolio}
+          title="Portfolio"
+          aria-label="Portfolio"
+          aria-expanded={portfolioOpen}
+          className={
+            portfolioOpen
+              ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
+              : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
+          }
+        >
+          <IconBriefcase size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </button>
+        <span
+          title="Orders — coming soon"
+          aria-label="Orders"
+          className="grid h-9 w-9 cursor-not-allowed place-items-center rounded-sm text-text-quaternary/50 transition-colors duration-150"
+        >
+          <IconReceipt2 size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </span>
+        <span
+          title="Docs — coming soon"
+          aria-label="Docs"
+          className="grid h-9 w-9 cursor-not-allowed place-items-center rounded-sm text-text-quaternary/50 transition-colors duration-150"
+        >
+          <IconHelpCircle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </span>
       </div>
-      {/* ChartPanel's candlestick chart runs on TradingView's lightweight-charts
-          (Apache 2.0) — the license requires a visible link back to
-          tradingview.com somewhere users can reach. One icon here, once for
-          the whole app, instead of a text credit repeated in the chart's own
-          toolbar. */}
-      <a
-        href="https://www.tradingview.com/"
-        target="_blank"
-        rel="noreferrer"
-        title="Charts by TradingView"
-        aria-label="Charts by TradingView"
-        className="mt-auto grid h-9 w-9 place-items-center rounded-sm text-text-quaternary transition-colors duration-150 hover:bg-surface-hover hover:text-text-tertiary"
-      >
-        <IconChartLine size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
-      </a>
     </nav>
   );
 }

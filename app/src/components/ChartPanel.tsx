@@ -1,9 +1,15 @@
 import { useCallback, useState } from 'react';
 import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
+import { MarketBar } from './MarketBar';
 
 // Chart panel, structured like the reference (Lighter's own chart widget):
-// sub-tabs, timeframe pills, a chart-type toggle, then the chart itself
-// with an OHLC crosshair legend overlaid top-left.
+// a market stat row, sub-tabs, timeframe pills, a chart-type toggle, then
+// the chart itself with an OHLC crosshair legend overlaid top-left.
+//
+// MarketBar.tsx (symbol + Mark/24h/Funding/OI) lives here as this panel's
+// own top row, not as a separate strip above the whole grid — matching
+// the reference, where those stats sit inside the chart card itself, and
+// closing the visual gap that separate strip left above everything.
 //
 // TradingView and Depth are visibly disabled with a "Soon" badge, not
 // silently missing or faked as working — TradingView's full Advanced
@@ -11,10 +17,6 @@ import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
 // visible (see the chart research this was built from), so it's a real
 // gate, not a UI choice; Depth (a cumulative bid/ask curve view, distinct
 // from OrderBookDepth's heatmap) is simply a later phase.
-//
-// No Mark/Index/24h/Funding stats row here — MarketBar.tsx already owns
-// that above the grid; repeating it inside the chart panel too would be
-// the same numbers shown twice, not fidelity to the reference.
 
 const TIMEFRAMES: Timeframe[] = ['5m', '15m', '1h', '4h'];
 type SubTab = 'price' | 'funding' | 'details';
@@ -41,6 +43,7 @@ export function ChartPanel() {
 
   return (
     <div className="flex h-full flex-col">
+      <MarketBar />
       <div className="flex items-center gap-[var(--space-5)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
         {(['price', 'funding', 'details'] as const).map((tab) => (
           <button

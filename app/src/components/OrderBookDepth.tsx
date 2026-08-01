@@ -65,19 +65,23 @@ function buildDepthGradient(
   return gradient;
 }
 
+// Bumped up again from an earlier pass — the mid-range dip (0.12→0.55)
+// at 0.36–0.38 alpha was muting most of the ladder, since most rows'
+// bars land in that x-range: only the far edge ever read as a real
+// "heatmap," everything else looked closer to plain dark rows.
 const ASK_DEPTH_STOPS: Array<[number, [number, number, number], number]> = [
-  [0, [150, 15, 18], 0.68],
-  [0.12, [60, 28, 20], 0.36],
-  [0.55, [70, 35, 15], 0.38],
-  [0.85, [190, 110, 10], 0.62],
-  [1, [235, 150, 10], 0.78],
+  [0, [150, 15, 18], 0.82],
+  [0.12, [60, 28, 20], 0.58],
+  [0.55, [70, 35, 15], 0.6],
+  [0.85, [190, 110, 10], 0.8],
+  [1, [235, 150, 10], 0.9],
 ];
 const BID_DEPTH_STOPS: Array<[number, [number, number, number], number]> = [
-  [0, [15, 140, 110], 0.68],
-  [0.12, [10, 45, 35], 0.36],
-  [0.55, [8, 55, 42], 0.38],
-  [0.85, [40, 180, 130], 0.62],
-  [1, [70, 230, 160], 0.78],
+  [0, [15, 140, 110], 0.82],
+  [0.12, [10, 45, 35], 0.58],
+  [0.55, [8, 55, 42], 0.6],
+  [0.85, [40, 180, 130], 0.8],
+  [1, [70, 230, 160], 0.9],
 ];
 
 const COLORS = {
