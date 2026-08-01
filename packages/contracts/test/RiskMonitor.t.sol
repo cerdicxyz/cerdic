@@ -11,6 +11,7 @@ import {IMarket} from "../src/clearing/IMarket.sol";
 import {IMarketLifecycle} from "../src/clearing/IMarketLifecycle.sol";
 import {LiquidationEntry} from "../src/clearing/LiquidationEntry.sol";
 import {RiskMonitor} from "../src/clearing/RiskMonitor.sol";
+import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
 import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 
 /// @dev Minimal mintable ERC-20 used as a collateral asset stand-in for the
@@ -112,11 +113,13 @@ contract RiskMonitorTest is Test {
     MockMarkPriceOracle internal oracle;
     MockERC20 internal usdc;
     ProtocolConstants internal constants;
+    AttestationRouter internal attestationRouter;
 
     address internal admin = makeAddr("admin");
     address internal trader = makeAddr("trader");
     address internal counterparty = makeAddr("counterparty");
     address internal stranger = makeAddr("stranger");
+    address internal tee = makeAddr("tee");
 
     bytes32 internal constant MARKET_ID = keccak256("BTC-USDC-PERP");
     bytes32 internal constant MARKET_ID_2 = keccak256("ETH-USDC-PERP");
@@ -141,6 +144,7 @@ contract RiskMonitorTest is Test {
         );
         monitor = new RiskMonitor(admin, address(oracle));
         constants = new ProtocolConstants();
+        attestationRouter = new AttestationRouter(admin);
 
         // Role wiring: every external read needed for arguments is hoisted
         // ABOVE the prank — an inline role getter would consume it
@@ -557,5 +561,100 @@ contract RiskMonitorTest is Test {
 
         uint256 expected = uint256(size) * price * 300 / (1e18 * 10_000);
         assertEq(monitor.currentMarginRequirement(trader), expected, "reference formula");
+    }
+
+    // ---------------------------------------------------------------------
+    // Portfolio margin: TEE-attested M(P) = f_S + f_C + f_L + f_K.
+    // ---------------------------------------------------------------------
+
+    /// @dev Wires the attestation router and authorizes the mock TEE address.
+    function _wireAttestationRouter() internal {
+        vm.startPrank(admin);
+        monitor.setAttestationRouter(address(attestationRouter));
+        attestationRouter.authorizeTEE(tee);
+        vm.stopPrank();
+    }
+
+    /// @notice A fresh attestation from an authorized TEE becomes the
+    ///         effective requirement, even when it's BELOW the isolated sum
+    ///         (the hedge-credit case that is the whole point of portfolio
+    ///         margin).
+    function test_FreshPortfolioAttestationOverridesIsolatedRequirement() public {
+        _wireAttestationRouter();
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30
+
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        assertEq(monitor.effectiveMarginRequirement(trader), 5e18, "attested value wins while fresh");
+        (uint256 requirement, bool fresh) = monitor.portfolioMarginRequirement(trader);
+        assertEq(requirement, 5e18);
+        assertTrue(fresh);
+    }
+
+    /// @notice An expired attestation is ignored: the monitor falls back to
+    ///         the conservative isolated sum rather than trusting stale data.
+    function test_ExpiredPortfolioAttestationFallsBackToIsolated() public {
+        _wireAttestationRouter();
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30
+
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1));
+        vm.warp(block.timestamp + 2);
+
+        assertEq(monitor.effectiveMarginRequirement(trader), MMR, "falls back to isolated once stale");
+        (, bool fresh) = monitor.portfolioMarginRequirement(trader);
+        assertFalse(fresh);
+    }
+
+    /// @notice No attestation ever submitted behaves exactly like before
+    ///         this feature existed: effective == isolated.
+    function test_NoAttestationUsesIsolatedRequirement() public {
+        _openLong(trader, MARKET_ID, SIZE);
+        assertEq(monitor.effectiveMarginRequirement(trader), MMR, "unset attestation, isolated fallback");
+    }
+
+    /// @notice Only an address the AttestationRouter has authorized as a TEE
+    ///         can submit; everyone else reverts, and an unset router fails closed.
+    function test_SubmitPortfolioMarginGatedToAuthorizedTEE() public {
+        vm.expectRevert(RiskMonitor.AttestationRouterNotSet.selector);
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        _wireAttestationRouter();
+
+        vm.expectRevert(RiskMonitor.NotAuthorizedAttester.selector);
+        vm.prank(stranger);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        vm.expectRevert(RiskMonitor.AttestationAlreadyExpired.selector);
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp));
+    }
+
+    /// @notice A hedge-credited portfolio attestation flows through to
+    ///         withdraw safety and liquidation, exactly as the isolated
+    ///         requirement does today: the plumbing is the same, only the
+    ///         number changes.
+    function test_PortfolioAttestationDrivesWithdrawAndLiquidation() public {
+        _wireAttestationRouter();
+        _fund(trader, 100e18);
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30, C_eff = $100
+
+        // Attest a requirement of $90: withdrawing down to exactly $90 left is safe.
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 90e18, uint64(block.timestamp + 1 hours));
+
+        assertFalse(monitor.isWithdrawSafe(trader, address(usdc), 11e18), "would breach the attested $90");
+        assertTrue(monitor.isWithdrawSafe(trader, address(usdc), 10e18), "leaves exactly $90");
+
+        // Re-attest a requirement above C_eff: checkLiquidation now breaches
+        // even though the isolated sum alone would not have.
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 200e18, uint64(block.timestamp + 1 hours));
+
+        bool breached = monitor.checkLiquidation(trader);
+        assertTrue(breached, "attested portfolio requirement breaches C_eff");
+        assertTrue(account.accounts(trader), "frozen off the attested requirement");
     }
 }
