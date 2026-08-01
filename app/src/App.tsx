@@ -3,6 +3,7 @@ import { Routes, Route, Navigate } from 'react-router';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { TradePage } from './pages/TradePage';
+import { AgentsPage } from './pages/AgentsPage';
 import { PortfolioModal } from './components/PortfolioModal';
 import { ToastProvider } from './toast/toast-context';
 import { ToastContainer } from './toast/toast-container';
@@ -26,6 +27,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/trade" replace />} />
             <Route path="/trade" element={<TradePage />} />
+            <Route path="/agents" element={<AgentsPage />} />
           </Routes>
         </div>
         <PortfolioModal open={portfolioOpen} onClose={() => setPortfolioOpen(false)} />
