@@ -1,11 +1,27 @@
+import {
+  IconBriefcase,
+  IconChartCandle,
+  IconChartLine,
+  IconHelpCircle,
+  IconReceipt2,
+} from '@tabler/icons-react';
+
 // Icon rail, ported layout-only from cer-perp's sidebar.tsx (56px
 // collapsed width). Nav targets are placeholders — no routing yet.
+//
+// Real SVG icons (@tabler/icons-react, the same set cer-perp's own
+// sidebar uses), not the unicode glyphs (⌗▤≡?) this had before — those
+// render at inconsistent visual weights depending on the system font and
+// never really looked like a matched icon set.
+
+const ICON_SIZE = 18;
+const ICON_STROKE = 1.75;
 
 const NAV_ITEMS = [
-  { key: 'trade', glyph: '⌗', label: 'Trade' },
-  { key: 'portfolio', glyph: '▤', label: 'Portfolio' },
-  { key: 'orders', glyph: '≡', label: 'Orders' },
-  { key: 'docs', glyph: '?', label: 'Docs' },
+  { key: 'trade', Icon: IconChartCandle, label: 'Trade' },
+  { key: 'portfolio', Icon: IconBriefcase, label: 'Portfolio' },
+  { key: 'orders', Icon: IconReceipt2, label: 'Orders' },
+  { key: 'docs', Icon: IconHelpCircle, label: 'Docs' },
 ];
 
 export function Sidebar() {
@@ -21,25 +37,40 @@ export function Sidebar() {
         c
       </div>
       <div className="flex flex-col gap-[var(--space-2)]">
-        {NAV_ITEMS.map((item) => {
-          const active = item.key === 'trade';
+        {NAV_ITEMS.map(({ key, Icon, label }) => {
+          const active = key === 'trade';
           return (
             <button
-              key={item.key}
+              key={key}
               type="button"
-              title={item.label}
-              aria-label={item.label}
+              title={label}
+              aria-label={label}
               className={
                 active
-                  ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-[15px] text-accent transition-colors duration-150'
-                  : 'grid h-9 w-9 place-items-center rounded-sm text-[15px] text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
+                  ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
+                  : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
               }
             >
-              <span aria-hidden="true">{item.glyph}</span>
+              <Icon size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
             </button>
           );
         })}
       </div>
+      {/* ChartPanel's candlestick chart runs on TradingView's lightweight-charts
+          (Apache 2.0) — the license requires a visible link back to
+          tradingview.com somewhere users can reach. One icon here, once for
+          the whole app, instead of a text credit repeated in the chart's own
+          toolbar. */}
+      <a
+        href="https://www.tradingview.com/"
+        target="_blank"
+        rel="noreferrer"
+        title="Charts by TradingView"
+        aria-label="Charts by TradingView"
+        className="mt-auto grid h-9 w-9 place-items-center rounded-sm text-text-quaternary transition-colors duration-150 hover:bg-surface-hover hover:text-text-tertiary"
+      >
+        <IconChartLine size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+      </a>
     </nav>
   );
 }

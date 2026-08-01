@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { LeverageSlider } from './LeverageSlider';
+import { toast } from '../toast/toast-context';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -31,6 +32,19 @@ type OrderType = 'market' | 'limit' | 'offer';
 function parseNum(value: string): number | null {
   const n = Number(value);
   return value.trim() !== '' && Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+// Strips anything that isn't a digit or decimal point, and collapses any
+// extra dots down to the first one — so a paste or stray keypress can't
+// leave letters sitting in a price/amount field. `type="number"` was the
+// other option but its own quirks (scientific notation, awkward leading
+// zeros) made a plain sanitized text input the better fit for a
+// right-aligned, large-font amount display.
+function sanitizeDecimal(value: string): string {
+  const cleaned = value.replace(/[^0-9.]/g, '');
+  const firstDot = cleaned.indexOf('.');
+  if (firstDot === -1) return cleaned;
+  return cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, '');
 }
 
 export function TradePanel() {
@@ -85,15 +99,22 @@ export function TradePanel() {
       </div>
 
       <div className="flex items-center gap-[var(--space-2)]">
-        <select
-          value={orderType}
-          onChange={(event) => setOrderType(event.target.value as OrderType)}
-          className="flex-1 rounded-md border border-border-subtle bg-surface-raised px-[var(--space-3)] py-[var(--space-2)] text-xs font-medium capitalize text-text-primary focus:border-border-focus focus:outline-none"
-        >
-          <option value="market">Market</option>
-          <option value="limit">Limit</option>
-          <option value="offer">Offer</option>
-        </select>
+        <div className="flex flex-1 items-center gap-px rounded-md border border-border-subtle bg-surface-raised p-px">
+          {(['market', 'limit', 'offer'] as const).map((type) => (
+            <button
+              key={type}
+              type="button"
+              onClick={() => setOrderType(type)}
+              className={`flex-1 rounded-sm px-[var(--space-2)] py-[var(--space-2)] text-xs font-medium capitalize transition-colors duration-150 ${
+                orderType === type
+                  ? 'bg-surface-hover text-text-primary'
+                  : 'text-text-tertiary hover:text-text-secondary'
+              }`}
+            >
+              {type}
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           onClick={() => setLeverageOpen((open) => !open)}
@@ -120,7 +141,7 @@ export function TradePanel() {
           <span className="text-[10px] uppercase tracking-[0.06em] text-text-quaternary">Price</span>
           <input
             value={price}
-            onChange={(event) => setPrice(event.target.value)}
+            onChange={(event) => setPrice(sanitizeDecimal(event.target.value))}
             placeholder="0.0000"
             inputMode="decimal"
             className="w-2/3 bg-transparent text-right font-sans text-sm text-text-primary placeholder:text-text-quaternary focus:outline-none"
@@ -149,7 +170,7 @@ export function TradePanel() {
           </div>
           <input
             value={amount}
-            onChange={(event) => setAmount(event.target.value)}
+            onChange={(event) => setAmount(sanitizeDecimal(event.target.value))}
             placeholder="0.00"
             inputMode="decimal"
             className="min-w-0 flex-1 bg-transparent text-right font-sans text-3xl font-semibold text-text-quaternary placeholder:text-text-quaternary focus:outline-none focus:text-text-primary"
@@ -187,7 +208,7 @@ export function TradePanel() {
             <span className="text-[10px] uppercase tracking-[0.06em] text-text-quaternary">Take Profit</span>
             <input
               value={takeProfit}
-              onChange={(event) => setTakeProfit(event.target.value)}
+              onChange={(event) => setTakeProfit(sanitizeDecimal(event.target.value))}
               placeholder="—"
               inputMode="decimal"
               className="rounded-sm border border-border-subtle bg-surface-raised px-[var(--space-2)] py-[var(--space-2)] text-xs text-text-primary placeholder:text-text-quaternary focus:border-border-focus focus:outline-none"
@@ -197,7 +218,7 @@ export function TradePanel() {
             <span className="text-[10px] uppercase tracking-[0.06em] text-text-quaternary">Stop Loss</span>
             <input
               value={stopLoss}
-              onChange={(event) => setStopLoss(event.target.value)}
+              onChange={(event) => setStopLoss(sanitizeDecimal(event.target.value))}
               placeholder="—"
               inputMode="decimal"
               className="rounded-sm border border-border-subtle bg-surface-raised px-[var(--space-2)] py-[var(--space-2)] text-xs text-text-primary placeholder:text-text-quaternary focus:border-border-focus focus:outline-none"
@@ -208,6 +229,7 @@ export function TradePanel() {
 
       <button
         type="button"
+        onClick={() => toast.info('Wallet connection coming soon', 'No wallet integration is wired up yet.')}
         className="rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent transition-colors duration-150 hover:bg-accent/20"
       >
         Connect Wallet to Trade

@@ -13,6 +13,13 @@
   --color-surface-raised: oklch(1 0 0 / 0.045);
   --color-surface-hover: oklch(1 0 0 / 0.08);
   --color-surface-pressed: oklch(1 0 0 / 0.025);
+  /* Solid, not translucent — every other surface.* token is a % white
+     tint meant to sit on the page's own black background inside the
+     grid layout. A toast is a fixed-position overlay drawn straight over
+     arbitrary page content (portaled to document.body), so a translucent
+     background there lets whatever's underneath show straight through
+     instead of reading as a card. */
+  --color-surface-overlay: #0c0c0f;
 
   --color-border-subtle: oklch(1 0 0 / 0.075);
   --color-border-default: #2b2b30;
@@ -37,6 +44,12 @@
      picked freehand. */
   --color-privacy: oklch(0.72 0.19 300);
   --color-privacy-dim: color-mix(in oklch, oklch(0.72 0.19 300) 18%, transparent);
+  /* Same method again, a third hue on the same lightness/chroma ramp —
+     the price chart's volume pane needs three distinct moving-average
+     line colors (MA5/10/20); --color-warning and --color-privacy cover
+     two of them, this fills the third rather than reaching for an
+     unrelated blue. */
+  --color-chart-line: oklch(0.72 0.19 230);
 
   /* Order book depth-heatmap colors, matching the reference screenshot's
      own genre-standard warm/cool pairing (amber asks, teal bids) —
