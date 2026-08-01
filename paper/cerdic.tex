@@ -413,6 +413,8 @@ Collateral tiers (Table~\ref{tab:collateral}) are not just haircut buckets -- ea
 
 Strategy vaults are the same mechanism at the account level: a vault is a sub-account with its own risk isolation, trading through the same kernel and margined the same way as any trader, so a vault-specific strategy failure cannot leak into other accounts. This is also how CLOB/RFQ liquidity gets provided -- market-making is one more vault strategy, not a separate pooled-liquidity system with its own risk model.
 
+This covers the \emph{firm/principal-funded} shape cleanly -- the capital owner pins risk limits into a capability token at account creation (\S\ref{sec:agents}; see also the prop-desk companion paper, which is exactly this pattern) and the kernel enforces them without the owner needing to see live positions, so sealed execution is not in tension with trust here. It does \emph{not}, on its own, cover the \emph{public} shape -- a permissionless vault funded by third-party depositors who don't know the manager. Every shipped version of that product (Hyperliquid Vaults, GMX's GLP) earns depositor trust through full on-chain visibility of the manager's positions and track record; that visibility is the trust mechanism, not incidental to it. Sealing a public vault's positions the same way a normal account is sealed would give depositors \emph{less} information than existing vault products, which is a regression, not a differentiator. The only path that stays coherent with \S\ref{sec:privacy}'s design is a ZK-attested performance/solvency proof -- the vault proves its realized return and solvency without revealing positions, the same primitive Section~\ref{sec:roadmap}'s Phase 3 already scopes for institutional solvency attestation. This has real academic grounding (zero-knowledge hedge-fund compliance proofs exist in the literature) but no shipped consumer-DeFi precedent, so it is scoped as research, not as a roadmap item ready to build.
+
 %=============================================================================
 \section{Economics}
 \label{sec:economics}
@@ -474,10 +476,10 @@ Every component below is real and working end-to-end, not a stub -- the point of
 Formal verification of kernel and margin invariants; wider scenario coverage in $f_S$ (vol shocks, correlation-breakdown regimes); additional crypto markets; multi-asset collateral with dynamic haircuts; mainnet.
 
 \subsection{Phase 2 -- more markets}
-Additional FX pairs (GBP/USD, JPY/USD); RWA and rate module; strategy vaults; internal repo market; CCTP v2 cross-chain collateral.
+Additional FX pairs (GBP/USD, JPY/USD); RWA and rate module; strategy vaults (the firm/principal-funded shape, \S\ref{sec:yield}; the public shape waits on Phase 3's ZK solvency attestation); internal repo market; CCTP v2 cross-chain collateral.
 
 \subsection{Phase 3 -- scale}
-ZK solvency attestation for institutions; ZK-compressed TEE attestation verification; institutional sub-accounts; agent strategy vaults (smart treasuries); migration path to Arc's protocol-level privacy roadmap (APS) if and when it ships.
+ZK solvency attestation for institutions -- the same proof extends to public strategy vaults per \S\ref{sec:yield}, once it exists; ZK-compressed TEE attestation verification; institutional sub-accounts; agent strategy vaults (smart treasuries); migration path to Arc's protocol-level privacy roadmap (APS) if and when it ships.
 
 %=============================================================================
 \section{Conclusion}
