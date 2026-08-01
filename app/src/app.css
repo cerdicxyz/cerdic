@@ -88,23 +88,21 @@
 
 html {
   height: 100%;
-  /* Default page zoom at 89%. Deliberately `zoom`, not
+  /* Default page zoom at 95%. Deliberately `zoom`, not
      `transform: scale()` (cer-perp's own approach): transform is a
      post-layout compositing scale, so 1px hairline borders end up at
-     0.89px and blur/anti-alias inconsistently across edges — confirmed
-     directly in a zoomed screenshot. `zoom` re-runs layout at the scaled
-     size instead, so borders come out crisp.
+     0.95px and blur/anti-alias inconsistently across edges. That was
+     confirmed directly in a zoomed screenshot. `zoom` re-runs layout at
+     the scaled size instead, so borders come out crisp.
 
      `vh` units still need manual compensation, though: unlike real
      browser zoom (which effectively grows the viewport for CSS
-     purposes), the `zoom` PROPERTY does not — `vh`/`vw` are defined by
+     purposes), the `zoom` PROPERTY does not. `vh`/`vw` are defined by
      spec to always resolve against the true device viewport, ignoring
-     any ancestor's `zoom`. Confirmed directly: body's `height: 100vh`
-     measured 765px in an 860px-tall viewport (860 * 0.89), leaving a
-     real, easy-to-miss-against-black gap at the bottom. `calc(100vh /
-     0.89)` below grows body back to 1/0.89 of the real viewport BEFORE
-     zoom shrinks it, so the rendered result exactly fills the screen. */
-  zoom: 0.89;
+     any ancestor's `zoom`. `calc(100vh / 0.95)` below grows body back
+     to 1/0.95 of the real viewport BEFORE zoom shrinks it, so the
+     rendered result exactly fills the screen. */
+  zoom: 0.95;
 }
 
 #root {
@@ -113,7 +111,7 @@ html {
 }
 
 body {
-  height: calc(100vh / 0.89);
+  height: calc(100vh / 0.95);
   overflow: hidden;
   background: var(--color-surface-base);
   color: var(--color-text-primary);
