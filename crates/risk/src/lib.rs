@@ -32,6 +32,8 @@
 
 #![deny(missing_docs)]
 
+pub mod backstop_maker;
+
 use std::collections::HashMap;
 
 use common::types::MarketId;
