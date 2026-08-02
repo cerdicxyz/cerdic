@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod attestation;
+pub mod backstop;
 pub mod book;
 pub mod decrypt;
 pub mod keystore;

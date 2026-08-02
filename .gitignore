@@ -17,3 +17,4 @@ app/vite.config.js
 *.aux
 *.out
 *.toc
+__pycache__/

@@ -50,7 +50,8 @@
 //! middleware (request body size cap, timeout, request tracing) wired
 //! in `main.rs` around this router, not inside the handlers themselves.
 
-use crate::book::{BookSnapshot, NewOrder, OrderBook, OwnerId, TimeInForce};
+use crate::backstop::{BackstopConfig, BACKSTOP_OWNER_ID};
+use crate::book::{BookSnapshot, Fill, NewOrder, OrderBook, OrderId, OwnerId, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
 use crate::market_data::{MarketSnapshot, TradeTape};
@@ -340,6 +341,15 @@ pub struct AppState {
     /// Enclave-only key for deriving `portfolioKey` from an address, see
     /// `portfolio_key`'s doc. Never serialized, never leaves this process.
     portfolio_key_secret: [u8; 32],
+    /// Per-market backstop-maker state (`backstop.rs`): price history,
+    /// inventory, realized PnL. Consulted in `post_order` only for demand
+    /// that would otherwise go permanently unserved (an IOC leftover, or
+    /// a failed FOK), never for GTC/GTT remainders that already rest in
+    /// `books` and can still find a real counterparty later.
+    backstop: Mutex<HashMap<MarketId, crate::backstop::BackstopState>>,
+    /// Shared backstop-maker configuration, same for every market for now
+    /// (per-market tuning is a real gap, not yet wired to anything).
+    backstop_config: BackstopConfig,
 }
 
 impl AppState {
@@ -357,11 +367,13 @@ impl AppState {
             book_updates: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
             batch_proof_keys: crate::proof::BatchProofKeys::shared(),
-            owner_addresses: Mutex::new(HashMap::new()),
+            owner_addresses: Mutex::new(HashMap::from([(BACKSTOP_OWNER_ID, Address::ZERO)])),
             sealed_key: crate::sealed::SealedKey::generate(),
             settlement_signer: crate::settle::SettlementSigner::generate(),
             portfolio_markets: Mutex::new(HashMap::new()),
             portfolio_key_secret,
+            backstop: Mutex::new(HashMap::new()),
+            backstop_config: BackstopConfig::default(),
         }
     }
 
@@ -379,11 +391,13 @@ impl AppState {
             book_updates: Mutex::new(HashMap::new()),
             last_nonce: Mutex::new(HashMap::new()),
             batch_proof_keys: crate::proof::BatchProofKeys::shared(),
-            owner_addresses: Mutex::new(HashMap::new()),
+            owner_addresses: Mutex::new(HashMap::from([(BACKSTOP_OWNER_ID, Address::ZERO)])),
             sealed_key: crate::sealed::SealedKey::from_bytes(&secrets.sealed_key),
             settlement_signer: crate::settle::SettlementSigner::from_bytes(&secrets.settlement_signer_seed),
             portfolio_markets: Mutex::new(HashMap::new()),
             portfolio_key_secret: secrets.portfolio_key_secret,
+            backstop: Mutex::new(HashMap::new()),
+            backstop_config: BackstopConfig::default(),
         }
     }
 }
@@ -467,8 +481,48 @@ async fn post_order(
 
     let mut books = state.books.lock().expect("books mutex poisoned");
     let book = books.entry(payload.market_id.clone()).or_default();
-    let result = book.submit(order, now);
+    let mut result = book.submit(order, now);
     drop(books);
+
+    // Backstop maker: consulted only for demand that would otherwise go
+    // PERMANENTLY unserved -- an IOC leftover (book.rs silently drops it,
+    // nothing rests) or a fully-failed FOK (book.rs already guarantees
+    // nothing matched or rested when `fill_or_kill_failed` is set). GTC/
+    // GTT remainders already rest in `books` and can still find a real
+    // counterparty later, so they're deliberately left untouched here,
+    // see `backstop.rs`'s module docs for why retroactively reconciling
+    // an already-rested order isn't attempted in this pass.
+    let filled_qty: crate::book::Qty = result.fills.iter().map(|f| f.qty).sum();
+    let leftover = payload.qty.saturating_sub(filled_qty);
+    let is_ioc = matches!(payload.tif, crate::book::TimeInForce::ImmediateOrCancel);
+    if (is_ioc && leftover > 0) || result.fill_or_kill_failed {
+        let requested = if result.fill_or_kill_failed { payload.qty } else { leftover };
+        let mut backstop = state.backstop.lock().expect("backstop mutex poisoned");
+        let market_state = backstop.entry(payload.market_id.clone()).or_default();
+        if let Some((price, filled)) = market_state.try_fill(&state.backstop_config, order.side, requested) {
+            // FOK is all-or-nothing by definition: a partial backstop
+            // fill would violate that guarantee just as much as a partial
+            // book fill would, so only accept it here if it covers the
+            // ENTIRE requested quantity. A partial fill is discarded (the
+            // backstop's inventory/PnL are only mutated inside `try_fill`
+            // on an ACCEPTED outcome, so nothing needs unwinding here).
+            let accept = !result.fill_or_kill_failed || filled == requested;
+            if accept {
+                result.fills.push(Fill {
+                    maker_id: OrderId::MAX, // sentinel: no real resting order backs this fill
+                    maker_owner: BACKSTOP_OWNER_ID,
+                    tick: price,
+                    qty: filled,
+                    maker_filled: true,
+                    maker_size_before: filled,
+                    taker_size_before: requested,
+                });
+                if result.fill_or_kill_failed {
+                    result.fill_or_kill_failed = false;
+                }
+            }
+        }
+    }
 
     tracing::info!(
         signer = %signer,
@@ -483,6 +537,19 @@ async fn post_order(
         let tape = market_data.entry(payload.market_id.clone()).or_default();
         for fill in &result.fills {
             tape.record(now, fill.tick, fill.qty);
+        }
+    }
+    // Feed every realized print (including the backstop's own fill, if
+    // any, above) back into the backstop's price history: this market's
+    // own trade prices stand in for a live oracle feed, see backstop.rs's
+    // module docs on why. A market with zero trades still has nothing to
+    // seed from, same limitation as before this loop runs for the first
+    // trade ever on a given market.
+    if !result.fills.is_empty() {
+        let mut backstop = state.backstop.lock().expect("backstop mutex poisoned");
+        let market_state = backstop.entry(payload.market_id.clone()).or_default();
+        for fill in &result.fills {
+            market_state.record_price(fill.tick);
         }
     }
     broadcast_orderbook_update(&state, &payload.market_id);
@@ -1196,6 +1263,129 @@ mod tests {
         let (status, body) = post_json(app, "/order", &envelope_for(crossing, &state)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "filled");
+        assert_eq!(body["fills"], 1);
+    }
+
+    /// The backstop maker (`backstop.rs`), wired into `post_order`: an IOC
+    /// order that the real book can only partially fill would normally
+    /// have its leftover silently dropped (`ioc_drops_unfilled_remainder_
+    /// instead_of_resting`, book.rs's own test for that baseline
+    /// behavior). Once the market has at least one real trade to seed the
+    /// backstop's price history, that leftover gets served instead.
+    #[tokio::test]
+    async fn ioc_leftover_is_served_by_the_backstop_once_the_market_has_a_price() {
+        let state = Arc::new(AppState::new());
+        let app = router(state.clone());
+
+        // Seed price history: one real trade at tick 100, fully consuming
+        // the resting order, so the book is empty again afterward.
+        let maker = wallet();
+        let taker = wallet();
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut seed_trade = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut seed_trade, &taker);
+        let (_, seed_body) = post_json(app.clone(), "/order", &envelope_for(seed_trade, &state)).await;
+        assert_eq!(seed_body["status"], "filled", "the book must be empty again before the real test below");
+
+        // The book is now empty (nothing resting): an IOC order here would
+        // normally fill zero and report nothing left, per book.rs's own
+        // ioc_drops_unfilled_remainder_instead_of_resting. With a seeded
+        // price history, the backstop should serve it instead.
+        let mut ioc = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 3,
+            tif: TimeInForce::ImmediateOrCancel,
+            post_only: false,
+            nonce: 2,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut ioc, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(ioc, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "filled", "the backstop must serve what the empty book could not");
+        assert_eq!(body["fills"], 1, "exactly the backstop's own synthetic fill");
+    }
+
+    /// Same mechanism, the FOK case: `book.rs` guarantees nothing matches
+    /// or rests when a fill-or-kill can't be fully satisfied by real
+    /// liquidity. If the backstop alone can cover the ENTIRE requested
+    /// quantity, the order should succeed instead of being rejected.
+    #[tokio::test]
+    async fn failed_fok_is_rescued_by_the_backstop_when_it_can_cover_the_whole_order() {
+        let state = Arc::new(AppState::new());
+        let app = router(state.clone());
+
+        // Seed price history the same way, then let the book go empty again.
+        let maker = wallet();
+        let taker = wallet();
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut seed_trade = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut seed_trade, &taker);
+        post_json(app.clone(), "/order", &envelope_for(seed_trade, &state)).await;
+
+        // Book is empty: with no backstop this would be Rejected
+        // ("insufficient liquidity for fill-or-kill"), per the existing
+        // book.rs-level fok_fails_whole_order_when_liquidity_insufficient
+        // baseline. The backstop has no notional cap configured by
+        // default, so it can cover the whole request.
+        let mut fok = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 40,
+            tif: TimeInForce::FillOrKill,
+            post_only: false,
+            nonce: 2,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut fok, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(fok, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "filled", "the backstop rescued the whole FOK request");
         assert_eq!(body["fills"], 1);
     }
 
