@@ -1,5 +1,5 @@
-import { useState } from 'react';
 import { IconLayoutGrid, IconList } from '@tabler/icons-react';
+import { usePersistedState } from '../hooks/usePersistedState';
 
 // Open positions, in both a List (table rows) and Box (card grid) mode —
 // a view toggle, not two different data sources. No mock rows: unlike
@@ -30,7 +30,7 @@ type ViewMode = 'list' | 'box';
 const POSITIONS: Position[] = [];
 
 export function PositionsPanel() {
-  const [view, setView] = useState<ViewMode>('list');
+  const [view, setView] = usePersistedState<ViewMode>('positionsView', 'list');
 
   return (
     <div className="flex h-full flex-col">

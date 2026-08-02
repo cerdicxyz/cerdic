@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
 import { MarketBar } from './MarketBar';
+import { usePersistedState } from '../hooks/usePersistedState';
 
 // Chart panel, structured like the reference (Lighter's own chart widget):
 // a market stat row, sub-tabs, timeframe pills, a chart-type toggle, then
@@ -36,7 +37,7 @@ function formatOhlc(candle: OhlcHover) {
 export function ChartPanel() {
   const [subTab, setSubTab] = useState<SubTab>('price');
   const [chartType, setChartType] = useState<ChartType>('original');
-  const [timeframe, setTimeframe] = useState<Timeframe>('5m');
+  const [timeframe, setTimeframe] = usePersistedState<Timeframe>('chartTimeframe', '5m');
   const [hover, setHover] = useState<OhlcHover | null>(null);
 
   const handleHover = useCallback((candle: OhlcHover | null) => setHover(candle), []);

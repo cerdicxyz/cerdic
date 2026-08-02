@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { IconSettings } from '@tabler/icons-react';
+import { usePersistedState } from '../hooks/usePersistedState';
 
 // Settings popover, anchored under Header's gear icon. Solid
 // --color-surface-overlay background, not the translucent
@@ -8,10 +9,10 @@ import { IconSettings } from '@tabler/icons-react';
 // not embedded in the grid layout, so a translucent surface would let
 // whatever's underneath show through.
 //
-// Every toggle here is a real, working client-only preference (kept in
-// component state, nothing pretending to be backend-wired) — no fake
-// "connect to sync settings" affordance, since there's no account system
-// to sync to yet.
+// Every toggle here is a real, working client-only preference, persisted
+// to localStorage via usePersistedState (hooks/usePersistedState.ts) so it
+// survives a refresh — no fake "connect to sync settings" affordance,
+// since there's no account system to sync to yet.
 
 const ICON_SIZE = 16;
 const ICON_STROKE = 1.75;
@@ -36,8 +37,8 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (che
 
 export function SettingsDropdown() {
   const [open, setOpen] = useState(false);
-  const [confirmOrders, setConfirmOrders] = useState(true);
-  const [fillSound, setFillSound] = useState(false);
+  const [confirmOrders, setConfirmOrders] = usePersistedState('confirmOrders', true);
+  const [fillSound, setFillSound] = usePersistedState('fillSound', false);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
