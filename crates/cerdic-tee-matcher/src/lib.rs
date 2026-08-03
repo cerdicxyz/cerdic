@@ -14,6 +14,7 @@ pub mod keystore;
 pub mod kms;
 pub mod logging;
 pub mod market_data;
+pub mod oracle;
 pub mod proof;
 pub mod sealed;
 pub mod settle;
