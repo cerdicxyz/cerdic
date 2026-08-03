@@ -52,6 +52,29 @@ contract RiskMonitor is IRiskMonitor {
     bytes32[] internal _markets;
     mapping(bytes32 => bool) internal _marketRegistered;
 
+    /// @notice Which execution path a market runs on. `Clob` (the zero
+    ///         value) is the default for every newly registered market,
+    ///         matching what every market already does today: a
+    ///         continuously-matched order book, with the kernel-owned
+    ///         backstop maker (crates/cerdic-tee-matcher::backstop)
+    ///         resting inside that same book as a floor, not a separate
+    ///         mode. `BackstopOnly` and `Rfq` are named here as the real
+    ///         open question this session's research left (does a thin
+    ///         FX pair want continuous book liquidity or a dealer-quoted
+    ///         RFQ path), not yet consumed by anything: the TEE matcher
+    ///         has no RPC client to read this on-chain value with, the
+    ///         same infrastructure gap documented in backstop.rs and
+    ///         api.rs's module docs for the missing oracle feed. This is
+    ///         the canonical, governance-controlled decision surface for
+    ///         that question, not a behavior switch yet.
+    enum ExecutionMode {
+        Clob,
+        BackstopOnly,
+        Rfq
+    }
+
+    mapping(bytes32 => ExecutionMode) public executionMode;
+
     /// @dev Latest off-chain-computed full portfolio margin per trader, TEE-attested.
     struct PortfolioAttestation {
         uint256 requirement;
@@ -66,6 +89,7 @@ contract RiskMonitor is IRiskMonitor {
     event MarkPriceOracleUpdated(address indexed oracle);
     event AttestationRouterUpdated(address indexed router);
     event MarketRegistered(bytes32 indexed marketId);
+    event ExecutionModeSet(bytes32 indexed marketId, ExecutionMode mode);
     event PortfolioMarginAttested(address indexed trader, uint256 requirement, uint64 expiry, address indexed attester);
 
     error NotAdmin();
@@ -78,6 +102,7 @@ contract RiskMonitor is IRiskMonitor {
     error AttestationRouterNotSet();
     error NotAuthorizedAttester();
     error AttestationAlreadyExpired();
+    error MarketNotRegistered(bytes32 marketId);
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
@@ -231,6 +256,15 @@ contract RiskMonitor is IRiskMonitor {
 
     function registeredMarkets() external view returns (bytes32[] memory) {
         return _markets;
+    }
+
+    /// @notice Sets which execution path `marketId` runs on. Only ever
+    ///         callable on an already-registered market: the mode is a
+    ///         property OF a market, not a way to pre-declare one.
+    function setExecutionMode(bytes32 marketId, ExecutionMode mode) external onlyAdmin {
+        if (!_marketRegistered[marketId]) revert MarketNotRegistered(marketId);
+        executionMode[marketId] = mode;
+        emit ExecutionModeSet(marketId, mode);
     }
 
     function _withdrawValueUsd(CollateralEngine collateral, address asset, uint256 amount)

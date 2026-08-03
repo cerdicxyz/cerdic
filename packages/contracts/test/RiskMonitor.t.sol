@@ -657,4 +657,38 @@ contract RiskMonitorTest is Test {
         assertTrue(breached, "attested portfolio requirement breaches C_eff");
         assertTrue(account.accounts(trader), "frozen off the attested requirement");
     }
+
+    // ---------------------------------------------------------------------
+    // executionMode: the per-market CLOB/backstop/RFQ decision surface.
+    // ---------------------------------------------------------------------
+
+    /// @notice Every registered market defaults to Clob (the zero value),
+    ///         matching what every market already does today with no
+    ///         explicit configuration needed.
+    function test_NewlyRegisteredMarketDefaultsToClobMode() public view {
+        assertEq(uint8(monitor.executionMode(MARKET_ID)), uint8(RiskMonitor.ExecutionMode.Clob));
+    }
+
+    function test_AdminCanSetExecutionMode() public {
+        vm.expectEmit(true, false, false, true, address(monitor));
+        emit RiskMonitor.ExecutionModeSet(MARKET_ID, RiskMonitor.ExecutionMode.Rfq);
+
+        vm.prank(admin);
+        monitor.setExecutionMode(MARKET_ID, RiskMonitor.ExecutionMode.Rfq);
+
+        assertEq(uint8(monitor.executionMode(MARKET_ID)), uint8(RiskMonitor.ExecutionMode.Rfq));
+    }
+
+    function test_SetExecutionModeRevertsForAnUnregisteredMarket() public {
+        bytes32 unregistered = keccak256("NEVER-REGISTERED");
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(RiskMonitor.MarketNotRegistered.selector, unregistered));
+        monitor.setExecutionMode(unregistered, RiskMonitor.ExecutionMode.BackstopOnly);
+    }
+
+    function test_SetExecutionModeGatedToAdmin() public {
+        vm.prank(stranger);
+        vm.expectRevert(RiskMonitor.NotAdmin.selector);
+        monitor.setExecutionMode(MARKET_ID, RiskMonitor.ExecutionMode.BackstopOnly);
+    }
 }
