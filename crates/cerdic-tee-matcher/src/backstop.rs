@@ -207,11 +207,22 @@ impl BackstopState {
     }
 
     /// Evaluates all three guards (TWAP pricing via [`quote`](Self::quote),
-    /// notional cap, last-look staleness) and, if accepted, updates
-    /// `inventory`. Returns `None` on rejection (last-look tripped, or no
-    /// price history yet) rather than a zero-size accept, so callers don't
-    /// need to distinguish "filled nothing" from "rejected."
-    pub fn try_fill(&mut self, cfg: &BackstopConfig, side: Side, requested_qty: Qty) -> Option<(Tick, Qty)> {
+    /// notional cap, last-look staleness) WITHOUT mutating any state.
+    /// Returns `None` on rejection (last-look tripped, no price history
+    /// yet, or the cap reduces the fill to zero) rather than a zero-size
+    /// accept, so callers don't need to distinguish "filled nothing" from
+    /// "rejected." Callers that only want to accept a fill covering the
+    /// FULL requested quantity (FOK, or rescuing a GTC/GTT remainder,
+    /// where there is no partial-reduce operation to fall back on) should
+    /// check `filled == requested_qty` on the result BEFORE calling
+    /// [`commit_fill`](Self::commit_fill), not after, so a partial quote
+    /// that gets discarded never touches `inventory` in the first place.
+    pub fn quote_and_check(
+        &self,
+        cfg: &BackstopConfig,
+        side: Side,
+        requested_qty: Qty,
+    ) -> Option<(Tick, Qty)> {
         let price = self.quote(cfg, side)?;
 
         let live_print = *self.history.back()?;
@@ -230,11 +241,28 @@ impl BackstopState {
             return None;
         }
 
+        Some((price, qty))
+    }
+
+    /// Applies the inventory side effect of a fill this maker just took,
+    /// `side` and `qty` as already decided by [`quote_and_check`]. Kept
+    /// separate from the read-only check specifically so a caller can
+    /// discard a partial quote it doesn't want (FOK, GTC/GTT rescue)
+    /// without ever mutating state for a fill that never actually happens.
+    pub fn commit_fill(&mut self, side: Side, qty: Qty) {
         self.inventory = match side {
             Side::Long => self.inventory.saturating_sub(qty as i64),
             Side::Short => self.inventory.saturating_add(qty as i64),
         };
+    }
 
+    /// Convenience: check and commit in one call, for callers happy to
+    /// accept whatever size the guards allow (a partial fill is a normal,
+    /// desired outcome for them). Equivalent to `quote_and_check` followed
+    /// by `commit_fill` on an accept.
+    pub fn try_fill(&mut self, cfg: &BackstopConfig, side: Side, requested_qty: Qty) -> Option<(Tick, Qty)> {
+        let (price, qty) = self.quote_and_check(cfg, side, requested_qty)?;
+        self.commit_fill(side, qty);
         Some((price, qty))
     }
 
@@ -365,5 +393,37 @@ mod tests {
         state.record_price(90); // price falls: the maker's short position profited
         assert!(state.cumulative_pnl > 0);
         assert_eq!(state.breakeven_subsidy_needed(), 0);
+    }
+
+    #[test]
+    fn quote_and_check_never_mutates_inventory_a_caller_can_still_discard_the_result() {
+        let mut state = BackstopState::default();
+        seed(&mut state, &[100; 20]);
+        let cfg = BackstopConfig { notional_cap: 3, ..BackstopConfig::default() };
+
+        // Requesting more than the cap allows: quote_and_check reports the
+        // capped (partial) size, but a caller enforcing all-or-nothing
+        // (FOK, GTC/GTT rescue) would see 3 != 10 and discard it -- this
+        // must be possible WITHOUT inventory having moved at all, unlike
+        // the old try_fill-only API where the mutation already happened
+        // by the time the caller could decide to discard.
+        let (_, filled) = state.quote_and_check(&cfg, Side::Long, 10).unwrap();
+        assert_eq!(filled, 3, "capped below the full request");
+        assert_eq!(
+            state.inventory, 0,
+            "a caller that hasn't called commit_fill yet must see untouched state"
+        );
+    }
+
+    #[test]
+    fn commit_fill_is_the_only_thing_that_actually_moves_inventory() {
+        let mut state = BackstopState::default();
+        seed(&mut state, &[100; 20]);
+        let cfg = BackstopConfig::default();
+
+        let (_, filled) = state.quote_and_check(&cfg, Side::Long, 10).unwrap();
+        assert_eq!(state.inventory, 0, "check alone must not move it");
+        state.commit_fill(Side::Long, filled);
+        assert_eq!(state.inventory, -10, "commit is what actually applies it");
     }
 }

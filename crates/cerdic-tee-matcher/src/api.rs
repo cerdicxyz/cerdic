@@ -484,43 +484,96 @@ async fn post_order(
     let mut result = book.submit(order, now);
     drop(books);
 
-    // Backstop maker: consulted only for demand that would otherwise go
+    // Backstop maker: consulted for demand that would otherwise go
     // PERMANENTLY unserved -- an IOC leftover (book.rs silently drops it,
-    // nothing rests) or a fully-failed FOK (book.rs already guarantees
-    // nothing matched or rested when `fill_or_kill_failed` is set). GTC/
-    // GTT remainders already rest in `books` and can still find a real
-    // counterparty later, so they're deliberately left untouched here,
-    // see `backstop.rs`'s module docs for why retroactively reconciling
-    // an already-rested order isn't attempted in this pass.
+    // nothing rests), a fully-failed FOK (book.rs already guarantees
+    // nothing matched or rested when `fill_or_kill_failed` is set), or a
+    // GTC/GTT remainder that just started resting in `books` (still
+    // reachable, but only rescued here if the backstop can cover it
+    // WHOLE, see the resting branch below for why).
+    //
+    // FOK and the GTC/GTT rescue are both all-or-nothing: `quote_and_check`
+    // is a pure read (`backstop.rs`'s doc on why), so a quote that doesn't
+    // cover the full requested quantity can be discarded WITHOUT ever
+    // touching `inventory`, unlike the IOC path below, which is happy to
+    // accept a real partial fill.
     let filled_qty: crate::book::Qty = result.fills.iter().map(|f| f.qty).sum();
     let leftover = payload.qty.saturating_sub(filled_qty);
     let is_ioc = matches!(payload.tif, crate::book::TimeInForce::ImmediateOrCancel);
+
     if (is_ioc && leftover > 0) || result.fill_or_kill_failed {
         let requested = if result.fill_or_kill_failed { payload.qty } else { leftover };
         let mut backstop = state.backstop.lock().expect("backstop mutex poisoned");
         let market_state = backstop.entry(payload.market_id.clone()).or_default();
-        if let Some((price, filled)) = market_state.try_fill(&state.backstop_config, order.side, requested) {
-            // FOK is all-or-nothing by definition: a partial backstop
-            // fill would violate that guarantee just as much as a partial
-            // book fill would, so only accept it here if it covers the
-            // ENTIRE requested quantity. A partial fill is discarded (the
-            // backstop's inventory/PnL are only mutated inside `try_fill`
-            // on an ACCEPTED outcome, so nothing needs unwinding here).
-            let accept = !result.fill_or_kill_failed || filled == requested;
-            if accept {
-                result.fills.push(Fill {
-                    maker_id: OrderId::MAX, // sentinel: no real resting order backs this fill
-                    maker_owner: BACKSTOP_OWNER_ID,
-                    tick: price,
-                    qty: filled,
-                    maker_filled: true,
-                    maker_size_before: filled,
-                    taker_size_before: requested,
-                });
-                if result.fill_or_kill_failed {
-                    result.fill_or_kill_failed = false;
-                }
+
+        let accepted = if result.fill_or_kill_failed {
+            // All-or-nothing: peek first, only commit (mutate inventory)
+            // if the quote covers the entire requested quantity.
+            market_state.quote_and_check(&state.backstop_config, order.side, requested).and_then(
+                |(price, filled)| {
+                    (filled == requested).then(|| {
+                        market_state.commit_fill(order.side, filled);
+                        (price, filled)
+                    })
+                },
+            )
+        } else {
+            // IOC: a genuine partial fill is a fine, desired outcome.
+            market_state.try_fill(&state.backstop_config, order.side, requested)
+        };
+
+        if let Some((price, filled)) = accepted {
+            result.fills.push(Fill {
+                maker_id: OrderId::MAX, // sentinel: no real resting order backs this fill
+                maker_owner: BACKSTOP_OWNER_ID,
+                tick: price,
+                qty: filled,
+                maker_filled: true,
+                maker_size_before: filled,
+                taker_size_before: requested,
+            });
+            if result.fill_or_kill_failed {
+                result.fill_or_kill_failed = false;
             }
+        }
+    } else if let Some(resting_id) = result.resting_id {
+        // GTC/GTT: the remainder is already resting in `books`. There is
+        // no partial-reduce operation on a live resting order (only a
+        // full `OrderBook::cancel`), so a partial backstop fill here
+        // would mean two sources of truth for the same order's remaining
+        // size. Only ever rescue it if the backstop can cover the ENTIRE
+        // resting quantity in one shot, cancelling the resting order and
+        // replacing it with a single backstop fill.
+        let resting_qty = result.resting_qty;
+        let mut backstop = state.backstop.lock().expect("backstop mutex poisoned");
+        let market_state = backstop.entry(payload.market_id.clone()).or_default();
+        let accepted = market_state
+            .quote_and_check(&state.backstop_config, order.side, resting_qty)
+            .and_then(|(price, filled)| {
+                (filled == resting_qty).then(|| {
+                    market_state.commit_fill(order.side, filled);
+                    (price, filled)
+                })
+            });
+        drop(backstop);
+
+        if let Some((price, filled)) = accepted {
+            let mut books = state.books.lock().expect("books mutex poisoned");
+            let book = books.entry(payload.market_id.clone()).or_default();
+            book.cancel(resting_id);
+            drop(books);
+
+            result.fills.push(Fill {
+                maker_id: OrderId::MAX,
+                maker_owner: BACKSTOP_OWNER_ID,
+                tick: price,
+                qty: filled,
+                maker_filled: true,
+                maker_size_before: filled,
+                taker_size_before: resting_qty,
+            });
+            result.resting_id = None;
+            result.resting_qty = 0;
         }
     }
 
@@ -1387,6 +1440,114 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "filled", "the backstop rescued the whole FOK request");
         assert_eq!(body["fills"], 1);
+    }
+
+    /// GTC/GTT rescue: a remainder that would normally rest in the book
+    /// gets served by the backstop instead when it can cover the entire
+    /// resting quantity in one shot, and the just-rested order is
+    /// cancelled so it doesn't ALSO sit there waiting for a real
+    /// counterparty on top of what the backstop already filled.
+    #[tokio::test]
+    async fn gtc_remainder_is_rescued_by_the_backstop_when_it_can_cover_the_whole_remainder() {
+        let state = Arc::new(AppState::new());
+        let app = router(state.clone());
+
+        // Seed price history the same way, then let the book go empty again.
+        let maker = wallet();
+        let taker = wallet();
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut seed_trade = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut seed_trade, &taker);
+        post_json(app.clone(), "/order", &envelope_for(seed_trade, &state)).await;
+
+        // Book is empty: a GTC order here would normally rest in full.
+        // With a seeded price history and no notional cap configured, the
+        // backstop can cover the whole thing instead.
+        let mut gtc = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 7,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 2,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut gtc, &taker);
+        let (status, body) = post_json(app.clone(), "/order", &envelope_for(gtc, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["status"], "filled",
+            "the backstop rescued the whole GTC remainder instead of resting it"
+        );
+        assert_eq!(body["fills"], 1);
+
+        // Confirm nothing was left resting: the book should report no depth.
+        let snapshot_response = app
+            .oneshot(axum::http::Request::get("/orderbook/0xEURCUSDC").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = snapshot_response.into_body().collect().await.unwrap().to_bytes();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            snapshot["bids"].as_array().unwrap().is_empty(),
+            "the rescued order must not ALSO be resting"
+        );
+    }
+
+    /// When the backstop declines entirely (here: a market with no price
+    /// history yet, `quote_and_check` returns `None` deterministically, no
+    /// TWAP to center a quote on), a GTC/GTT remainder must rest exactly
+    /// as it would with no backstop wired at all. This is what proves
+    /// `quote_and_check` returning `None` never mutates `inventory` and
+    /// never touches the already-rested order, the base case every other
+    /// backstop test builds on.
+    #[tokio::test]
+    async fn gtc_remainder_rests_normally_when_the_backstop_has_no_price_history_yet() {
+        let state = Arc::new(AppState::new());
+        let app = router(state.clone());
+        let taker = wallet();
+
+        // A brand-new market: no trade has EVER happened on it, so the
+        // backstop has zero price history and cannot quote at all.
+        let mut gtc = OrderPayload {
+            market_id: "0xFRESHMARKET".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 7,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut gtc, &taker);
+        let (status, body) = post_json(app, "/order", &envelope_for(gtc, &state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["status"], "resting",
+            "no price history means the backstop cannot quote, so it rests"
+        );
     }
 
     /// Unlike ZK proof generation (threshold-gated), settlement is attempted for
