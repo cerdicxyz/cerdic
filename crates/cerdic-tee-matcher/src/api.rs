@@ -51,7 +51,7 @@
 //! in `main.rs` around this router, not inside the handlers themselves.
 
 use crate::backstop::{BackstopConfig, BACKSTOP_OWNER_ID};
-use crate::book::{BookSnapshot, Fill, NewOrder, OrderBook, OrderId, OwnerId, TimeInForce};
+use crate::book::{BookSnapshot, Fill, NewOrder, OrderBook, OrderId, OwnerId, Tick, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
 use crate::market_data::{MarketSnapshot, TradeTape};
@@ -350,13 +350,15 @@ pub struct AppState {
     /// Shared backstop-maker configuration, same for every market for now
     /// (per-market tuning is a real gap, not yet wired to anything).
     backstop_config: BackstopConfig,
-    /// Which Pyth feed (`oracle.rs`) prices a given market, if any. Empty
-    /// by default: a market with no entry here just keeps today's
+    /// Which Pyth feed id (`oracle.rs`) prices a given market, if any.
+    /// Empty by default: a market with no entry here just keeps today's
     /// behavior unchanged (the backstop's TWAP runs off local trade
     /// history, `/liquidation-check` stands in with the sealed entry
     /// price), this is an explicit per-market opt-in, not a silent
-    /// behavior change for markets nobody's configured yet.
-    oracle_feed_mapping: HashMap<MarketId, &'static str>,
+    /// behavior change for markets nobody's configured yet. Populated via
+    /// `configure_oracle_feed`, real market-to-feed pairings are
+    /// deployment config, see that method's doc.
+    oracle_feed_mapping: HashMap<MarketId, String>,
 }
 
 impl AppState {
@@ -414,6 +416,49 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl AppState {
+    /// Opts one market into live Pyth pricing: `poll_oracle_prices` will
+    /// fetch `feed_id` for `market_id` and feed it into that market's
+    /// backstop TWAP going forward. Called at startup, before the state is
+    /// wrapped in `Arc` and handed to the router, real market-to-feed
+    /// pairings are deployment config (`main.rs`), not something this
+    /// crate can hardcode: `MarketId` is an opaque, on-chain-assigned
+    /// `bytes32` per market, this crate has no registry mapping it back to
+    /// a real trading pair.
+    pub fn configure_oracle_feed(&mut self, market_id: MarketId, feed_id: impl Into<String>) {
+        self.oracle_feed_mapping.insert(market_id, feed_id.into());
+    }
+
+    /// Fetches a fresh Pyth price for every market `configure_oracle_feed`
+    /// was called for, and records each into that market's
+    /// [`backstop::BackstopState`] TWAP (`record_price`), the same call
+    /// `post_order`'s fill loop already makes for realized trade prints.
+    /// This is additive, not a replacement: a market's backstop quote is
+    /// centered on the trailing mean of BOTH sources once both are
+    /// flowing, real trades AND the oracle keep it live even through a
+    /// quiet market with no trades at all, closing the exact gap
+    /// `backstop.rs`'s module docs name (a market with zero trades has no
+    /// price to quote from). Meant to be called on a fixed interval by a
+    /// background task (`main.rs`), not per-request: hammering Hermes on
+    /// every `/order` call would be wasteful and add latency to the
+    /// matching hot path for no benefit over a periodic poll.
+    pub async fn poll_oracle_prices(&self) {
+        if self.oracle_feed_mapping.is_empty() {
+            return;
+        }
+        let market_ids: Vec<MarketId> = self.oracle_feed_mapping.keys().cloned().collect();
+        let prices = live_mark_prices(self, &market_ids).await;
+        if prices.is_empty() {
+            return;
+        }
+        let mut backstop = self.backstop.lock().expect("backstop mutex poisoned");
+        for (market_id, price) in prices {
+            let tick = price as Tick;
+            backstop.entry(market_id).or_default().record_price(tick);
+        }
     }
 }
 
@@ -988,8 +1033,8 @@ async fn load_portfolio_state(state: &AppState, portfolio_key: FixedBytes<32>) -
 async fn live_mark_prices(state: &AppState, market_ids: &[MarketId]) -> HashMap<MarketId, u128> {
     let mut feed_to_market = HashMap::new();
     for market_id in market_ids {
-        if let Some(&feed_id) = state.oracle_feed_mapping.get(market_id) {
-            feed_to_market.insert(feed_id, market_id.clone());
+        if let Some(feed_id) = state.oracle_feed_mapping.get(market_id) {
+            feed_to_market.insert(feed_id.as_str(), market_id.clone());
         }
     }
     if feed_to_market.is_empty() {
@@ -1028,25 +1073,37 @@ async fn live_mark_prices(state: &AppState, market_ids: &[MarketId]) -> HashMap<
 /// upgrade, never a regression: a market with no configured oracle feed
 /// behaves EXACTLY as it did before `oracle.rs` existed.
 ///
-/// KNOWN, PRE-EXISTING, SEPARATE BUG (found while adding this function's
-/// tests, not introduced by the live-price change above): `size` and
-/// `price` both need to be 1e18-scaled for `risk::RiskMonitor` to return a
-/// meaningful number, matching `RiskMonitor.sol`'s on-chain convention,
-/// but `PortfolioMarketState.signed_size`/`entry_price` come straight from
-/// `book.rs`'s raw, UNSCALED `Tick`/`Qty`. For any realistically small
-/// position this silently floors `margin_requirement` to zero, a
-/// liquidation check that can never fire. Not fixed here: it needs
-/// verifying what scale `sealed.collateral` actually carries first (this
-/// function compares `margin_requirement` against `effective_collateral`
-/// directly), a separate, more invasive investigation than wiring an
-/// oracle price in.
+/// FIXED, formerly a real bug (found while adding this function's tests):
+/// `risk::RiskMonitor::current_margin_requirement` divides its product by
+/// `SCALE * BPS_DENOMINATOR`, needing `size` 1e18-scaled to return a
+/// meaningful number, matching `RiskMonitor.sol`'s on-chain convention.
+/// `PortfolioMarketState.signed_size`/`entry_price`/`sealed.collateral`
+/// are all instead `book.rs`'s raw, UNSCALED convention throughout: this
+/// crate's own settlement path (`required_margin`, `collateral_delta`,
+/// verified in `settle.rs`/`SettlementEngine.sol`, which never cross-checks
+/// a sealed position's collateral against `CollateralEngine`'s real
+/// 1e18-scaled deposits) is internally consistent in unscaled units end to
+/// end; only this call into `risk::RiskMonitor` was mixing conventions.
+///
+/// Rather than duplicate `current_margin_requirement`'s formula locally
+/// (real drift risk against the Solidity-mirrored source of truth this
+/// function's own module doc calls out above), `size` alone is pre-scaled
+/// by `risk::SCALE`: the formula's `size * price * MMR_BPS / (SCALE *
+/// BPS_DENOMINATOR)` becomes `(size*SCALE) * price * MMR_BPS / (SCALE *
+/// BPS_DENOMINATOR) == size * price * MMR_BPS / BPS_DENOMINATOR`, the
+/// `SCALE` cancels exactly, leaving a plain unscaled result directly
+/// comparable to `effective_collateral`'s own unscaled convention, no
+/// change needed there.
 fn compute_margin(
     market_states: &[PortfolioMarketState],
     live_prices: &HashMap<MarketId, u128>,
 ) -> Result<risk::MarginResult, risk::RiskError> {
     let positions: Vec<risk::PositionState> = market_states
         .iter()
-        .map(|m| risk::PositionState { market_id: m.market_id.clone(), size: m.signed_size })
+        .map(|m| risk::PositionState {
+            market_id: m.market_id.clone(),
+            size: m.signed_size.saturating_mul(risk::SCALE as i128),
+        })
         .collect();
     let mark_prices: HashMap<MarketId, u128> = market_states
         .iter()
@@ -1925,21 +1982,13 @@ mod tests {
         assert_eq!(body["fills"], 1);
     }
 
-    // NOTE: these three tests deliberately assert PROPORTIONAL relationships
-    // (live price produces exactly double/some multiple of what entry price
-    // alone would), not absolute dollar figures. Writing this test exposed a
-    // real, PRE-EXISTING, separate bug: risk::RiskMonitor::compute_margin
-    // expects both `size` and `price` 1e18-scaled (matching RiskMonitor.sol's
-    // on-chain convention), but PortfolioMarketState's `signed_size`/
-    // `entry_price` come straight from book.rs's raw, UNSCALED Tick/Qty
-    // (`backstop.rs`'s module docs cover why book.rs isn't 1e18 fixed point).
-    // For any realistically small position this silently floors the
-    // margin requirement to zero, a liquidation check that can never fire.
-    // That bug predates this change and isn't specific to the live-price
-    // wiring below (entry_price alone hits it too), so it's flagged here,
-    // not fixed here: reconciling it needs verifying what scale
-    // `sealed.collateral` actually carries first, a separate, more
-    // invasive investigation than wiring an oracle price in.
+    // The formerly-PRE-EXISTING scale bug (`risk::RiskMonitor` needing a
+    // 1e18-scaled `size` to produce a nonzero result against unscaled
+    // `book.rs`-convention prices) is fixed, `compute_margin`'s doc comment
+    // above covers the exact scaling identity. These pin the real, absolute
+    // dollar figures now, not just proportional relationships: signed_size
+    // 10 at price 100 is `10 * 100 * MMR_BPS(300) / BPS_DENOMINATOR(10_000)
+    // == 30`.
 
     #[test]
     fn compute_margin_falls_back_to_entry_price_when_no_live_price_available() {
@@ -1950,6 +1999,7 @@ mod tests {
             collateral: I256::try_from(1_000i64).unwrap(),
         }];
         let with_entry_price = compute_margin(&states, &HashMap::new()).unwrap();
+        assert_eq!(with_entry_price.margin_requirement, 30);
         let with_matching_live_price =
             compute_margin(&states, &HashMap::from([("0xEURCUSDC".to_string(), 100u128)])).unwrap();
         assert_eq!(
@@ -1967,8 +2017,10 @@ mod tests {
             collateral: I256::try_from(1_000i64).unwrap(),
         }];
         let at_entry_price = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
+        assert_eq!(at_entry_price, 30);
         let live_prices = HashMap::from([("0xEURCUSDC".to_string(), 200u128)]); // live: now $200, double
         let at_live_price = compute_margin(&states, &live_prices).unwrap().margin_requirement;
+        assert_eq!(at_live_price, 60);
         assert_eq!(at_live_price, at_entry_price * 2, "double the price must double the requirement");
     }
 
@@ -1991,6 +2043,7 @@ mod tests {
         // Only EURC/USDC has a live price (double its entry price); BTC/USDC
         // must still fall back to its own entry price untouched.
         let baseline = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
+        assert_eq!(baseline, 30 + 1_500, "EURC leg (10*100*300/10_000) + BTC leg (1*50_000*300/10_000)");
         let live_prices = HashMap::from([("0xEURCUSDC".to_string(), 200u128)]);
         let overridden = compute_margin(&states, &live_prices).unwrap().margin_requirement;
 
@@ -2016,6 +2069,28 @@ mod tests {
         // configured a feed for.
         let prices = live_mark_prices(&state, &["0xEURCUSDC".to_string(), "0xBTCUSDC".to_string()]).await;
         assert!(prices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_oracle_prices_is_a_no_op_with_nothing_configured() {
+        let state = AppState::new();
+        // Same short-circuit as live_mark_prices above, but through the
+        // path main.rs's background poller actually calls: no configured
+        // feed must never attempt a Hermes request.
+        state.poll_oracle_prices().await;
+        let backstop = state.backstop.lock().unwrap();
+        assert!(backstop.is_empty(), "nothing configured means no backstop state gets created either");
+    }
+
+    #[test]
+    fn configure_oracle_feed_registers_the_market_in_the_mapping() {
+        let mut state = AppState::new();
+        assert!(state.oracle_feed_mapping.is_empty());
+        state.configure_oracle_feed("0xEURCUSDC".to_string(), crate::oracle::FEED_EUR_USD);
+        assert_eq!(
+            state.oracle_feed_mapping.get("0xEURCUSDC").map(String::as_str),
+            Some(crate::oracle::FEED_EUR_USD)
+        );
     }
 
     #[tokio::test]
