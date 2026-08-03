@@ -350,6 +350,13 @@ pub struct AppState {
     /// Shared backstop-maker configuration, same for every market for now
     /// (per-market tuning is a real gap, not yet wired to anything).
     backstop_config: BackstopConfig,
+    /// Which Pyth feed (`oracle.rs`) prices a given market, if any. Empty
+    /// by default: a market with no entry here just keeps today's
+    /// behavior unchanged (the backstop's TWAP runs off local trade
+    /// history, `/liquidation-check` stands in with the sealed entry
+    /// price), this is an explicit per-market opt-in, not a silent
+    /// behavior change for markets nobody's configured yet.
+    oracle_feed_mapping: HashMap<MarketId, &'static str>,
 }
 
 impl AppState {
@@ -374,6 +381,7 @@ impl AppState {
             portfolio_key_secret,
             backstop: Mutex::new(HashMap::new()),
             backstop_config: BackstopConfig::default(),
+            oracle_feed_mapping: HashMap::new(),
         }
     }
 
@@ -398,6 +406,7 @@ impl AppState {
             portfolio_key_secret: secrets.portfolio_key_secret,
             backstop: Mutex::new(HashMap::new()),
             backstop_config: BackstopConfig::default(),
+            oracle_feed_mapping: HashMap::new(),
         }
     }
 }
@@ -965,6 +974,45 @@ async fn load_portfolio_state(state: &AppState, portfolio_key: FixedBytes<32>) -
     result
 }
 
+/// Fetches a live Pyth price (`oracle.rs`) for every market in
+/// `market_ids` that `state.oracle_feed_mapping` has a feed configured
+/// for, converted to this crate's plain tick convention
+/// (`oracle::pyth_price_to_tick`). A market with no configured feed
+/// simply doesn't appear in the result, same posture `compute_margin`
+/// below already has for missing data: fall back, don't fail the whole
+/// check. A Hermes request failure is logged and treated as "no live
+/// prices available this call," not propagated as an error, for the
+/// same reason: `/liquidation-check`/`/liquidate` must degrade to the
+/// sealed-entry-price stand-in, never fail outright, when the oracle is
+/// unreachable.
+async fn live_mark_prices(state: &AppState, market_ids: &[MarketId]) -> HashMap<MarketId, u128> {
+    let mut feed_to_market = HashMap::new();
+    for market_id in market_ids {
+        if let Some(&feed_id) = state.oracle_feed_mapping.get(market_id) {
+            feed_to_market.insert(feed_id, market_id.clone());
+        }
+    }
+    if feed_to_market.is_empty() {
+        return HashMap::new();
+    }
+
+    let feed_ids: Vec<&str> = feed_to_market.keys().copied().collect();
+    match crate::oracle::fetch_latest_prices(&feed_ids).await {
+        Ok(prices) => prices
+            .into_iter()
+            .filter_map(|(feed_id, price)| {
+                feed_to_market.get(feed_id.as_str()).map(|market_id| {
+                    (market_id.clone(), crate::oracle::pyth_price_to_tick(price.price, price.expo) as u128)
+                })
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "oracle fetch failed, falling back to sealed entry price for mark price");
+            HashMap::new()
+        }
+    }
+}
+
 /// Computes `M` for a loaded portfolio state via `risk::RiskMonitor`, the
 /// isolated maintenance-margin formula that's actually mirrored on the
 /// Solidity side (`RiskMonitor.sol`, cross-checked by
@@ -973,13 +1021,40 @@ async fn load_portfolio_state(state: &AppState, portfolio_key: FixedBytes<32>) -
 /// off-chain computed") but belongs as a `RiskMonitor.sol` upgrade with
 /// its Rust side mirroring THAT, not a Rust-only formula the contract
 /// merely trusts — tracked as a follow-up, not invented here.
-fn compute_margin(market_states: &[PortfolioMarketState]) -> Result<risk::MarginResult, risk::RiskError> {
+///
+/// `live_prices` (`live_mark_prices`, above) takes priority per-market
+/// when present; a market absent from it falls back to its own sealed
+/// entry price, same stand-in as before this existed. This is a strict
+/// upgrade, never a regression: a market with no configured oracle feed
+/// behaves EXACTLY as it did before `oracle.rs` existed.
+///
+/// KNOWN, PRE-EXISTING, SEPARATE BUG (found while adding this function's
+/// tests, not introduced by the live-price change above): `size` and
+/// `price` both need to be 1e18-scaled for `risk::RiskMonitor` to return a
+/// meaningful number, matching `RiskMonitor.sol`'s on-chain convention,
+/// but `PortfolioMarketState.signed_size`/`entry_price` come straight from
+/// `book.rs`'s raw, UNSCALED `Tick`/`Qty`. For any realistically small
+/// position this silently floors `margin_requirement` to zero, a
+/// liquidation check that can never fire. Not fixed here: it needs
+/// verifying what scale `sealed.collateral` actually carries first (this
+/// function compares `margin_requirement` against `effective_collateral`
+/// directly), a separate, more invasive investigation than wiring an
+/// oracle price in.
+fn compute_margin(
+    market_states: &[PortfolioMarketState],
+    live_prices: &HashMap<MarketId, u128>,
+) -> Result<risk::MarginResult, risk::RiskError> {
     let positions: Vec<risk::PositionState> = market_states
         .iter()
         .map(|m| risk::PositionState { market_id: m.market_id.clone(), size: m.signed_size })
         .collect();
-    let mark_prices: HashMap<MarketId, u128> =
-        market_states.iter().map(|m| (m.market_id.clone(), m.entry_price as u128)).collect();
+    let mark_prices: HashMap<MarketId, u128> = market_states
+        .iter()
+        .map(|m| {
+            let price = live_prices.get(&m.market_id).copied().unwrap_or(m.entry_price as u128);
+            (m.market_id.clone(), price)
+        })
+        .collect();
     let effective_collateral: u128 =
         market_states.iter().map(|m| i128::try_from(m.collateral).unwrap_or(0).max(0) as u128).sum();
 
@@ -999,7 +1074,10 @@ async fn post_liquidation_check(
         return Ok(Json(LiquidationCheckResponse { liquidatable: false }));
     }
 
-    let liquidatable = match compute_margin(&market_states) {
+    let market_ids: Vec<MarketId> = market_states.iter().map(|m| m.market_id.clone()).collect();
+    let live_prices = live_mark_prices(&state, &market_ids).await;
+
+    let liquidatable = match compute_margin(&market_states, &live_prices) {
         Ok(result) => result.maintenance_breached,
         Err(e) => {
             tracing::error!(error = %e, portfolio_key = %request.portfolio_key, "margin computation failed");
@@ -1037,7 +1115,10 @@ async fn post_liquidate(
         return Ok(Json(LiquidateResponse { executed: false, tx_hash: None }));
     }
 
-    let margin = compute_margin(&market_states)
+    let market_ids: Vec<MarketId> = market_states.iter().map(|m| m.market_id.clone()).collect();
+    let live_prices = live_mark_prices(&state, &market_ids).await;
+
+    let margin = compute_margin(&market_states, &live_prices)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("margin computation failed: {e}")))?;
     if !margin.maintenance_breached {
         tracing::info!(portfolio_key = %request.portfolio_key, "liquidate called on a healthy portfolio, not executing");
@@ -1842,6 +1923,99 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "filled");
         assert_eq!(body["fills"], 1);
+    }
+
+    // NOTE: these three tests deliberately assert PROPORTIONAL relationships
+    // (live price produces exactly double/some multiple of what entry price
+    // alone would), not absolute dollar figures. Writing this test exposed a
+    // real, PRE-EXISTING, separate bug: risk::RiskMonitor::compute_margin
+    // expects both `size` and `price` 1e18-scaled (matching RiskMonitor.sol's
+    // on-chain convention), but PortfolioMarketState's `signed_size`/
+    // `entry_price` come straight from book.rs's raw, UNSCALED Tick/Qty
+    // (`backstop.rs`'s module docs cover why book.rs isn't 1e18 fixed point).
+    // For any realistically small position this silently floors the
+    // margin requirement to zero, a liquidation check that can never fire.
+    // That bug predates this change and isn't specific to the live-price
+    // wiring below (entry_price alone hits it too), so it's flagged here,
+    // not fixed here: reconciling it needs verifying what scale
+    // `sealed.collateral` actually carries first, a separate, more
+    // invasive investigation than wiring an oracle price in.
+
+    #[test]
+    fn compute_margin_falls_back_to_entry_price_when_no_live_price_available() {
+        let states = vec![PortfolioMarketState {
+            market_id: "0xEURCUSDC".to_string(),
+            signed_size: 10,
+            entry_price: 100,
+            collateral: I256::try_from(1_000i64).unwrap(),
+        }];
+        let with_entry_price = compute_margin(&states, &HashMap::new()).unwrap();
+        let with_matching_live_price =
+            compute_margin(&states, &HashMap::from([("0xEURCUSDC".to_string(), 100u128)])).unwrap();
+        assert_eq!(
+            with_entry_price.margin_requirement, with_matching_live_price.margin_requirement,
+            "no live price falls back to entry_price, so it must match a live price of the same value"
+        );
+    }
+
+    #[test]
+    fn compute_margin_prefers_a_live_price_over_the_sealed_entry_price() {
+        let states = vec![PortfolioMarketState {
+            market_id: "0xEURCUSDC".to_string(),
+            signed_size: 10,
+            entry_price: 100, // stale: the position opened at $100
+            collateral: I256::try_from(1_000i64).unwrap(),
+        }];
+        let at_entry_price = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
+        let live_prices = HashMap::from([("0xEURCUSDC".to_string(), 200u128)]); // live: now $200, double
+        let at_live_price = compute_margin(&states, &live_prices).unwrap().margin_requirement;
+        assert_eq!(at_live_price, at_entry_price * 2, "double the price must double the requirement");
+    }
+
+    #[test]
+    fn compute_margin_only_overrides_markets_present_in_live_prices() {
+        let states = vec![
+            PortfolioMarketState {
+                market_id: "0xEURCUSDC".to_string(),
+                signed_size: 10,
+                entry_price: 100,
+                collateral: I256::try_from(1_000i64).unwrap(),
+            },
+            PortfolioMarketState {
+                market_id: "0xBTCUSDC".to_string(),
+                signed_size: 1,
+                entry_price: 50_000,
+                collateral: I256::try_from(0i64).unwrap(),
+            },
+        ];
+        // Only EURC/USDC has a live price (double its entry price); BTC/USDC
+        // must still fall back to its own entry price untouched.
+        let baseline = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
+        let live_prices = HashMap::from([("0xEURCUSDC".to_string(), 200u128)]);
+        let overridden = compute_margin(&states, &live_prices).unwrap().margin_requirement;
+
+        let eurc_only_states = vec![PortfolioMarketState {
+            market_id: "0xEURCUSDC".to_string(),
+            signed_size: 10,
+            entry_price: 100,
+            collateral: I256::try_from(1_000i64).unwrap(),
+        }];
+        let eurc_leg_at_entry =
+            compute_margin(&eurc_only_states, &HashMap::new()).unwrap().margin_requirement;
+        // The total moved by exactly EURC's own leg doubling, proving BTC's
+        // leg (computed from its untouched entry price) didn't move at all.
+        assert_eq!(overridden, baseline + eurc_leg_at_entry);
+    }
+
+    #[tokio::test]
+    async fn live_mark_prices_is_empty_and_makes_no_request_with_the_default_unconfigured_mapping() {
+        let state = AppState::new();
+        // The default AppState has an empty oracle_feed_mapping (no market
+        // has opted in), so this must short-circuit before ever touching
+        // the network, not attempt a Hermes call for markets nobody
+        // configured a feed for.
+        let prices = live_mark_prices(&state, &["0xEURCUSDC".to_string(), "0xBTCUSDC".to_string()]).await;
+        assert!(prices.is_empty());
     }
 
     #[tokio::test]

@@ -145,6 +145,23 @@ pub async fn fetch_price(feed_id: &str) -> Result<PythPrice, OracleError> {
     prices.remove(feed_id).ok_or_else(|| OracleError::MissingFeed(feed_id.to_string()))
 }
 
+/// Converts a raw Pyth price (`price * 10^expo`) into this crate's plain
+/// unscaled `u64` tick convention (`book.rs`'s `Tick`, and the entry-price
+/// convention `PortfolioMarketState` already uses, whole-dollar integer
+/// ticks, matching the test fixtures' `tick = 100` meaning "$100"). Rounds
+/// to the nearest whole unit rather than truncating, and floors negative
+/// results at zero (a negative price is nonsensical for anything Cerdic
+/// trades, and this keeps the conversion total instead of panicking on
+/// a market this function was never meant to be used for).
+pub fn pyth_price_to_tick(price: i64, expo: i32) -> u64 {
+    let scaled = price as f64 * 10f64.powi(expo);
+    if scaled <= 0.0 {
+        0
+    } else {
+        scaled.round() as u64
+    }
+}
+
 /// Pure parsing, split out from the network call so it's testable against
 /// a real captured Hermes response without a live request, same pattern
 /// `attestation.rs`'s `parse_http_response` uses.
@@ -234,5 +251,27 @@ mod tests {
     fn empty_parsed_array_returns_an_empty_map_not_an_error() {
         let prices = parse_hermes_response(r#"{"parsed": []}"#).unwrap();
         assert!(prices.is_empty());
+    }
+
+    #[test]
+    fn pyth_price_to_tick_matches_the_real_captured_btc_price() {
+        // 6271068500001 * 10^-8 = 62710.685...00001, rounds to 62711.
+        assert_eq!(pyth_price_to_tick(6_271_068_500_001, -8), 62_711);
+    }
+
+    #[test]
+    fn pyth_price_to_tick_rounds_to_the_nearest_whole_unit() {
+        assert_eq!(pyth_price_to_tick(1_085_000_000, -9), 1); // 1.085 -> 1
+        assert_eq!(pyth_price_to_tick(1_585_000_000, -9), 2); // 1.585 -> 2
+    }
+
+    #[test]
+    fn pyth_price_to_tick_floors_a_nonsensical_negative_price_at_zero() {
+        assert_eq!(pyth_price_to_tick(-100, -2), 0);
+    }
+
+    #[test]
+    fn pyth_price_to_tick_of_zero_is_zero() {
+        assert_eq!(pyth_price_to_tick(0, -8), 0);
     }
 }
