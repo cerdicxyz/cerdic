@@ -6,7 +6,7 @@
 //! exactly what a real client would send.
 //!
 //! Usage:
-//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty]
+//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id]
 //!
 //! Run two of these (e.g. a resting sell then a crossing buy at the
 //! same tick) against one running server to see a real fill and the
@@ -34,6 +34,7 @@ fn main() {
     };
     let tick: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(100);
     let qty: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let market_id = args.next().unwrap_or_else(|| "EURC/USDC".to_string());
 
     println!("Fetching enclave public key from {SERVER}/pubkey ...");
     let pubkey_json = curl_get(&format!("{SERVER}/pubkey"));
@@ -47,7 +48,7 @@ fn main() {
     println!("Signing as a fresh random wallet: {}", wallet.address());
 
     let mut order = OrderPayload {
-        market_id: "0xEURCUSDC".to_string(),
+        market_id: market_id.clone(),
         side,
         tick,
         qty,

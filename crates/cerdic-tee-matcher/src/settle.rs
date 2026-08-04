@@ -28,6 +28,22 @@ use alloy::{
     sol_types::SolCall,
 };
 use std::env;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+/// Serializes every real broadcast from this process behind one lock, and
+/// each call waits for on-chain inclusion before releasing it. Caught by
+/// a real concurrent stress test: two `broadcast()` calls in flight at
+/// once each build their own fresh `Provider`, so alloy's nonce filler
+/// queries the chain independently for both and hands out the same
+/// "next" nonce twice, the second submission then fails with a real
+/// `nonce too low` RPC error, not a rare edge case, reliably reproducible
+/// under any concurrent settlement load. A shared per-process queue is
+/// the correct MVP fix for a single settlement-signing identity; sharding
+/// nonces across multiple signer keys is future work, not needed until
+/// settlement throughput itself (not matching throughput) is the
+/// bottleneck.
+static BROADCAST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 sol! {
     struct MakerLeg {
@@ -388,14 +404,23 @@ async fn broadcast(
         rpc::types::TransactionRequest,
     };
 
+    // Held for the whole send-and-confirm round trip, see BROADCAST_LOCK's
+    // doc: releasing it only after inclusion is what makes the next
+    // call's nonce query see this transaction's effect.
+    let _guard = BROADCAST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
     let wallet = EthereumWallet::from(signer.wallet.clone());
-    let provider =
-        ProviderBuilder::new().wallet(wallet).on_http(rpc_url.parse().map_err(|e| format!("{e}"))?);
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(wallet)
+        .on_http(rpc_url.parse().map_err(|e| format!("{e}"))?);
 
     let tx = TransactionRequest::default().with_to(contract).with_input(calldata);
 
     let pending = provider.send_transaction(tx).await.map_err(|e| format!("{e}"))?;
-    Ok(*pending.tx_hash())
+    let tx_hash = *pending.tx_hash();
+    pending.get_receipt().await.map_err(|e| format!("{e}"))?;
+    Ok(tx_hash)
 }
 
 #[cfg(test)]

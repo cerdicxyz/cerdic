@@ -222,6 +222,14 @@ pub struct LiquidateResponse {
 #[derive(Debug, Serialize)]
 pub struct PubkeyResponse {
     pub pubkey_b64: String,
+    /// The settlement-signing address (`settle::SettlementSigner`, distinct
+    /// from `pubkey_b64`'s X25519 decryption key — see that struct's own
+    /// doc for why) — whatever `AttestationRouter.authorizeTEE` needs to
+    /// be called with before this instance's settleMatch calls will be
+    /// accepted on-chain. Added because there was previously no way to
+    /// learn this address at all short of reading it out of the process's
+    /// own memory: a real, if small, operational gap for any deployment.
+    pub settlement_address: String,
     /// A real GCP OIDC token, fetched fresh from the Confidential Space
     /// launcher on every call (see `attestation.rs`), when running in
     /// Confidential Space. AWS Nitro's COSE_Sign1 document isn't wired
@@ -491,7 +499,11 @@ async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<PubkeyResponse> 
             None
         }
     };
-    Json(PubkeyResponse { pubkey_b64: state.keystore.public_key_b64(), attestation })
+    Json(PubkeyResponse {
+        pubkey_b64: state.keystore.public_key_b64(),
+        settlement_address: state.settlement_signer.address().to_string(),
+        attestation,
+    })
 }
 
 async fn get_health() -> Json<HealthResponse> {
