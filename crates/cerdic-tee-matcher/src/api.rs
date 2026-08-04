@@ -547,15 +547,21 @@ async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<PubkeyResponse> 
     // a payload substring only proves anything because it was bound in
     // here, at request time, not because the token happens to mention it.
     let settlement_address = state.settlement_signer.address().to_string();
-    let attestation =
-        match crate::attestation::fetch_oidc_token(ATTESTATION_AUDIENCE, Some(&settlement_address)).await {
-            Ok(token) => Some(token),
-            Err(crate::attestation::AttestationError::NoLauncherSocket) => None,
-            Err(e) => {
-                tracing::error!(error = %e, "attestation token fetch failed");
-                None
-            }
-        };
+    // Lowercase, not the checksummed `settlement_address` above: caught
+    // against a real submitAttestation call, which reverted
+    // MissingSignerClaim because alloy's `Address::to_string()` is
+    // EIP-55 checksummed (mixed case) while `TeeAttestationVerifier.sol`'s
+    // `_toHexString` always emits lowercase, so a case-sensitive substring
+    // search against the checksummed nonce never matched.
+    let nonce = settlement_address.to_lowercase();
+    let attestation = match crate::attestation::fetch_oidc_token(ATTESTATION_AUDIENCE, Some(&nonce)).await {
+        Ok(token) => Some(token),
+        Err(crate::attestation::AttestationError::NoLauncherSocket) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "attestation token fetch failed");
+            None
+        }
+    };
     Json(PubkeyResponse { pubkey_b64: state.keystore.public_key_b64(), settlement_address, attestation })
 }
 
