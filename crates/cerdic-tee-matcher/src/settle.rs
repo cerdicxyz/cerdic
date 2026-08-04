@@ -14,11 +14,15 @@
 //! seal anything itself. Wired into `post_order` (`api.rs`) for every
 //! fill.
 //!
-//! Broadcasting is real but optional: if `SETTLEMENT_RPC_URL` and
-//! `SETTLEMENT_CONTRACT_ADDRESS` are both set, this signs and submits a
-//! real transaction. If not (the default in this dev environment, which
-//! has no deployed `SettlementEngine` to point at), it builds and signs
-//! the call, logs what would have been sent, and stops there, an honest
+//! Broadcasting is real but optional: if `SETTLEMENT_RPC_URL` is set and
+//! the caller resolved a contract address for the market in question
+//! (each market is its own deployed `SettlementEngine` instance, see
+//! `api::AppState::settlement_contracts`'s doc — this module never reads
+//! a single global contract address, that was a real bug fixed once a
+//! second market existed to expose it), this signs and submits a real
+//! transaction. If not (the default in this dev environment, which has
+//! no deployed `SettlementEngine` to point at), it builds and signs the
+//! call, logs what would have been sent, and stops there, an honest
 //! "nothing to submit to" rather than a fake success.
 
 use alloy::{
@@ -186,15 +190,24 @@ pub fn build_taker_sweep_calldata(sweep: &TakerSweep) -> Bytes {
 /// Builds the batch calldata and, only if broadcasting is configured, signs and submits
 /// one real transaction covering every maker leg. Same "nothing to submit to" posture as
 /// `settle_match` when unconfigured.
-pub async fn settle_taker_sweep(signer: &SettlementSigner, sweep: &TakerSweep) -> SettlementResult {
+///
+/// `contract` is the specific market's `SettlementEngine` address (each
+/// market is its own deployed instance, see `api::AppState::settlement_contracts`'s
+/// doc), resolved by the caller from `sweep.market_id` — not looked up
+/// here, this module has no market registry of its own.
+pub async fn settle_taker_sweep(
+    signer: &SettlementSigner,
+    sweep: &TakerSweep,
+    contract: Option<Address>,
+) -> SettlementResult {
     let calldata = build_taker_sweep_calldata(sweep);
 
-    let Some((rpc_url, contract)) = broadcast_config() else {
+    let Some((rpc_url, contract)) = broadcast_config(contract) else {
         tracing::debug!(
             signer = %signer.address(),
             legs = sweep.maker_legs.len(),
             calldata = %calldata,
-            "taker sweep built and signed, not broadcast (SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set)"
+            "taker sweep built and signed, not broadcast (SETTLEMENT_RPC_URL unset or no contract configured for this market)"
         );
         return SettlementResult { calldata, broadcast_tx_hash: None };
     };
@@ -217,6 +230,7 @@ pub async fn settle_taker_sweep(signer: &SettlementSigner, sweep: &TakerSweep) -
 /// (bringing it to zero), and `sealed_params` typically empty bytes
 /// (flat/no position), matching `/liquidation-check`'s own "empty
 /// sealedParams means no position" convention.
+#[derive(Clone)]
 pub struct LiquidationLegDelta {
     pub market_id: FixedBytes<32>,
     pub collateral_delta: I256,
@@ -258,33 +272,87 @@ pub fn build_liquidate_calldata(sweep: &LiquidationSweep) -> Bytes {
     Bytes::from(call.abi_encode())
 }
 
-/// Builds the liquidation calldata and, only if broadcasting is
-/// configured, signs and submits one real transaction. Same "nothing to
-/// submit to" posture as `settle_match` when unconfigured.
-pub async fn liquidate_sealed(signer: &SettlementSigner, sweep: &LiquidationSweep) -> SettlementResult {
-    let calldata = build_liquidate_calldata(sweep);
-
-    let Some((rpc_url, contract)) = broadcast_config() else {
-        tracing::debug!(
-            signer = %signer.address(),
-            portfolio_key = %sweep.portfolio_key,
-            legs = sweep.legs.len(),
-            calldata = %calldata,
-            "liquidation built and signed, not broadcast (SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set)"
-        );
-        return SettlementResult { calldata, broadcast_tx_hash: None };
-    };
-
-    match broadcast(signer, &rpc_url, contract, calldata.clone()).await {
-        Ok(tx_hash) => {
-            tracing::info!(tx_hash = %tx_hash, portfolio_key = %sweep.portfolio_key, "portfolio liquidated on-chain");
-            SettlementResult { calldata, broadcast_tx_hash: Some(tx_hash) }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, portfolio_key = %sweep.portfolio_key, "liquidation broadcast failed");
-            SettlementResult { calldata, broadcast_tx_hash: None }
+/// Liquidates a portfolio that may hold legs across more than one
+/// market, hence more than one deployed `SettlementEngine` contract
+/// (each market is its own instance, see
+/// `api::AppState::settlement_contracts`'s doc). `SettlementEngine.liquidateSealed`'s
+/// own doc requires "legs MUST cover every market this portfolioKey
+/// holds collateral in" *within one call*, so legs are grouped by their
+/// resolved contract address and one `liquidateSealed` call goes out per
+/// group, each covering everything that group's contract has for this
+/// portfolio, satisfying that invariant per-contract rather than
+/// globally.
+///
+/// Passing the same full-portfolio `sweep.margin_requirement` to every
+/// group's call (not a per-market split, there is no principled way to
+/// divide a netted portfolio figure across markets) is sound because the
+/// on-chain check is `marginRequirement > collateralBefore`: since each
+/// group's `collateralBefore` is only that group's slice of the whole
+/// portfolio's collateral, it can never exceed the total, so if the
+/// whole portfolio is genuinely underwater (which is the only reason
+/// this function is ever called, see `/liquidate`'s guard) every group's
+/// call independently passes the same check. Returns one `SettlementResult`
+/// per contract actually invoiced; a leg whose market has no resolved
+/// contract is skipped with a warning, same "honest nothing to submit
+/// to" posture as everywhere else in this module.
+pub async fn liquidate_sealed(
+    signer: &SettlementSigner,
+    sweep: &LiquidationSweep,
+    market_contracts: &std::collections::HashMap<FixedBytes<32>, Address>,
+) -> Vec<SettlementResult> {
+    let mut groups: std::collections::HashMap<Address, Vec<&LiquidationLegDelta>> =
+        std::collections::HashMap::new();
+    for leg in &sweep.legs {
+        match market_contracts.get(&leg.market_id) {
+            Some(contract) => groups.entry(*contract).or_default().push(leg),
+            None => tracing::warn!(
+                market_id = %leg.market_id,
+                portfolio_key = %sweep.portfolio_key,
+                "no settlement contract configured for this leg's market, skipping it entirely"
+            ),
         }
     }
+
+    let mut results = Vec::with_capacity(groups.len());
+    for (contract, legs) in groups {
+        let group_sweep = LiquidationSweep {
+            portfolio_key: sweep.portfolio_key,
+            margin_requirement: sweep.margin_requirement,
+            legs: legs.into_iter().cloned().collect(),
+            liquidator: sweep.liquidator,
+            liquidator_reward: sweep.liquidator_reward,
+        };
+        let calldata = build_liquidate_calldata(&group_sweep);
+
+        let Some((rpc_url, contract)) = broadcast_config(Some(contract)) else {
+            tracing::debug!(
+                signer = %signer.address(),
+                portfolio_key = %sweep.portfolio_key,
+                legs = group_sweep.legs.len(),
+                calldata = %calldata,
+                "liquidation group built and signed, not broadcast (SETTLEMENT_RPC_URL not set)"
+            );
+            results.push(SettlementResult { calldata, broadcast_tx_hash: None });
+            continue;
+        };
+
+        match broadcast(signer, &rpc_url, contract, calldata.clone()).await {
+            Ok(tx_hash) => {
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    contract = %contract,
+                    portfolio_key = %sweep.portfolio_key,
+                    "portfolio liquidated on-chain"
+                );
+                results.push(SettlementResult { calldata, broadcast_tx_hash: Some(tx_hash) });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, contract = %contract, portfolio_key = %sweep.portfolio_key, "liquidation broadcast failed");
+                results.push(SettlementResult { calldata, broadcast_tx_hash: None });
+            }
+        }
+    }
+    results
 }
 
 /// The result of building a settlement call: always the calldata (so a
@@ -311,27 +379,32 @@ pub fn build_settle_match_calldata(settlement: &MatchSettlement) -> Bytes {
     Bytes::from(call.abi_encode())
 }
 
-/// Reads `SETTLEMENT_RPC_URL` and `SETTLEMENT_CONTRACT_ADDRESS`. `None`
-/// means "not configured", the normal state in this dev environment,
-/// not an error.
-fn broadcast_config() -> Option<(String, Address)> {
+/// Reads `SETTLEMENT_RPC_URL` and pairs it with `contract` (the specific
+/// market's resolved `SettlementEngine` address, see
+/// `api::AppState::settlement_contracts`'s doc — this module has no
+/// market registry of its own, callers resolve it). `None` means "not
+/// configured", the normal state in this dev environment or for a
+/// market nobody's wired a contract for yet, not an error.
+fn broadcast_config(contract: Option<Address>) -> Option<(String, Address)> {
     let rpc_url = env::var("SETTLEMENT_RPC_URL").ok()?;
-    let contract = env::var("SETTLEMENT_CONTRACT_ADDRESS").ok()?;
-    let contract: Address = contract.parse().ok()?;
-    Some((rpc_url, contract))
+    Some((rpc_url, contract?))
 }
 
-/// Builds the settlement calldata and, only if both broadcast env vars
-/// are set, signs and submits a real transaction. Never blocks on
+/// Builds the settlement calldata and, only if broadcasting is
+/// configured, signs and submits a real transaction. Never blocks on
 /// network I/O when broadcasting isn't configured.
-pub async fn settle_match(signer: &SettlementSigner, settlement: &MatchSettlement) -> SettlementResult {
+pub async fn settle_match(
+    signer: &SettlementSigner,
+    settlement: &MatchSettlement,
+    contract: Option<Address>,
+) -> SettlementResult {
     let calldata = build_settle_match_calldata(settlement);
 
-    let Some((rpc_url, contract)) = broadcast_config() else {
+    let Some((rpc_url, contract)) = broadcast_config(contract) else {
         tracing::debug!(
             signer = %signer.address(),
             calldata = %calldata,
-            "settlement built and signed, not broadcast (SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set)"
+            "settlement built and signed, not broadcast (SETTLEMENT_RPC_URL unset or no contract configured for this market)"
         );
         return SettlementResult { calldata, broadcast_tx_hash: None };
     };
@@ -356,20 +429,24 @@ pub struct SealedPosition {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadSealedError {
-    #[error("SETTLEMENT_RPC_URL/SETTLEMENT_CONTRACT_ADDRESS not set, nothing to read from")]
+    #[error("SETTLEMENT_RPC_URL unset or no contract configured for this market, nothing to read from")]
     NotConfigured,
     #[error("RPC call failed: {0}")]
     Rpc(String),
 }
 
 /// Reads one sealed position via `eth_call` (no signing, no gas, no
-/// state change — a plain read). `None` config is an error here, unlike
-/// `settle_match`'s silent no-op: a caller asking to READ a position
-/// with nowhere configured to read it from is a real failure, not the
-/// normal "nothing to broadcast" dev-mode state.
+/// state change — a plain read). `contract` is the specific market's
+/// resolved `SettlementEngine` address (each market is its own deployed
+/// instance, see `api::AppState::settlement_contracts`'s doc); `None`
+/// config is an error here, unlike `settle_match`'s silent no-op: a
+/// caller asking to READ a position with nowhere configured to read it
+/// from is a real failure, not the normal "nothing to broadcast"
+/// dev-mode state.
 pub async fn load_sealed(
     portfolio_key: FixedBytes<32>,
     market_id: FixedBytes<32>,
+    contract: Option<Address>,
 ) -> Result<SealedPosition, LoadSealedError> {
     use alloy::{
         network::TransactionBuilder,
@@ -377,7 +454,7 @@ pub async fn load_sealed(
         rpc::types::TransactionRequest,
     };
 
-    let (rpc_url, contract) = broadcast_config().ok_or(LoadSealedError::NotConfigured)?;
+    let (rpc_url, contract) = broadcast_config(contract).ok_or(LoadSealedError::NotConfigured)?;
     let provider =
         ProviderBuilder::new().on_http(rpc_url.parse().map_err(|e| LoadSealedError::Rpc(format!("{e}")))?);
 
@@ -501,12 +578,23 @@ mod tests {
     async fn settle_match_without_broadcast_config_does_not_submit_anything() {
         // Ensure no stray env vars from another test/process leak in.
         std::env::remove_var("SETTLEMENT_RPC_URL");
-        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
 
         let signer = SettlementSigner::generate();
-        let result = settle_match(&signer, &sample_settlement()).await;
+        let result = settle_match(&signer, &sample_settlement(), Some(Address::from([4u8; 20]))).await;
         assert!(result.broadcast_tx_hash.is_none());
         assert!(!result.calldata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settle_match_with_no_resolved_contract_does_not_submit_anything() {
+        std::env::set_var("SETTLEMENT_RPC_URL", "http://127.0.0.1:1");
+
+        let signer = SettlementSigner::generate();
+        let result = settle_match(&signer, &sample_settlement(), None).await;
+        assert!(result.broadcast_tx_hash.is_none());
+        assert!(!result.calldata.is_empty());
+
+        std::env::remove_var("SETTLEMENT_RPC_URL");
     }
 
     #[test]
@@ -525,9 +613,8 @@ mod tests {
         // position with nowhere to read it from must get a real error,
         // not a fabricated empty result.
         std::env::remove_var("SETTLEMENT_RPC_URL");
-        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
 
-        let result = load_sealed(FixedBytes::from([1u8; 32]), FixedBytes::from([2u8; 32])).await;
+        let result = load_sealed(FixedBytes::from([1u8; 32]), FixedBytes::from([2u8; 32]), None).await;
         assert!(matches!(result, Err(LoadSealedError::NotConfigured)));
     }
 
@@ -589,10 +676,9 @@ mod tests {
     #[tokio::test]
     async fn settle_taker_sweep_without_broadcast_config_does_not_submit_anything() {
         std::env::remove_var("SETTLEMENT_RPC_URL");
-        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
 
         let signer = SettlementSigner::generate();
-        let result = settle_taker_sweep(&signer, &sample_sweep()).await;
+        let result = settle_taker_sweep(&signer, &sample_sweep(), Some(Address::from([4u8; 20]))).await;
         assert!(result.broadcast_tx_hash.is_none());
         assert!(!result.calldata.is_empty());
     }
@@ -642,11 +728,56 @@ mod tests {
     #[tokio::test]
     async fn liquidate_sealed_without_broadcast_config_does_not_submit_anything() {
         std::env::remove_var("SETTLEMENT_RPC_URL");
-        std::env::remove_var("SETTLEMENT_CONTRACT_ADDRESS");
 
         let signer = SettlementSigner::generate();
-        let result = liquidate_sealed(&signer, &sample_liquidation()).await;
-        assert!(result.broadcast_tx_hash.is_none());
-        assert!(!result.calldata.is_empty());
+        let sweep = sample_liquidation();
+        let market_contracts =
+            std::collections::HashMap::from([(sweep.legs[0].market_id, Address::from([4u8; 20]))]);
+        let results = liquidate_sealed(&signer, &sweep, &market_contracts).await;
+        // Only one leg's market has a resolved contract; the other is
+        // skipped with a warning, not silently dropped from the result.
+        assert_eq!(results.len(), 1);
+        assert!(results[0].broadcast_tx_hash.is_none());
+        assert!(!results[0].calldata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn liquidate_sealed_groups_legs_by_contract_one_call_per_group() {
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+
+        let signer = SettlementSigner::generate();
+        let sweep = sample_liquidation();
+        // Both legs' markets resolve to the SAME contract: one group, one call.
+        let contract = Address::from([4u8; 20]);
+        let market_contracts = std::collections::HashMap::from([
+            (sweep.legs[0].market_id, contract),
+            (sweep.legs[1].market_id, contract),
+        ]);
+        let results = liquidate_sealed(&signer, &sweep, &market_contracts).await;
+        assert_eq!(results.len(), 1);
+
+        let decoded = ISettlementEngine::liquidateSealedCall::abi_decode(&results[0].calldata, true).unwrap();
+        assert_eq!(decoded.legs.len(), 2, "both legs must land in the one group's call");
+        // Same full-portfolio margin requirement carried through, not split.
+        assert_eq!(decoded.marginRequirement, sweep.margin_requirement);
+    }
+
+    #[tokio::test]
+    async fn liquidate_sealed_splits_legs_across_two_contracts() {
+        std::env::remove_var("SETTLEMENT_RPC_URL");
+
+        let signer = SettlementSigner::generate();
+        let sweep = sample_liquidation();
+        let market_contracts = std::collections::HashMap::from([
+            (sweep.legs[0].market_id, Address::from([4u8; 20])),
+            (sweep.legs[1].market_id, Address::from([5u8; 20])),
+        ]);
+        let results = liquidate_sealed(&signer, &sweep, &market_contracts).await;
+        assert_eq!(results.len(), 2, "two distinct contracts must produce two separate calls");
+        for result in &results {
+            let decoded = ISettlementEngine::liquidateSealedCall::abi_decode(&result.calldata, true).unwrap();
+            assert_eq!(decoded.legs.len(), 1, "each call must only carry its own contract's leg");
+            assert_eq!(decoded.marginRequirement, sweep.margin_requirement);
+        }
     }
 }

@@ -6,11 +6,15 @@
 //! exactly what a real client would send.
 //!
 //! Usage:
-//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id]
+//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id] [private_key]
 //!
 //! Run two of these (e.g. a resting sell then a crossing buy at the
 //! same tick) against one running server to see a real fill and the
-//! `order accepted` log line with real fields.
+//! `order accepted` log line with real fields. Pass the same
+//! `private_key` (a `0x`-prefixed 32-byte hex secp256k1 key) across
+//! calls in different markets to trade as the same portfolioKey in
+//! more than one market, since the enclave derives portfolioKey from
+//! the signer's address, not per-market.
 
 use alloy::{
     primitives::PrimitiveSignature as Signature,
@@ -23,6 +27,7 @@ use cerdic_tee_matcher::{
 };
 use crypto_box::PublicKey;
 use std::process::Command;
+use std::str::FromStr;
 
 const SERVER: &str = "http://localhost:8787";
 
@@ -35,6 +40,7 @@ fn main() {
     let tick: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(100);
     let qty: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
     let market_id = args.next().unwrap_or_else(|| "EURC/USDC".to_string());
+    let private_key = args.next();
 
     println!("Fetching enclave public key from {SERVER}/pubkey ...");
     let pubkey_json = curl_get(&format!("{SERVER}/pubkey"));
@@ -44,8 +50,11 @@ fn main() {
         base64_decode(&pubkey_b64).try_into().expect("enclave pubkey must be 32 bytes");
     let enclave_pubkey = PublicKey::from(pubkey_bytes);
 
-    let wallet = PrivateKeySigner::random();
-    println!("Signing as a fresh random wallet: {}", wallet.address());
+    let wallet = match private_key {
+        Some(pk) => PrivateKeySigner::from_str(&pk).expect("invalid private key"),
+        None => PrivateKeySigner::random(),
+    };
+    println!("Signing as {}", wallet.address());
 
     let mut order = OrderPayload {
         market_id: market_id.clone(),

@@ -27,6 +27,7 @@ async fn main() {
     let secrets = cerdic_tee_matcher::kms::recover_or_generate().await;
     let mut app_state = api::AppState::from_secrets(secrets);
     configure_oracle_feeds(&mut app_state);
+    configure_settlement_contracts(&mut app_state);
     let state = Arc::new(app_state);
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
@@ -66,6 +67,44 @@ fn configure_oracle_feeds(state: &mut api::AppState) {
             _ => tracing::warn!(
                 pair,
                 "malformed CERDIC_ORACLE_FEEDS entry, expected marketId=feedId, skipping"
+            ),
+        }
+    }
+}
+
+/// Reads `CERDIC_SETTLEMENT_CONTRACTS`, a comma-separated list of
+/// `marketId=contractAddress` pairs, and registers each with `state`.
+/// Each market is its own deployed `SettlementEngine` instance (see
+/// `api::AppState::settlement_contracts`'s doc), so this replaces what
+/// used to be a single global `SETTLEMENT_CONTRACT_ADDRESS` env var read
+/// directly inside `settle.rs`, wrong for every market but the first one
+/// once a second market existed. Unset or malformed entries are skipped
+/// with a warning, never fatal: a market with no entry here just never
+/// broadcasts, same posture as an unconfigured `SETTLEMENT_RPC_URL`.
+fn configure_settlement_contracts(state: &mut api::AppState) {
+    let Ok(raw) = std::env::var("CERDIC_SETTLEMENT_CONTRACTS") else {
+        tracing::info!("CERDIC_SETTLEMENT_CONTRACTS not set, no market will broadcast settlement on-chain");
+        return;
+    };
+    for pair in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match pair.split_once('=') {
+            Some((market_id, contract)) if !market_id.is_empty() && !contract.is_empty() => {
+                match contract.parse() {
+                    Ok(address) => {
+                        tracing::info!(market_id, contract, "settlement contract configured");
+                        state.configure_settlement_contract(market_id.to_string(), address);
+                    }
+                    Err(e) => tracing::warn!(
+                        market_id,
+                        contract,
+                        error = %e,
+                        "malformed CERDIC_SETTLEMENT_CONTRACTS address, skipping"
+                    ),
+                }
+            }
+            _ => tracing::warn!(
+                pair,
+                "malformed CERDIC_SETTLEMENT_CONTRACTS entry, expected marketId=contractAddress, skipping"
             ),
         }
     }

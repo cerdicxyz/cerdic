@@ -216,7 +216,11 @@ pub struct LiquidateRequest {
 #[derive(Debug, Serialize)]
 pub struct LiquidateResponse {
     pub executed: bool,
-    pub tx_hash: Option<String>,
+    /// One entry per on-chain `liquidateSealed` call actually submitted.
+    /// A portfolio with legs in more than one market's contract produces
+    /// more than one transaction, see `settle::liquidate_sealed`'s doc on
+    /// why that can't be a single atomic call across contracts.
+    pub tx_hashes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +371,19 @@ pub struct AppState {
     /// `configure_oracle_feed`, real market-to-feed pairings are
     /// deployment config, see that method's doc.
     oracle_feed_mapping: HashMap<MarketId, String>,
+    /// Which on-chain contract settles a given market, keyed by the same
+    /// `MarketId` string as `oracle_feed_mapping`. Real necessity, not
+    /// convenience: each market is its own deployed `SettlementEngine`
+    /// instance (`ARCHITECTURE.md`'s "one contract per market" pattern,
+    /// e.g. `FxPerpMarket` vs `PerpMarket` are different addresses with
+    /// independent sealed-position storage), so a single global contract
+    /// address (this field's predecessor) silently settled every market
+    /// against whichever one contract happened to be configured, wrong
+    /// for every market but the first one. Populated via
+    /// `configure_settlement_contract`; a market with no entry here logs
+    /// and skips broadcasting rather than guessing, same "honest nothing
+    /// to submit to" posture as an unconfigured `SETTLEMENT_RPC_URL`.
+    settlement_contracts: HashMap<MarketId, alloy::primitives::Address>,
 }
 
 impl AppState {
@@ -392,6 +409,7 @@ impl AppState {
             backstop: Mutex::new(HashMap::new()),
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
+            settlement_contracts: HashMap::new(),
         }
     }
 
@@ -417,6 +435,7 @@ impl AppState {
             backstop: Mutex::new(HashMap::new()),
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
+            settlement_contracts: HashMap::new(),
         }
     }
 }
@@ -438,6 +457,19 @@ impl AppState {
     /// a real trading pair.
     pub fn configure_oracle_feed(&mut self, market_id: MarketId, feed_id: impl Into<String>) {
         self.oracle_feed_mapping.insert(market_id, feed_id.into());
+    }
+
+    /// Opts one market into real on-chain settlement broadcasting at the
+    /// given contract address, see `settlement_contracts`'s doc. Called
+    /// at startup alongside `configure_oracle_feed`; a market never
+    /// passed here simply never broadcasts, same as today's behavior
+    /// when `SETTLEMENT_RPC_URL` is unset.
+    pub fn configure_settlement_contract(
+        &mut self,
+        market_id: MarketId,
+        contract: alloy::primitives::Address,
+    ) {
+        self.settlement_contracts.insert(market_id, contract);
     }
 
     /// Fetches a fresh Pyth price for every market `configure_oracle_feed`
@@ -491,19 +523,23 @@ pub fn router(state: Arc<AppState>) -> Router {
 const ATTESTATION_AUDIENCE: &str = "cerdic-tee-matcher";
 
 async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<PubkeyResponse> {
-    let attestation = match crate::attestation::fetch_oidc_token(ATTESTATION_AUDIENCE).await {
-        Ok(token) => Some(token),
-        Err(crate::attestation::AttestationError::NoLauncherSocket) => None,
-        Err(e) => {
-            tracing::error!(error = %e, "attestation token fetch failed");
-            None
-        }
-    };
-    Json(PubkeyResponse {
-        pubkey_b64: state.keystore.public_key_b64(),
-        settlement_address: state.settlement_signer.address().to_string(),
-        attestation,
-    })
+    // Binds this token to this specific settlement-signing key via GCP's
+    // `nonces` request field: the real token has no claim carrying an
+    // arbitrary address on its own (`sub` is the instance URL, not a
+    // key), so `TeeAttestationVerifier.sol` checking for this address as
+    // a payload substring only proves anything because it was bound in
+    // here, at request time, not because the token happens to mention it.
+    let settlement_address = state.settlement_signer.address().to_string();
+    let attestation =
+        match crate::attestation::fetch_oidc_token(ATTESTATION_AUDIENCE, Some(&settlement_address)).await {
+            Ok(token) => Some(token),
+            Err(crate::attestation::AttestationError::NoLauncherSocket) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "attestation token fetch failed");
+                None
+            }
+        };
+    Json(PubkeyResponse { pubkey_b64: state.keystore.public_key_b64(), settlement_address, attestation })
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -784,13 +820,15 @@ async fn post_order(
             index.entry(taker_portfolio_key).or_default().insert(payload.market_id.clone());
         }
 
+        let contract = state.settlement_contracts.get(&payload.market_id).copied();
         let state_for_settlement = state.clone();
         // Never awaited: settlement is async network I/O (or a no-op
         // when unconfigured, see settle.rs), not something the trader's
         // response should wait on.
         tokio::spawn(async move {
             let result =
-                crate::settle::settle_taker_sweep(&state_for_settlement.settlement_signer, &sweep).await;
+                crate::settle::settle_taker_sweep(&state_for_settlement.settlement_signer, &sweep, contract)
+                    .await;
             if let Some(tx_hash) = result.broadcast_tx_hash {
                 tracing::info!(tx_hash = %tx_hash, market_id = %sweep.market_id, "taker sweep settled on-chain");
             }
@@ -1002,7 +1040,8 @@ async fn load_portfolio_state(state: &AppState, portfolio_key: FixedBytes<32>) -
     let mut result = Vec::with_capacity(markets.len());
     for market_id in &markets {
         let market_hash = keccak256(market_id.as_bytes());
-        let sealed = match crate::settle::load_sealed(portfolio_key, market_hash).await {
+        let contract = state.settlement_contracts.get(market_id).copied();
+        let sealed = match crate::settle::load_sealed(portfolio_key, market_hash, contract).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, market_id, "failed to read sealed position, skipping");
@@ -1181,7 +1220,7 @@ async fn post_liquidate(
 
     let market_states = load_portfolio_state(&state, portfolio_key).await;
     if market_states.is_empty() {
-        return Ok(Json(LiquidateResponse { executed: false, tx_hash: None }));
+        return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
 
     let market_ids: Vec<MarketId> = market_states.iter().map(|m| m.market_id.clone()).collect();
@@ -1191,7 +1230,7 @@ async fn post_liquidate(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("margin computation failed: {e}")))?;
     if !margin.maintenance_breached {
         tracing::info!(portfolio_key = %request.portfolio_key, "liquidate called on a healthy portfolio, not executing");
-        return Ok(Json(LiquidateResponse { executed: false, tx_hash: None }));
+        return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
 
     let legs: Vec<crate::settle::LiquidationLegDelta> = market_states
@@ -1214,14 +1253,24 @@ async fn post_liquidate(
         liquidator_reward,
     };
 
-    let result = crate::settle::liquidate_sealed(&state.settlement_signer, &sweep).await;
-    if let Some(tx_hash) = &result.broadcast_tx_hash {
-        tracing::info!(tx_hash = %tx_hash, portfolio_key = %request.portfolio_key, "portfolio liquidated");
+    // Each leg's market may live on a different SettlementEngine contract
+    // (see settlement_contracts's doc), keyed here by the on-chain
+    // bytes32 marketId to match LiquidationLegDelta.market_id.
+    let market_contracts: std::collections::HashMap<FixedBytes<32>, Address> = state
+        .settlement_contracts
+        .iter()
+        .map(|(market_id, contract)| (keccak256(market_id.as_bytes()), *contract))
+        .collect();
+
+    let results = crate::settle::liquidate_sealed(&state.settlement_signer, &sweep, &market_contracts).await;
+    for result in &results {
+        if let Some(tx_hash) = &result.broadcast_tx_hash {
+            tracing::info!(tx_hash = %tx_hash, portfolio_key = %request.portfolio_key, "portfolio liquidated");
+        }
     }
-    Ok(Json(LiquidateResponse {
-        executed: result.broadcast_tx_hash.is_some(),
-        tx_hash: result.broadcast_tx_hash.map(|h| h.to_string()),
-    }))
+    let tx_hashes: Vec<String> =
+        results.iter().filter_map(|r| r.broadcast_tx_hash.map(|h| h.to_string())).collect();
+    Ok(Json(LiquidateResponse { executed: !tx_hashes.is_empty(), tx_hashes }))
 }
 
 /// Decodes a `0x`-prefixed (or bare) 32-byte hex string into a `portfolioKey`.
