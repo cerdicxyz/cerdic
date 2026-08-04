@@ -197,6 +197,20 @@ pub enum OfferResponse {
 #[derive(Debug, Deserialize)]
 pub struct LiquidationCheckRequest {
     pub portfolio_key: String,
+    /// Optional: markets to check in addition to whatever this
+    /// process's own `portfolio_markets` index already knows.
+    /// `portfolio_markets` is in-memory only, not part of
+    /// `kms::EnclaveSecrets` (real deployment note: it never survives a
+    /// restart even with KMS-recovered identity, so a portfolio that
+    /// traded before the last restart would otherwise silently read back
+    /// as "no known positions" here, a healthy-looking false negative, a
+    /// real gap this field exists to let a keeper work around by
+    /// supplying what it already knows from its own on-chain event
+    /// history). Any market named here also gets folded into the
+    /// in-memory index for next time, so one caller providing it helps
+    /// every caller after.
+    #[serde(default)]
+    pub market_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +225,9 @@ pub struct LiquidationCheckResponse {
 pub struct LiquidateRequest {
     pub portfolio_key: String,
     pub liquidator: String,
+    /// Same purpose and caveat as `LiquidationCheckRequest::market_ids`.
+    #[serde(default)]
+    pub market_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -807,6 +824,15 @@ async fn post_order(
             stop_loss: None,
         };
         let taker_portfolio_key = portfolio_key(&state.portfolio_key_secret, signer);
+        // Debug-only, deliberately not info!: logging the signer/portfolioKey
+        // link at a level anyone running with default settings sees would
+        // undercut the exact unlinkability `portfolio_key`'s own doc
+        // describes (a keeper watching chain events can't map a
+        // portfolioKey back to a trader; an operator with debug logging
+        // turned on obviously can, that's a different, opt-in trust
+        // boundary). Useful for exactly this kind of local operator-side
+        // debugging/testing, not meant for a production log stream.
+        tracing::debug!(signer = %signer, portfolio_key = %taker_portfolio_key, "derived taker portfolio_key");
         let sweep = crate::settle::TakerSweep {
             market_id: keccak256(payload.market_id.as_bytes()),
             portfolio_key_taker: taker_portfolio_key,
@@ -1031,10 +1057,25 @@ struct PortfolioMarketState {
 /// (or whose sealed read/unseal fails) is silently skipped, same posture
 /// the old inline version of this loop had: settling nothing for one bad
 /// market is safer than failing the whole portfolio's check.
-async fn load_portfolio_state(state: &AppState, portfolio_key: FixedBytes<32>) -> Vec<PortfolioMarketState> {
+///
+/// `market_hints` are markets a caller (a keeper, from its own on-chain
+/// event history) supplied in addition to whatever this process's
+/// in-memory `portfolio_markets` index already knows, see
+/// `LiquidationCheckRequest::market_ids`'s doc on why that index alone
+/// isn't always enough. Folded into the index for next time, not just
+/// used once.
+async fn load_portfolio_state(
+    state: &AppState,
+    portfolio_key: FixedBytes<32>,
+    market_hints: &[String],
+) -> Vec<PortfolioMarketState> {
     let markets: Vec<MarketId> = {
-        let index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
-        index.get(&portfolio_key).map(|set| set.iter().cloned().collect()).unwrap_or_default()
+        let mut index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
+        let entry = index.entry(portfolio_key).or_default();
+        for hint in market_hints {
+            entry.insert(hint.clone());
+        }
+        entry.iter().cloned().collect()
     };
 
     let mut result = Vec::with_capacity(markets.len());
@@ -1176,7 +1217,7 @@ async fn post_liquidation_check(
     let portfolio_key = parse_portfolio_key(&request.portfolio_key)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad portfolio_key: {e}")))?;
 
-    let market_states = load_portfolio_state(&state, portfolio_key).await;
+    let market_states = load_portfolio_state(&state, portfolio_key, &request.market_ids).await;
     if market_states.is_empty() {
         tracing::debug!(portfolio_key = %request.portfolio_key, "no known positions for this portfolio");
         return Ok(Json(LiquidationCheckResponse { liquidatable: false }));
@@ -1218,7 +1259,7 @@ async fn post_liquidate(
     let liquidator: Address =
         request.liquidator.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad liquidator: {e}")))?;
 
-    let market_states = load_portfolio_state(&state, portfolio_key).await;
+    let market_states = load_portfolio_state(&state, portfolio_key, &request.market_ids).await;
     if market_states.is_empty() {
         return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
