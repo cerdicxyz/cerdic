@@ -21,6 +21,21 @@ jobs:
       - run: bun run build
         working-directory: app
 
+  contracts:
+    name: Contracts (Foundry / Solidity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge fmt --check
+        working-directory: packages/contracts
+      - run: forge build
+        working-directory: packages/contracts
+      - run: forge test
+        working-directory: packages/contracts
+
   crates:
     name: Crates (Rust workspace)
     runs-on: ubuntu-latest

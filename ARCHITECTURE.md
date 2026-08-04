@@ -416,13 +416,17 @@ interface IMarket
 ### Attestation Verifier
 
 ```
-contract GcpAttestationVerifier
-  - init(expectedImageDigest: bytes32, googleJwksAddr: address)
-  - submitAttestation(oidcToken: bytes, enclaveSigner: address)
-    // Verifies RS256 signature over the OIDC token against Google's JWKS
-    // (RSA verify via the modexp precompile), checks iss/aud claims and that
-    // the token's image-digest claim == expectedImageDigest, then registers
-    // enclaveSigner as authorized until the token's expiry.
+contract TeeAttestationVerifier  // built: packages/contracts/src/clearing/TeeAttestationVerifier.sol
+  - setPublicKey(n: bytes, e: bytes)                 // admin-configured JWKS key, not hardcoded to one issuer
+  - setExpectedClaims(issuer, audience, imageDigest: bytes)
+  - submitAttestation(signingInput, payload, signature: bytes, enclaveSigner: address, expiry: uint256)
+    // Verifies RS256 signature over the OIDC token (RSA verify via the modexp
+    // precompile + PKCS#1 v1.5 padding check), checks iss/aud/image-digest claims
+    // are present in the payload, then registers enclaveSigner as authorized
+    // until expiry. Cloud-agnostic by name/config — GCP Confidential Space is the
+    // first concrete issuer this is wired against, nothing in the contract itself
+    // is GCP-specific. Tested against a real RSA-2048/RS256 signature, not yet
+    // against a live enclave's actual token — see the contract's own module doc.
   - authorizedUntil(signer: address) → uint256
 
 contract NitroAttestationRegistry
@@ -602,13 +606,13 @@ correctness guarantee that lands a few seconds to minutes later.
 │   │   └── src/
 │   │       ├── clearing/         # Account, CollateralEngine, PositionEngine,
 │   │       │                     # SettlementEngine, RiskMonitor, LiquidationEntry
-│   │       ├── markets/          # BtcPerpMarket (built), FxPerpMarket (TODO)
+│   │       ├── markets/          # PerpMarket (BTC/USDC, built), FxPerpMarket (built)
 │   │       ├── oracle/           # OracleHub, PythConsumer, ChainlinkConsumer,
 │   │       │                     # MarketImpactTwap
 │   │       ├── execution/        # OrderBook (public CLOB) + Market Maker Offers (TODO)
 │   │       ├── lib/              # ProtocolConstants, RingBuffer
-│   │       ├── privacy/          # GcpAttestationVerifier, NitroAttestationRegistry,
-│   │       │                     # AttestationRouter (not yet scaffolded)
+│   │       ├── clearing/         # ...also AttestationRouter, TeeAttestationVerifier (built);
+│   │       │                     # NitroAttestationRegistry (AWS path, Phase 1, not built)
 │   │       └── agents/           # Agent identity + capability tokens (not yet scaffolded)
 │   │
 │   └── shared/                   # TS types/constants (no frontend consumer yet — see `app/`)
@@ -682,11 +686,12 @@ correctness guarantee that lands a few seconds to minutes later.
   `SettlementEngine`, `RiskMonitor`, `LiquidationEntry`.
 - Portfolio margin upgrade: `f_S+f_C+f_L+f_K` replacing the current isolated-margin-only
   `RiskMonitor`.
-- `FxPerpMarket` (EURC/USDC) alongside the existing `BtcPerpMarket`.
+- `FxPerpMarket` (EURC/USDC, built) alongside the existing `PerpMarket` (BTC/USDC).
 - `cerdic-tee-matcher` (Rust), deployed to GCP Confidential Space (primary) implementing
   the sealed-params / authorized-settler / stripped-events design above, replacing the
   `rfq-matcher` stub.
-- `GcpAttestationVerifier` contract + public-settlement fallback path.
+- `TeeAttestationVerifier` contract (built, untested against a live enclave token) +
+  public-settlement fallback path.
 - Agent accounts: identity, capability tokens, session keys, one working agent type
   (trading agent), Nanopayments-integrated.
 - Frontend (`app/`, Vite + React), Arc Testnet deployment.
