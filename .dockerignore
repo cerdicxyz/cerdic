@@ -1,0 +1,7 @@
+crates/target
+app/node_modules
+app/dist
+packages/contracts/out
+packages/contracts/cache
+packages/contracts/broadcast
+.git
