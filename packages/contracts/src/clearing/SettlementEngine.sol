@@ -92,6 +92,16 @@ contract SettlementEngine is PositionEngine {
     event PositionCloseSettled(address indexed trader, bytes32 indexed marketId, int256 remainingSize);
     event AttestationRouterUpdated(address indexed router);
     event MatchSettled(bytes32 indexed matchId);
+    /// @notice The public discovery surface `docs/spec-contracts-tee.md` section 2.4
+    ///         describes ("Keeper watches only public state: portfolioKey + collateral
+    ///         status") but that no event actually provided until now: every other
+    ///         sealed-settlement event (`MatchSettled`) indexes `matchId`, not
+    ///         `portfolioKey`, so a keeper had no way to learn a portfolioKey exists at
+    ///         all short of a liquidation already having happened. Emitted on every
+    ///         sealed leg (open, close, liquidation), carrying only the opaque key and
+    ///         market, never a trader address or position detail -- the same
+    ///         unlinkability `portfolioKey`'s own derivation already guarantees.
+    event SealedPositionTouched(bytes32 indexed portfolioKey, bytes32 indexed marketId);
     /// @notice liquidatorReward is informational only, no token transfer happens here --
     ///         same no-real-token-movement scope collateralDelta already has everywhere
     ///         else in this contract (see SealedPosition's doc), not yet a payout.
@@ -371,6 +381,7 @@ contract SettlementEngine is PositionEngine {
 
         position.collateral = newCollateral;
         position.sealedParams = sealedParams;
+        emit SealedPositionTouched(portfolioKey, marketId);
     }
 
     /// @dev The offsetting takeover trade is settled separately via settleTrade, which

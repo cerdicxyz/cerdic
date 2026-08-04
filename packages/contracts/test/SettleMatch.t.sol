@@ -53,6 +53,31 @@ contract SettleMatchTest is Test {
         engine.settleMatch(MATCH_ID, MARKET_ID, PORTFOLIO_A, deltaA, sealedA, PORTFOLIO_B, deltaB, sealedB);
     }
 
+    /// @notice The keeper discovery surface `docs/spec-contracts-tee.md` section 2.4
+    ///         describes: both legs' portfolioKeys must be publicly learnable from this
+    ///         one call, paired with their market, and nothing else.
+    function test_SettleMatchEmitsSealedPositionTouchedForBothLegs() public {
+        vm.recordLogs();
+        _settle(1_000e18, 1_000e18, "", "");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        bool foundA;
+        bool foundB;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] == SettlementEngine.SealedPositionTouched.selector) {
+                if (logs[i].topics[1] == PORTFOLIO_A) {
+                    foundA = true;
+                    assertEq(logs[i].topics[2], MARKET_ID);
+                } else if (logs[i].topics[1] == PORTFOLIO_B) {
+                    foundB = true;
+                    assertEq(logs[i].topics[2], MARKET_ID);
+                }
+            }
+        }
+        assertTrue(foundA, "portfolio A must be publicly discoverable");
+        assertTrue(foundB, "portfolio B must be publicly discoverable");
+    }
+
     function test_SettleMatchStoresSealedParamsAndCollateralPerPortfolioKey() public {
         bytes memory sealedA = hex"aabbcc";
         bytes memory sealedB = hex"ddeeff";
