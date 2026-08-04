@@ -80,6 +80,20 @@ pub struct PythPrice {
 #[derive(Debug, Deserialize)]
 struct HermesResponse {
     parsed: Vec<HermesParsedFeed>,
+    #[serde(default)]
+    binary: Option<HermesBinary>,
+}
+
+/// The raw, Wormhole-signed VAA update blob(s) Hermes returns alongside
+/// the human-readable `parsed` prices. `fetch_latest_prices` never looks
+/// at this (it only needs the numbers), but `updatePriceFeeds` on the
+/// real on-chain `IPyth` contract takes exactly this: opaque bytes it
+/// verifies against Pyth's own guardian signatures, not anything this
+/// crate could construct itself. See `keeper_price_pusher.rs`, the one
+/// real consumer.
+#[derive(Debug, Deserialize)]
+struct HermesBinary {
+    data: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +157,39 @@ pub async fn fetch_latest_prices(feed_ids: &[&str]) -> Result<HashMap<String, Py
 pub async fn fetch_price(feed_id: &str) -> Result<PythPrice, OracleError> {
     let mut prices = fetch_latest_prices(&[feed_id]).await?;
     prices.remove(feed_id).ok_or_else(|| OracleError::MissingFeed(feed_id.to_string()))
+}
+
+/// Fetches the raw, guardian-signed VAA update blob(s) for every feed in
+/// `feed_ids`, hex-decoded and ready to pass straight to `IPyth.updatePriceFeeds`.
+/// This is the on-chain half `fetch_latest_prices` deliberately doesn't
+/// provide (see this module's own doc on that gap) — `keeper_price_pusher.rs`
+/// is the real consumer.
+pub async fn fetch_update_data(feed_ids: &[&str]) -> Result<Vec<Vec<u8>>, OracleError> {
+    let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let mut url = format!("{HERMES_BASE_URL}/v2/updates/price/latest?");
+    for id in feed_ids {
+        url.push_str("ids[]=");
+        url.push_str(id);
+        url.push('&');
+    }
+
+    let response = client.get(&url).send().await?;
+    if !response.status().is_success() {
+        return Err(OracleError::BadResponse(format!("Hermes returned HTTP {}", response.status())));
+    }
+    let body = response.text().await?;
+    let parsed: HermesResponse =
+        serde_json::from_str(&body).map_err(|e| OracleError::BadResponse(e.to_string()))?;
+    let binary = parsed
+        .binary
+        .ok_or_else(|| OracleError::BadResponse("Hermes response had no binary update data".to_string()))?;
+    binary
+        .data
+        .into_iter()
+        .map(|hex_str| {
+            hex::decode(hex_str).map_err(|e| OracleError::BadResponse(format!("bad hex in binary.data: {e}")))
+        })
+        .collect()
 }
 
 /// Converts a raw Pyth price (`price * 10^expo`) into this crate's plain

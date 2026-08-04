@@ -138,6 +138,38 @@ pub enum OrderResponse {
     Rejected { reason: String },
 }
 
+/// A trader asking the enclave for their OWN `portfolioKey`. Real gap
+/// this closes: `portfolio_key`'s own doc is explicit that it's
+/// deliberately unrecoverable from an address without breaking the
+/// enclave, which is exactly right for a THIRD PARTY (a keeper watching
+/// chain events can't map a portfolioKey back to a trader) but leaves a
+/// trader with no way to look up their OWN key either, so no way to call
+/// `/liquidation-check` on themselves or (the actual motivating case,
+/// see `market_maker.rs`) read their own sealed position via `loadSealed`
+/// to track inventory. Safe to answer because it's signature-gated the
+/// same way an order is: only the address that can produce a valid
+/// signature over its own request ever learns that address's
+/// portfolioKey, nothing here lets anyone learn another address's key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PortfolioKeyRequest {
+    pub nonce: u64,
+    pub signature: Signature,
+}
+
+impl SignedPayload for PortfolioKeyRequest {
+    fn signing_bytes(&self) -> Vec<u8> {
+        format!("portfolio_key_request|{}", self.nonce).into_bytes()
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortfolioKeyResponse {
+    pub portfolio_key: String,
+}
+
 /// A standing maker quote, per `docs/spec-contracts-tee.md` section 2.5.
 /// Always submitted post-only under the hood (see `post_offer`): an
 /// offer is by definition a resting quote, not something that takes
@@ -525,6 +557,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(get_health))
         .route("/order", post(post_order))
         .route("/offer", post(post_offer))
+        .route("/portfolio-key", post(post_portfolio_key))
         .route("/liquidation-check", post(post_liquidation_check))
         .route("/liquidate", post(post_liquidate))
         .route("/orderbook/:market_id", get(get_orderbook))
@@ -940,6 +973,27 @@ async fn post_offer(
     broadcast_orderbook_update(&state, &payload.market_id);
     let offer_id = result.resting_id.expect("a non-rejected post-only submit always rests");
     Ok(Json(OfferResponse::Resting { offer_id }))
+}
+
+async fn post_portfolio_key(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<Envelope>,
+) -> Result<Json<PortfolioKeyResponse>, ApiError> {
+    let (payload, signer): (PortfolioKeyRequest, Address) =
+        decrypt::decrypt_and_authenticate(&state.keystore, &envelope)?;
+
+    {
+        let mut last_nonce = state.last_nonce.lock().expect("last_nonce mutex poisoned");
+        if let Some(&last) = last_nonce.get(&signer) {
+            if payload.nonce <= last {
+                return Err(ApiError::NonceReplay { got: payload.nonce, last });
+            }
+        }
+        last_nonce.insert(signer, payload.nonce);
+    }
+
+    let key = portfolio_key(&state.portfolio_key_secret, signer);
+    Ok(Json(PortfolioKeyResponse { portfolio_key: key.to_string() }))
 }
 
 /// Builds the current `OrderBookResponse` for one market from `books` and
@@ -2056,6 +2110,78 @@ mod tests {
         let (status, body) = post_json(app, "/offer", &envelope).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn portfolio_key_lookup_matches_what_a_real_trade_settles_under() {
+        let state = Arc::new(AppState::new());
+        let taker = wallet();
+
+        // Prove the endpoint returns the SAME key a real settlement uses,
+        // not just some derived value: cross a real trade as `taker`,
+        // capture the portfolio_key the taker leg gets built with, then
+        // confirm /portfolio-key returns that exact value for `taker`.
+        let maker = wallet();
+        let mut resting = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut resting, &maker);
+        let app = router(state.clone());
+        post_json(app.clone(), "/order", &envelope_for(resting, &state)).await;
+
+        let mut crossing = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Buy,
+            tick: 100,
+            qty: 5,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut crossing, &taker);
+        post_json(app.clone(), "/order", &envelope_for(crossing, &state)).await;
+
+        let expected = portfolio_key(&state.portfolio_key_secret, taker.address());
+
+        // nonce 2, not 1: `taker` already used nonce 1 for the order
+        // above, and the nonce namespace is shared across every
+        // authenticated endpoint for a given signer (replay protection
+        // that spans /order, /offer, and /portfolio-key alike).
+        let mut req = PortfolioKeyRequest { nonce: 2, signature: Signature::test_signature() };
+        let raw = taker.sign_message_sync(&req.signing_bytes()).unwrap();
+        req.signature = Signature::try_from(raw.as_bytes().as_slice()).unwrap();
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &req).unwrap();
+
+        let (status, body) = post_json(app, "/portfolio-key", &envelope).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["portfolio_key"], expected.to_string());
+    }
+
+    #[tokio::test]
+    async fn portfolio_key_lookup_rejects_a_replayed_nonce() {
+        let state = Arc::new(AppState::new());
+        let trader = wallet();
+        let app = router(state.clone());
+
+        let mut req = PortfolioKeyRequest { nonce: 1, signature: Signature::test_signature() };
+        let raw = trader.sign_message_sync(&req.signing_bytes()).unwrap();
+        req.signature = Signature::try_from(raw.as_bytes().as_slice()).unwrap();
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &req).unwrap();
+        let (status, _) = post_json(app.clone(), "/portfolio-key", &envelope).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Same nonce again must be rejected, not silently answered twice.
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &req).unwrap();
+        let (status, _) = post_json(app, "/portfolio-key", &envelope).await;
+        assert_ne!(status, StatusCode::OK);
     }
 
     #[tokio::test]
