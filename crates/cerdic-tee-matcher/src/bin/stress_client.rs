@@ -6,7 +6,15 @@
 //! not just HTTP overhead.
 //!
 //! Usage:
-//!   cargo run --release --bin stress_client -- [n_orders] [concurrency] [market_id]
+//!   cargo run --release --bin stress_client -- [n_orders] [concurrency] [market_id] [mode]
+//!
+//! `mode` is `cross` (default: alternating buy/sell at the same tick, most
+//! orders cross a resting counterparty) or `ioc` (every order is an
+//! all-buy, one-sided IOC with no resting counterparty ever placed, so
+//! every single one is unserved demand that must be absorbed by the
+//! backstop maker, `backstop.rs` — a concurrent-load stress test of that
+//! path specifically, not just the order book/settlement path `cross`
+//! already covers).
 
 use alloy::{
     primitives::PrimitiveSignature as Signature,
@@ -32,12 +40,19 @@ async fn main() {
     let n_orders: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(500);
     let concurrency: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(50);
     let market_id = args.next().unwrap_or_else(|| "EURC/USDC".to_string());
+    let ioc_mode = args.next().as_deref() == Some("ioc");
 
     let client = reqwest::Client::new();
 
     println!("Fetching enclave public key from {SERVER}/pubkey ...");
-    let pubkey_resp: serde_json::Value =
-        client.get(format!("{SERVER}/pubkey")).send().await.expect("pubkey fetch failed").json().await.unwrap();
+    let pubkey_resp: serde_json::Value = client
+        .get(format!("{SERVER}/pubkey"))
+        .send()
+        .await
+        .expect("pubkey fetch failed")
+        .json()
+        .await
+        .unwrap();
     let pubkey_b64 = pubkey_resp["pubkey_b64"].as_str().expect("no pubkey_b64 in response");
     use base64::Engine;
     let pubkey_bytes: [u8; 32] =
@@ -64,17 +79,25 @@ async fn main() {
         let handle = tokio::spawn(async move {
             let _permit = permit;
             let wallet = PrivateKeySigner::random();
-            // Alternate buy/sell around the same tick so a good fraction
-            // actually cross and exercise the settlement path too, not
-            // just the decrypt/book-insert path.
-            let side = if i % 2 == 0 { OrderSide::Buy } else { OrderSide::Sell };
+            // cross mode: alternate buy/sell around the same tick so a
+            // good fraction actually cross a resting order and exercise
+            // the settlement path too, not just decrypt/book-insert.
+            // ioc mode: every order is a one-sided buy IOC with no
+            // resting counterparty ever placed, so every single one is
+            // unserved demand forced through the backstop maker.
+            let (side, tif) = if ioc_mode {
+                (OrderSide::Buy, TimeInForce::ImmediateOrCancel)
+            } else {
+                let side = if i % 2 == 0 { OrderSide::Buy } else { OrderSide::Sell };
+                (side, TimeInForce::GoodTilCancel)
+            };
 
             let mut order = OrderPayload {
                 market_id,
                 side,
                 tick: 100,
                 qty: 1,
-                tif: TimeInForce::GoodTilCancel,
+                tif,
                 post_only: false,
                 nonce: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
                 signature: Signature::test_signature(),
