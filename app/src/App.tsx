@@ -39,6 +39,7 @@ function AppShell({ portfolioOpen, setPortfolioOpen }: { portfolioOpen: boolean;
             <Routes>
               <Route path="/" element={<TradePage />} />
               <Route path="/trade" element={<TradePage />} />
+              <Route path="/trade/:pair" element={<TradePage />} />
               <Route path="/agents" element={<AgentsPage />} />
             </Routes>
           </div>

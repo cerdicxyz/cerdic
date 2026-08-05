@@ -55,6 +55,22 @@ export const MARKETS: Market[] = [
   { id: 'KR200/USD', label: 'KR200 / USD', icon: '/korea-logo.svg', assetClass: 'Equities', leverage: 30 },
 ];
 
+// URL slug for a market, e.g. "BTC/USDC" -> "btc-usdc" — matches Ostium's
+// own /trade/<pair> path convention (they use query params, from=/to=;
+// this is the path-slug alternative, cleaner with react-router and
+// closer to what most perp venues use for a shareable/bookmarkable
+// market URL). Derived from `id` (the matcher's own market_id string,
+// already the real cross-system identifier), not a separately
+// hand-maintained slug list that could drift from it.
+export function marketToSlug(market: Market): string {
+  return market.id.toLowerCase().replace('/', '-');
+}
+
+export function marketFromSlug(slug: string | undefined): Market | undefined {
+  if (!slug) return undefined;
+  return MARKETS.find((market) => marketToSlug(market) === slug.toLowerCase());
+}
+
 export function MarketDropdown({
   selected,
   onSelect,
