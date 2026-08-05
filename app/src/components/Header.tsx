@@ -29,12 +29,17 @@ export function Header() {
   const location = useLocation();
 
   return (
-    <header className="flex h-12 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
+    <header className="flex h-24 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
       <a
         href="/"
         className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline"
       >
-        <img src="/logos/android-chrome-512x512.png" alt="" aria-hidden="true" className="h-8 w-8 flex-shrink-0" />
+        <img
+          src="/logos/android-chrome-512x512.png"
+          alt=""
+          aria-hidden="true"
+          className="h-20 w-20 flex-shrink-0"
+        />
         <span>Cerdic</span>
       </a>
 
@@ -43,14 +48,19 @@ export function Header() {
         className="mx-auto flex items-center gap-[var(--space-7)]"
       >
         {NAV_ITEMS.map((item) => {
-          const active = item.path !== null && location.pathname.startsWith(item.path);
+          const active =
+            item.path !== null && location.pathname.startsWith(item.path);
           const className = active
             ? 'text-[13px] font-medium text-text-primary no-underline transition-colors duration-150'
             : 'text-[13px] font-medium text-text-tertiary no-underline transition-colors duration-150 hover:text-text-secondary';
 
           if (item.path === null) {
             return (
-              <span key={item.label} title={`${item.label} — coming soon`} className={`${className} cursor-not-allowed opacity-50`}>
+              <span
+                key={item.label}
+                title={`${item.label} — coming soon`}
+                className={`${className} cursor-not-allowed opacity-50`}
+              >
                 {item.label}
               </span>
             );
