@@ -178,7 +178,7 @@ contract LiquidationEntryTest is Test {
         account = new ClearingAccount(admin);
         usdc = new MockERC20("USD Coin", "USDC");
         collateralEngine = new CollateralEngine(admin, address(usdc));
-        settlementEngine = new SettlementEngine(admin);
+        settlementEngine = new SettlementEngine(admin, 20);
         market = new MockMarket();
         oracle = new MockMarkPriceOracle(PRICE);
         entry = new LiquidationEntry(

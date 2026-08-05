@@ -67,7 +67,7 @@ contract PerpMarketTest is Test {
         oracle = new MockOracleHub();
         oracle.setBoth(PRICE, PRICE); // mark = index = $100k (stable)
 
-        market = new PerpMarket(admin, address(oracle), FEED);
+        market = new PerpMarket(admin, address(oracle), FEED, 20);
         constants = new ProtocolConstants();
 
         // Self-register as decoder for the BTC/USDC market.
@@ -170,6 +170,27 @@ contract PerpMarketTest is Test {
         );
         vm.prank(admin);
         market.settleTrade(FEED, longTrader, shortTrader, SIZE, PRICE, 0);
+    }
+
+    /// @notice `settleTrade` always auto-computes margin at exactly this instance's
+    ///         own ceiling (`requiredMargin`), so it can never exercise a DIFFERENT
+    ///         leverage than the one it was deployed with — `validateOpen` is the
+    ///         surface a caller supplying its own collateral (e.g. a trader choosing
+    ///         25x on a market whose ceiling allows it) actually goes through. A
+    ///         25x-implied position (1 unit @ $100k against $4k collateral) must be
+    ///         rejected by a 20x-ceiling market but accepted by an otherwise
+    ///         identical 30x-ceiling one — proof LEVERAGE_CEILING is a real
+    ///         per-instance constructor param now, not still hardcoded at 20x.
+    function test_HigherLeverageCeilingAcceptsWhatALowerOneRejects() public {
+        PerpMarket wideMarket = new PerpMarket(admin, address(oracle), FEED, 30);
+        assertEq(wideMarket.LEVERAGE_CEILING(), 30);
+        assertEq(wideMarket.IMR_BPS(), 333, "10_000 / 30, rounded down");
+        assertEq(market.LEVERAGE_CEILING(), 20);
+        assertEq(market.IMR_BPS(), 500);
+
+        uint256 notionalCollateral = 4_000e18; // 1 BTC @ $100k / $4k = 25x
+        assertFalse(market.validateOpen(SIZE, notionalCollateral), "20x ceiling must reject a 25x position");
+        assertTrue(wideMarket.validateOpen(SIZE, notionalCollateral), "30x ceiling must accept a 25x position");
     }
 
     // -----------------------------------------------------------------

@@ -25,11 +25,28 @@ contract SettlementEngine is PositionEngine {
     uint256 internal constant SCALE = 1e18;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    /// @notice Initial margin requirement in basis points; mirrors ProtocolConstants.IMR_BPS.
-    uint256 internal constant IMR_BPS = 500;
+    /// @notice Per-instance leverage ceiling (a plain multiplier, e.g. 20, 30, 50),
+    ///         initialized at construction but admin-adjustable afterward via
+    ///         `setLeverageCeiling` — a testnet risk parameter still being tuned, not a
+    ///         value markets need immutability guarantees over yet. Each
+    ///         PerpMarket/FxPerpMarket IS its own SettlementEngine instance (see this
+    ///         contract's own inheritors' docs), so this is genuinely per-market, not a
+    ///         shared global — different markets can (and do, see
+    ///         DeployMoreMarketsLocal.s.sol) carry different values.
+    uint256 public LEVERAGE_CEILING;
 
-    /// @notice Per-market leverage ceiling; mirrors ProtocolConstants.MAX_LEVERAGE_BPS / 100.
-    uint256 internal constant LEVERAGE_CEILING = 20;
+    /// @notice Initial margin requirement in basis points, always kept in lockstep with
+    ///         LEVERAGE_CEILING (`10_000 / LEVERAGE_CEILING`, only ever changed together
+    ///         via `setLeverageCeiling`) so the two can never independently drift —
+    ///         previously two separately-hardcoded constants that happened to agree at
+    ///         20x. Integer division means non-round ceilings (e.g. 30x -> 333bps,
+    ///         30.03x-implied) round down slightly; `validateOpen`'s notional-based
+    ///         check (derived from this same LEVERAGE_CEILING) is the one that ends up
+    ///         binding at the exact ceiling, this is just the margin floor and is
+    ///         intentionally allowed to be marginally looser.
+    uint256 public IMR_BPS;
+
+    event LeverageCeilingUpdated(uint256 oldCeiling, uint256 newCeiling);
 
     /// @notice Zero until wired; while zero, settlement skips the impact-TWAP feed.
     MarketImpactTwap public impactTwap;
@@ -124,6 +141,7 @@ contract SettlementEngine is PositionEngine {
     error NotAuthorizedTEE(address caller);
     error ZeroMatchId();
     error ZeroPortfolioKey();
+    error ZeroLeverageCeiling();
     error MatchAlreadySettled(bytes32 matchId);
     error InsufficientSealedCollateral(bytes32 portfolioKey, bytes32 marketId, int256 wouldBe);
     error ZeroLiquidator();
@@ -131,7 +149,10 @@ contract SettlementEngine is PositionEngine {
     error NegativeSealedCollateral(bytes32 portfolioKey, bytes32 marketId);
     error NotLiquidatable(bytes32 portfolioKey, uint256 marginRequirement, uint256 collateralBefore);
 
-    constructor(address admin) PositionEngine(admin) {
+    constructor(address admin, uint256 leverageCeiling_) PositionEngine(admin) {
+        if (leverageCeiling_ == 0) revert ZeroLeverageCeiling();
+        LEVERAGE_CEILING = leverageCeiling_;
+        IMR_BPS = BPS_DENOMINATOR / leverageCeiling_;
         _grantRole(SETTLER_ROLE, admin);
         _grantRole(LIQUIDATOR_ROLE, admin);
     }
@@ -202,6 +223,17 @@ contract SettlementEngine is PositionEngine {
     function setAttestationRouter(address router) external onlyRole(CLEARING_ADMIN_ROLE) {
         attestationRouter = AttestationRouter(router);
         emit AttestationRouterUpdated(router);
+    }
+
+    /// @notice Retunes this market's leverage ceiling after deployment — see
+    ///         LEVERAGE_CEILING's own doc for why this stays mutable rather than
+    ///         immutable. IMR_BPS is recomputed in the same call so the two are never
+    ///         set out of sync with each other.
+    function setLeverageCeiling(uint256 newCeiling) external onlyRole(CLEARING_ADMIN_ROLE) {
+        if (newCeiling == 0) revert ZeroLeverageCeiling();
+        emit LeverageCeilingUpdated(LEVERAGE_CEILING, newCeiling);
+        LEVERAGE_CEILING = newCeiling;
+        IMR_BPS = BPS_DENOMINATOR / newCeiling;
     }
 
     /// @notice TEE-private settlement, per docs/spec-contracts-tee.md section 2.2: the TEE
@@ -410,8 +442,9 @@ contract SettlementEngine is PositionEngine {
         emit PositionCloseSettled(trader, marketId, remainingSize);
     }
 
-    /// @notice `|size| * price * IMR_BPS / (1e18 * 1e4)`; 5% of notional = 20x leverage ceiling.
-    function requiredMargin(int256 size, uint256 price) public pure returns (uint256) {
+    /// @notice `|size| * price * IMR_BPS / (1e18 * 1e4)`; IMR_BPS is this instance's own
+    ///         per-market value (see LEVERAGE_CEILING's doc), not a shared 20x default.
+    function requiredMargin(int256 size, uint256 price) public view returns (uint256) {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 absSize = size > 0 ? uint256(size) : uint256(-size);
         return absSize * price * IMR_BPS / (SCALE * BPS_DENOMINATOR);

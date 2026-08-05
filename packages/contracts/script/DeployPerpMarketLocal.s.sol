@@ -64,7 +64,9 @@ contract DeployPerpMarketLocal is Script {
         chainlinkConsumer.setAggregator(btcUsdcMarketId, address(btcAggregator));
 
         // --- The second market: PerpMarket (BTC/USDC) ---
-        PerpMarket btcMarket = new PerpMarket(admin, address(oracleHub), btcUsdcMarketId);
+        // 30x: crypto's higher realized vol vs FX, see
+        // SettlementEngine.LEVERAGE_CEILING's own doc.
+        PerpMarket btcMarket = new PerpMarket(admin, address(oracleHub), btcUsdcMarketId, 30);
         btcMarket.registerDecoder(btcUsdcMarketId, address(btcMarket));
         btcMarket.setAttestationRouter(attestationRouter);
         riskMonitor.registerMarket(btcUsdcMarketId);

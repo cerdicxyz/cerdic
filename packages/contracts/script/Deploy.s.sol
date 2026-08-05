@@ -69,7 +69,9 @@ contract Deploy is Script {
         TeeAttestationVerifier attestationVerifier = new TeeAttestationVerifier(admin);
 
         // --- The one MVP market: FxPerpMarket (EURC/USDC) ---
-        FxPerpMarket fxMarket = new FxPerpMarket(admin, address(oracleHub), eurcUsdcFeedId);
+        // 50x: FX majors' lower realized vol vs crypto/commodities, see
+        // SettlementEngine.LEVERAGE_CEILING's own doc.
+        FxPerpMarket fxMarket = new FxPerpMarket(admin, address(oracleHub), eurcUsdcFeedId, 50);
 
         // --- Wiring ---
         fxMarket.registerDecoder(eurcUsdcFeedId, address(fxMarket));

@@ -48,7 +48,7 @@ contract FxPerpMarketTest is Test {
         oracle = new MockOracleHub();
         oracle.setMarkPrice(PRICE);
 
-        market = new FxPerpMarket(admin, address(oracle), FEED);
+        market = new FxPerpMarket(admin, address(oracle), FEED, 20);
         constants = new ProtocolConstants();
 
         vm.prank(admin);

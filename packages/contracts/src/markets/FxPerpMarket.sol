@@ -15,21 +15,12 @@ import {OracleHub} from "../oracle/OracleHub.sol";
 ///         interest-rate differential (r_quote - r_base), the conventional FX carry
 ///         model, not PerpMarket's mark/index price-divergence formula. Per
 ///         ARCHITECTURE.md's "FX Perpetual Market" sketch (packages/contracts/src/markets/).
-/// @dev    IMR_BPS/leverage are inherited unchanged from SettlementEngine (20x,
-///         matching every other market) rather than raised for FX's materially
-///         lower realized volatility (live FX-perp venues run up to 50x  see the
-///         research this was scoped from). SettlementEngine.requiredMargin hardcodes
-///         IMR_BPS for the plaintext settleTrade path, so a market-local leverage
-///         override here would silently desync from what settleTrade actually
-///         requires upfront before this contract's own validateOpen ever runs.
-///         Raising FX leverage needs requiredMargin to become per-market (or
-///         market-supplied), a shared SettlementEngine change  not something to
-///         bolt on unsafely inside one market extension.
+/// @dev    IMR_BPS/leverage are now genuinely per-instance (see
+///         SettlementEngine.LEVERAGE_CEILING's own doc) rather than a shared global
+///         20x  the constructor's `leverageCeiling_` is what FX pairs raise to 50x
+///         (materially lower realized volatility than crypto/commodities, matching
+///         how real FX-perp venues price them), passed in by the deploy script.
 contract FxPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMarketLifecycle, IPositionDecoder {
-    /// @notice Same local leverage constant PerpMarket declares  see this
-    ///         contract's own doc for why it isn't raised for FX yet.
-    uint256 internal constant MAX_LEVERAGE_BPS = 2000;
-
     /// @notice Grants setRateDifferential  separate from CLEARING_ADMIN_ROLE so a
     ///         rate-pushing keeper doesn't need full admin rights over the market.
     bytes32 public constant RATE_KEEPER_ROLE = keccak256("RATE_KEEPER_ROLE");
@@ -72,7 +63,9 @@ contract FxPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMar
     error WrongMarket(bytes32 got, bytes32 expected);
     error RateDifferentialOutOfBounds(int256 bps);
 
-    constructor(address admin, address oracleHubAddr, bytes32 marketId_) SettlementEngine(admin) {
+    constructor(address admin, address oracleHubAddr, bytes32 marketId_, uint256 leverageCeiling_)
+        SettlementEngine(admin, leverageCeiling_)
+    {
         marketId = marketId_;
         oracleHub = OracleHub(oracleHubAddr);
         lastIndexUpdateTimestamp = block.timestamp;
@@ -137,8 +130,8 @@ contract FxPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMar
         return size * (currentFunding - entryFunding) * int256(oraclePrice) / int256(SCALE * SCALE);
     }
 
-    /// @dev Initial-margin and leverage-cap checks; arithmetically identical at
-    ///      IMR_BPS=500/MAX_LEVERAGE_BPS=2000, same drift-catching redundancy PerpMarket keeps.
+    /// @dev Initial-margin and leverage-cap checks, both derived from this instance's own
+    ///      LEVERAGE_CEILING, same drift-catching redundancy PerpMarket keeps.
     function validateOpen(int256 size, uint256 collateral) external view returns (bool) {
         if (size == 0) return false;
 
@@ -149,7 +142,7 @@ contract FxPerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMar
         uint256 requiredMargin_ = absSize * oraclePrice * IMR_BPS / (SCALE * BPS_DENOMINATOR);
         if (requiredMargin_ > collateral) return false;
 
-        uint256 maxNotional = collateral * MAX_LEVERAGE_BPS / 100;
+        uint256 maxNotional = collateral * LEVERAGE_CEILING;
         if (absSize * oraclePrice / SCALE > maxNotional) return false;
 
         return true;

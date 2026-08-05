@@ -36,7 +36,7 @@ contract SettleMatchTest is Test {
     bytes32 internal constant MATCH_ID = keccak256("match1");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
 
@@ -139,7 +139,7 @@ contract SettleMatchTest is Test {
     }
 
     function test_UnwiredAttestationRouterReverts() public {
-        SettlementEngine bare = new SettlementEngine(admin);
+        SettlementEngine bare = new SettlementEngine(admin, 20);
         vm.expectRevert(SettlementEngine.AttestationRouterNotSet.selector);
         vm.prank(tee);
         bare.settleMatch(MATCH_ID, MARKET_ID, PORTFOLIO_A, 1, "", PORTFOLIO_B, 1, "");
@@ -203,7 +203,7 @@ contract SettleTakerSweepTest is Test {
     bytes32 internal constant PORTFOLIO_MAKER_3 = keccak256("portfolioMaker3");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
 
@@ -309,7 +309,7 @@ contract SettleTakerSweepTest is Test {
         engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 5_000e18, "", legs);
         uint256 batchedTotal = (gasBefore - gasleft()) + baseTxGas;
 
-        SettlementEngine individualEngine = new SettlementEngine(admin);
+        SettlementEngine individualEngine = new SettlementEngine(admin, 20);
         vm.prank(admin);
         individualEngine.setAttestationRouter(address(router));
         vm.prank(admin);
@@ -350,7 +350,7 @@ contract LiquidateSealedTest is Test {
     bytes32 internal constant PORTFOLIO = keccak256("portfolioLiq");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
         marketTwo = new MockSealedMarket();

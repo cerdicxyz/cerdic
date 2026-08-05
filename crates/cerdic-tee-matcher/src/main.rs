@@ -3,7 +3,7 @@
 
 use cerdic_tee_matcher::{api, logging};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 /// 64 KiB. An order/offer payload is a handful of fields; this is
 /// generous headroom, not a tuned limit, chosen to block trivially
@@ -33,10 +33,20 @@ async fn main() {
 
     tokio::spawn(oracle_poll_loop(state.clone()));
 
+    // Permissive by design, not an oversight: every mutating endpoint here
+    // is authenticated by a signed payload (decrypt::decrypt_and_authenticate),
+    // never by a cookie/session a cross-origin request could ride along on,
+    // so there's no CSRF-shaped risk a stricter allow-list would close.
+    // Needed at all because this server previously had no CorsLayer/`cors`
+    // feature enabled — a browser on a different origin (the app's own dev
+    // server, or any real frontend) couldn't reach it, full stop.
+    let cors = CorsLayer::permissive();
+
     let app = api::router(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(TimeoutLayer::new(Duration::from_secs(10)))
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
     let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind listen address");

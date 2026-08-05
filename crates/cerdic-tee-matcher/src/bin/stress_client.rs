@@ -100,6 +100,7 @@ async fn main() {
                 tif,
                 post_only: false,
                 nonce: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+                leverage: 1,
                 signature: Signature::test_signature(),
             };
             let raw_sig = wallet.sign_message_sync(&order.signing_bytes()).unwrap();

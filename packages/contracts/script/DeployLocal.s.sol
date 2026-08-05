@@ -113,7 +113,7 @@ contract DeployLocal is Script {
         c.attestationRouter = new AttestationRouter(admin);
         c.attestationVerifier = new TeeAttestationVerifier(admin);
 
-        c.fxMarket = new FxPerpMarket(admin, address(c.oracleHub), t.feedId);
+        c.fxMarket = new FxPerpMarket(admin, address(c.oracleHub), t.feedId, 50);
 
         c.fxMarket.registerDecoder(t.feedId, address(c.fxMarket));
         c.fxMarket.setAttestationRouter(address(c.attestationRouter));

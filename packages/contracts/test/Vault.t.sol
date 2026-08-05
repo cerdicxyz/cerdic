@@ -146,7 +146,7 @@ contract VaultTest is Test {
     ///         it would for a directly-held account, no extra code in Vault.sol.
     function test_WithdrawIsMarginGatedThroughAccount() public {
         RiskMonitor monitor = new RiskMonitor(admin, address(0x1)); // oracle unused here
-        SettlementEngine settlementEngine = new SettlementEngine(admin);
+        SettlementEngine settlementEngine = new SettlementEngine(admin, 20);
         vm.startPrank(admin);
         collateralEngine.setBalanceSource(address(account));
         monitor.setPositionEngine(address(settlementEngine));

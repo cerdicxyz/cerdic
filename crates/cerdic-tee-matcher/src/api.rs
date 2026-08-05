@@ -104,6 +104,12 @@ pub struct OrderPayload {
     pub tif: TimeInForce,
     pub post_only: bool,
     pub nonce: u64,
+    /// The trader's chosen leverage, forwarded as-is into
+    /// `SealedParams.leverage` (previously hardcoded to `1` regardless of
+    /// what a client sent). Not validated here — `SettlementEngine.validateOpen`
+    /// is the real per-market enforcement (`LEVERAGE_CEILING`), the matcher
+    /// doesn't duplicate that check.
+    pub leverage: u64,
     pub signature: Signature,
 }
 
@@ -119,8 +125,15 @@ impl SignedPayload for OrderPayload {
             TimeInForce::FillOrKill => "FOK".to_string(),
         };
         format!(
-            "order|{}|{:?}|{}|{}|{}|{}|{}",
-            self.market_id, self.side, self.tick, self.qty, tif_tag, self.post_only, self.nonce
+            "order|{}|{:?}|{}|{}|{}|{}|{}|{}",
+            self.market_id,
+            self.side,
+            self.tick,
+            self.qty,
+            tif_tag,
+            self.post_only,
+            self.nonce,
+            self.leverage
         )
         .into_bytes()
     }
@@ -322,6 +335,45 @@ const DEFAULT_DEPTH_LEVELS: usize = 50;
 #[derive(Debug, Deserialize)]
 pub struct DepthQuery {
     pub levels: Option<usize>,
+}
+
+/// The most bars a `/candles` query will ever return, same
+/// can't-force-an-unbounded-response reasoning as `MAX_DEPTH_LEVELS`.
+const MAX_CANDLE_LIMIT: usize = 500;
+const DEFAULT_CANDLE_LIMIT: usize = 180;
+
+#[derive(Debug, Deserialize)]
+pub struct CandleQuery {
+    /// One of "1m","5m","15m","30m","1h","4h","1d" — matches the
+    /// frontend's own Timeframe type (app/src/components/PriceChart.tsx)
+    /// exactly, so no separate mapping table needs to stay in sync on
+    /// both sides. An unrecognized value is a 400, not a silent fallback
+    /// to some default interval a caller never asked for.
+    pub interval: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CandlesResponse {
+    pub market_id: MarketId,
+    pub interval: String,
+    pub candles: Vec<crate::market_data::Candle>,
+}
+
+/// Parses `CandleQuery::interval` into seconds. Kept as one small
+/// function rather than a static map so the accepted-values list and the
+/// error message can't drift apart.
+fn interval_to_seconds(interval: &str) -> Option<u64> {
+    match interval {
+        "1m" => Some(60),
+        "5m" => Some(5 * 60),
+        "15m" => Some(15 * 60),
+        "30m" => Some(30 * 60),
+        "1h" => Some(60 * 60),
+        "4h" => Some(4 * 60 * 60),
+        "1d" => Some(24 * 60 * 60),
+        _ => None,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -568,6 +620,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/liquidate", post(post_liquidate))
         .route("/orderbook/:market_id", get(get_orderbook))
         .route("/ws/orderbook/:market_id", get(ws_orderbook))
+        .route("/candles/:market_id", get(get_candles))
         .with_state(state)
 }
 
@@ -876,7 +929,7 @@ async fn post_order(
             side_is_buy: taker_is_buy,
             entry_price: taker_entry_price,
             size: taker_total_qty as u64,
-            leverage: 1,
+            leverage: payload.leverage,
             take_profit: None,
             stop_loss: None,
         };
@@ -1077,6 +1130,32 @@ async fn get_orderbook(
 ) -> Json<OrderBookResponse> {
     let levels = query.levels.unwrap_or(DEFAULT_DEPTH_LEVELS).clamp(1, MAX_DEPTH_LEVELS);
     Json(build_orderbook_response(&state, &market_id, levels))
+}
+
+/// Real server-side indexing, not client-side mock generation: buckets
+/// this market's retained trade history (TradeTape::candles, up to the
+/// rolling 24h window) into OHLCV bars. A market that has never traded
+/// returns an empty `candles` list, not a 404 — same "empty snapshot, not
+/// an error" posture `get_orderbook` already has for an unseen market.
+async fn get_candles(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+    Query(query): Query<CandleQuery>,
+) -> Result<Json<CandlesResponse>, (StatusCode, String)> {
+    let Some(interval_secs) = interval_to_seconds(&query.interval) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unrecognized interval {:?}, expected one of 1m,5m,15m,30m,1h,4h,1d", query.interval),
+        ));
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_CANDLE_LIMIT).clamp(1, MAX_CANDLE_LIMIT);
+
+    let candles = {
+        let market_data = state.market_data.lock().expect("market_data mutex poisoned");
+        market_data.get(&market_id).map(|tape| tape.candles(interval_secs, limit)).unwrap_or_default()
+    };
+
+    Ok(Json(CandlesResponse { market_id, interval: query.interval, candles }))
 }
 
 async fn ws_orderbook(
@@ -1569,7 +1648,10 @@ fn portfolio_key(secret: &[u8; 32], address: Address) -> FixedBytes<32> {
 /// `loadSealed` collateral reads, see that binary's own doc on why it
 /// can't just read a fill size directly. Keeping one definition here
 /// rather than a second copy there is what keeps them from drifting out
-/// of sync silently.
+/// of sync silently. A single global default, same as `OrderPayload.leverage`
+/// below: contracts enforce the real per-market ceiling
+/// (`SettlementEngine.validateOpen`), this is only how much margin the
+/// matcher itself asks for up front.
 pub const IMR_BPS: u128 = 500;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 
@@ -1626,6 +1708,8 @@ fn build_maker_leg(
         side_is_buy: !taker_is_buy,
         entry_price: tick,
         size: qty,
+        // Makers rest via `OfferPayload`, which (unlike `OrderPayload`) has
+        // no leverage field yet — a real, stated gap, not an oversight.
         leverage: 1,
         take_profit: None,
         stop_loss: None,
@@ -1722,6 +1806,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut order, &wallet);
@@ -1746,6 +1831,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -1761,6 +1847,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -1793,6 +1880,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -1806,6 +1894,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut seed_trade, &taker);
@@ -1824,6 +1913,7 @@ mod tests {
             tif: TimeInForce::ImmediateOrCancel,
             post_only: false,
             nonce: 2,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut ioc, &taker);
@@ -1853,6 +1943,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -1866,6 +1957,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut seed_trade, &taker);
@@ -1884,6 +1976,7 @@ mod tests {
             tif: TimeInForce::FillOrKill,
             post_only: false,
             nonce: 2,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut fok, &taker);
@@ -1914,6 +2007,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -1927,6 +2021,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut seed_trade, &taker);
@@ -1943,6 +2038,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 2,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut gtc, &taker);
@@ -1990,6 +2086,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut gtc, &taker);
@@ -2021,6 +2118,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2035,6 +2133,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2070,6 +2169,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2084,6 +2184,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2113,6 +2214,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2129,6 +2231,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2149,6 +2252,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 5,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut order, &wallet);
@@ -2166,6 +2270,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 5,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut replay, &wallet);
@@ -2185,6 +2290,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut order, &wallet);
@@ -2246,6 +2352,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2281,6 +2388,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2295,6 +2403,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2358,6 +2467,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2687,6 +2797,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2701,6 +2812,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);
@@ -2756,6 +2868,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut bid, &bidder);
@@ -2770,6 +2883,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut ask, &asker);
@@ -2800,6 +2914,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut resting, &maker);
@@ -2814,6 +2929,7 @@ mod tests {
             tif: TimeInForce::GoodTilCancel,
             post_only: false,
             nonce: 1,
+            leverage: 1,
             signature: Signature::test_signature(),
         };
         sign(&mut crossing, &taker);

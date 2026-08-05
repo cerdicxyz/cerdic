@@ -6,7 +6,7 @@
 //! exactly what a real client would send.
 //!
 //! Usage:
-//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id] [private_key]
+//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id] [private_key] [leverage]
 //!
 //! Run two of these (e.g. a resting sell then a crossing buy at the
 //! same tick) against one running server to see a real fill and the
@@ -41,6 +41,7 @@ fn main() {
     let qty: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
     let market_id = args.next().unwrap_or_else(|| "EURC/USDC".to_string());
     let private_key = args.next();
+    let leverage: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     println!("Fetching enclave public key from {SERVER}/pubkey ...");
     let pubkey_json = curl_get(&format!("{SERVER}/pubkey"));
@@ -64,6 +65,7 @@ fn main() {
         tif: TimeInForce::GoodTilCancel,
         post_only: false,
         nonce: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        leverage,
         signature: Signature::test_signature(), // overwritten below
     };
     let raw_signature = wallet.sign_message_sync(&order.signing_bytes()).unwrap();

@@ -182,7 +182,7 @@ contract SettlementEngineTest is Test {
     address internal invariantSeller = makeAddr("invariantSeller");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         market = new MockMarket();
         constants = new ProtocolConstants();
 
@@ -457,6 +457,37 @@ contract SettlementEngineTest is Test {
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, settlerRole)
         );
         engine.settleTrade(MARKET_ID, longTrader, shortTrader, SIZE, PRICE, 0);
+    }
+
+    /// @notice The leverage ceiling is a mutable, admin-settable risk parameter (see
+    ///         LEVERAGE_CEILING's own doc for why it's not immutable), not a one-shot
+    ///         constructor value — a market being retuned shouldn't need a redeploy.
+    ///         IMR_BPS must move in lockstep so the two never independently drift.
+    function test_SetLeverageCeilingUpdatesBothCeilingAndImrBpsTogether() public {
+        assertEq(engine.LEVERAGE_CEILING(), 20);
+        assertEq(engine.IMR_BPS(), 500);
+
+        vm.prank(admin);
+        engine.setLeverageCeiling(50);
+
+        assertEq(engine.LEVERAGE_CEILING(), 50);
+        assertEq(engine.IMR_BPS(), 200, "10_000 / 50, exact");
+    }
+
+    function test_SetLeverageCeilingNonAdminReverts() public {
+        bytes32 adminRole = engine.CLEARING_ADMIN_ROLE();
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, adminRole)
+        );
+        engine.setLeverageCeiling(50);
+    }
+
+    function test_SetLeverageCeilingZeroReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(SettlementEngine.ZeroLeverageCeiling.selector);
+        engine.setLeverageCeiling(0);
     }
 
     /// @notice Degenerate trade parameters are rejected one at a time.
