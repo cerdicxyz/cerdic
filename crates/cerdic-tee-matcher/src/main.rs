@@ -34,6 +34,7 @@ async fn main() {
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
     tokio::spawn(oracle_poll_loop(state.clone()));
+    tokio::spawn(funding_and_oi_poll_loop(state.clone()));
 
     // Permissive by design, not an oversight: every mutating endpoint here
     // is authenticated by a signed payload (decrypt::decrypt_and_authenticate),
@@ -173,5 +174,21 @@ async fn oracle_poll_loop(state: Arc<api::AppState>) {
     loop {
         interval.tick().await;
         state.poll_oracle_prices().await;
+    }
+}
+
+/// Real on-chain RPC reads (funding index, portfolioKey discovery via
+/// event logs), so this runs far less often than the oracle poll —
+/// funding accrues slowly by design (a central-bank-rate-differential or
+/// mark/index-divergence process, not something that needs sub-second
+/// tracking), and open interest doesn't change faster than real trades
+/// settle.
+const FUNDING_AND_OI_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+async fn funding_and_oi_poll_loop(state: Arc<api::AppState>) {
+    let mut interval = tokio::time::interval(FUNDING_AND_OI_POLL_INTERVAL);
+    loop {
+        interval.tick().await;
+        state.poll_funding_and_oi().await;
     }
 }

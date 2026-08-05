@@ -70,7 +70,7 @@ use axum::{
 use common::types::{MarketId, Side as CommonSide};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
@@ -495,6 +495,16 @@ pub struct AppState {
     /// exposure to it, same "opt-in, not opt-out" posture as every other
     /// deployment-config flag in this file.
     debug_seed_enabled: bool,
+    /// Trailing (timestamp, funding_index) samples per market, refreshed
+    /// by `poll_funding_and_oi`, capped so this never grows unbounded —
+    /// only enough history to compute a rate from the oldest-vs-newest
+    /// sample (see `get_funding`'s own doc), not a full time series.
+    funding_samples: Mutex<HashMap<MarketId, VecDeque<(u64, i128)>>>,
+    /// `portfolioKey`s discovered so far per market (via the public
+    /// `SealedPositionTouched` event, see `settle::index_open_interest`'s
+    /// own doc) plus the next block to resume scanning from, so a
+    /// refresh cycle never rescans the whole chain.
+    oi_index: Mutex<HashMap<MarketId, (std::collections::HashSet<FixedBytes<32>>, u64)>>,
 }
 
 impl AppState {
@@ -523,6 +533,8 @@ impl AppState {
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
+            funding_samples: Mutex::new(HashMap::new()),
+            oi_index: Mutex::new(HashMap::new()),
         }
     }
 
@@ -551,6 +563,8 @@ impl AppState {
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
+            funding_samples: Mutex::new(HashMap::new()),
+            oi_index: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -636,6 +650,47 @@ impl AppState {
             backstop.entry(market_id).or_default().record_price(tick);
         }
     }
+
+    /// Refreshes both `funding_samples` and `oi_index` for every market
+    /// with a configured settlement contract — real on-chain reads
+    /// (`settle::load_funding_index`/`settle::index_open_interest`), not
+    /// derived from anything the matcher already tracks itself, so this
+    /// is meant to be called on a fixed interval (main.rs) same as
+    /// `poll_oracle_prices`, not per-request. A market whose RPC call
+    /// fails this cycle just keeps its last good sample/index rather
+    /// than losing history over one bad poll.
+    pub async fn poll_funding_and_oi(&self) {
+        const MAX_SAMPLES: usize = 30;
+        for (market_id, contract) in &self.settlement_contracts {
+            let market_hash = keccak256(market_id.as_bytes());
+
+            if let Ok(index) = crate::settle::load_funding_index(market_hash, Some(*contract)).await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before the Unix epoch")
+                    .as_secs();
+                let mut samples = self.funding_samples.lock().expect("funding_samples mutex poisoned");
+                let series = samples.entry(market_id.clone()).or_default();
+                series.push_back((now, index));
+                while series.len() > MAX_SAMPLES {
+                    series.pop_front();
+                }
+            }
+
+            let from_block = {
+                let oi = self.oi_index.lock().expect("oi_index mutex poisoned");
+                oi.get(market_id).map(|(_, next)| *next).unwrap_or(0)
+            };
+            if let Ok((new_keys, next_block)) =
+                crate::settle::index_open_interest(market_hash, Some(*contract), from_block).await
+            {
+                let mut oi = self.oi_index.lock().expect("oi_index mutex poisoned");
+                let (keys, next) = oi.entry(market_id.clone()).or_default();
+                keys.extend(new_keys);
+                *next = next_block;
+            }
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -651,6 +706,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ws/orderbook/:market_id", get(ws_orderbook))
         .route("/candles/:market_id", get(get_candles))
         .route("/trades/:market_id", get(get_trades))
+        .route("/funding/:market_id", get(get_funding))
+        .route("/oi/:market_id", get(get_open_interest))
         .route("/debug/seed-history", post(post_debug_seed_history))
         .with_state(state)
 }
@@ -1219,6 +1276,102 @@ async fn get_trades(
         market_data.get(&market_id).map(|tape| tape.recent(limit)).unwrap_or_default()
     };
     Json(TradesResponse { market_id, trades })
+}
+
+#[derive(Debug, Serialize)]
+struct FundingResponse {
+    market_id: MarketId,
+    /// The raw cumulative index this market's contract is currently at
+    /// (1e18-scaled, `PerpMarket.sol`/`FxPerpMarket.sol`'s own
+    /// convention) — `None` if no settlement contract is configured for
+    /// this market_id (`configure_settlement_contract` never called).
+    funding_index: Option<i128>,
+    /// Basis points per hour, derived from the oldest-vs-newest sample
+    /// in the trailing window (`AppState::poll_funding_and_oi`) — `None`
+    /// until at least two samples exist. Exact for FxPerpMarket (its
+    /// index accrues by real wall-clock seconds); a stated
+    /// approximation for PerpMarket-family markets, which accrue by
+    /// BLOCK count, not seconds — see `settle::load_funding_index`'s own
+    /// doc.
+    rate_1h_bps: Option<f64>,
+}
+
+async fn get_funding(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+) -> Json<FundingResponse> {
+    if !state.settlement_contracts.contains_key(&market_id) {
+        return Json(FundingResponse { market_id, funding_index: None, rate_1h_bps: None });
+    }
+
+    let samples = state.funding_samples.lock().expect("funding_samples mutex poisoned");
+    let series = samples.get(&market_id);
+    let funding_index = series.and_then(|s| s.back()).map(|(_, index)| *index);
+
+    let rate_1h_bps = series.and_then(|s| {
+        let (t0, i0) = *s.front()?;
+        let (t1, i1) = *s.back()?;
+        if t1 <= t0 {
+            return None;
+        }
+        let elapsed = (t1 - t0) as f64;
+        let delta = (i1 - i0) as f64;
+        // delta is 1e18-scaled per `elapsed` seconds; per-hour bps:
+        // (delta / elapsed) * 3600 seconds/hour * 10_000 bps / 1e18 scale.
+        Some((delta / elapsed) * 3600.0 * 10_000.0 / 1e18)
+    });
+
+    Json(FundingResponse { market_id, funding_index, rate_1h_bps })
+}
+
+#[derive(Debug, Serialize)]
+struct OpenInterestResponse {
+    market_id: MarketId,
+    /// Total plaintext collateral currently committed across every
+    /// `portfolioKey` discovered for this market — a real, honest proxy
+    /// for open interest, NOT position size (which stays sealed, see
+    /// `settle::index_open_interest`'s own doc on why collateral is the
+    /// one number this can legitimately surface). `None` if no
+    /// settlement contract is configured for this market_id.
+    total_collateral: Option<i128>,
+    position_count: Option<usize>,
+}
+
+/// Sums CURRENT collateral live (one `loadSealed` read per known
+/// portfolioKey) rather than caching a stale total — `poll_funding_and_oi`
+/// only refreshes which KEYS exist, not their collateral, since collateral
+/// changes on every settlement and this endpoint is polled far less often
+/// than settlements happen. Fine at demo scale (a handful of keys); a real
+/// deployment with many portfolioKeys per market would want this cached
+/// too, a real follow-up, not built here.
+async fn get_open_interest(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+) -> Json<OpenInterestResponse> {
+    let Some(&contract) = state.settlement_contracts.get(&market_id) else {
+        return Json(OpenInterestResponse { market_id, total_collateral: None, position_count: None });
+    };
+    let market_hash = keccak256(market_id.as_bytes());
+
+    let keys: Vec<FixedBytes<32>> = {
+        let oi = state.oi_index.lock().expect("oi_index mutex poisoned");
+        oi.get(&market_id).map(|(keys, _)| keys.iter().copied().collect()).unwrap_or_default()
+    };
+
+    let mut total: i128 = 0;
+    let mut count = 0usize;
+    for key in &keys {
+        if let Ok(position) = crate::settle::load_sealed(*key, market_hash, Some(contract)).await {
+            if let Ok(collateral) = i128::try_from(position.collateral) {
+                if collateral > 0 {
+                    total += collateral;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    Json(OpenInterestResponse { market_id, total_collateral: Some(total), position_count: Some(count) })
 }
 
 #[derive(Debug, Deserialize)]

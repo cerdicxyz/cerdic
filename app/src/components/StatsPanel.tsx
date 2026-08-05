@@ -1,3 +1,5 @@
+import { useFunding } from '../hooks/useFunding';
+import { useOpenInterest } from '../hooks/useOpenInterest';
 import { useOrderBook } from '../hooks/useOrderBook';
 import { formatMarketPrice } from '../lib/priceScale';
 import type { Market } from './MarketDropdown';
@@ -18,17 +20,18 @@ import type { Market } from './MarketDropdown';
 //   backend state either, market_data.rs's TradeTape already retained
 //   every trade price in the window, `snapshot()` just never scanned it
 //   for a max/min before.
-// - Mark Price, Index Price, Funding: no oracle RPC client wired to this
-//   response yet, no funding-rate calculation surfaced from the
-//   contracts' own funding index — real, buildable follow-ups, not
-//   architecturally blocked the way Open Interest is.
-// - Open Interest: NOT a "not wired yet" gap — position sizes only ever
-//   exist as TEE-sealed ciphertext (SealedParams, see sealed.rs's own
-//   doc), unreadable in plaintext by the matcher itself by design. Real
-//   OI needs either breaking that seal (defeats the whole point of
-//   sealing it) or a separate ZK/homomorphic aggregate — a real,
-//   materially bigger project, not a field this panel was ever missing
-//   by oversight.
+// - Mark Price, Index Price: no oracle RPC client wired to this response
+//   yet — a real, buildable follow-up, not architecturally blocked.
+// - Funding: real, off the matcher's GET /funding/:marketId
+//   (useFunding.ts), itself a real RPC read of the deployed market
+//   contract's own on-chain `fundingIndex`.
+// - Open Interest: exact position SIZE stays TEE-sealed by design
+//   (SealedParams) and always will — but SealedPosition.collateral is
+//   deliberately plaintext (the kernel's own solvency bound), and
+//   SealedPositionTouched is a public event built for keeper discovery.
+//   Together they make a real, indexed PROXY figure (total collateral
+//   committed, off useOpenInterest.ts) legitimately computable without
+//   breaking the sealing guarantee at all.
 // - Margin Mode / Initial Margin / Max Leverage: Initial Margin/Max
 //   Leverage are the SELECTED market's own real values now
 //   (SettlementEngine.LEVERAGE_CEILING, genuinely per-market — 50x FX
@@ -42,6 +45,8 @@ function formatStat(value: number | null, digits = 2) {
 
 export function StatsPanel({ market }: { market: Market }) {
   const book = useOrderBook(market.id);
+  const funding = useFunding(market.id);
+  const oi = useOpenInterest(market.id);
 
   const spread = book.bestBid !== null && book.bestAsk !== null ? book.bestAsk - book.bestBid : null;
   const change24hPct = book.change24hBps !== null ? book.change24hBps / 100 : null;
@@ -61,12 +66,16 @@ export function StatsPanel({ market }: { market: Market }) {
     { label: '24h Low', value: book.low24h !== null ? formatMarketPrice(book.low24h, market.id) : '—' },
     {
       label: 'Open Interest',
-      value: '—',
-      hint: 'Position sizes are TEE-sealed by design (SealedParams) — not readable in plaintext by the matcher itself, so this cannot be computed without either breaking that seal or a separate ZK/homomorphic aggregate, a real follow-up project, not a quick add.',
+      value: oi.totalCollateral !== null ? formatStat(oi.totalCollateral, 0) : '—',
+      hint: 'Total collateral committed across positions discovered via SealedPositionTouched — a proxy for OI, not position size, which stays TEE-sealed by design.',
     },
     { label: 'Resting Levels', value: restingLevels > 0 ? String(restingLevels) : '—' },
-    { label: 'Funding (1h)', value: '—' },
-    { label: 'Next Funding', value: '—' },
+    { label: 'Funding (1h)', value: funding.rate1hBps !== null ? `${(funding.rate1hBps / 100).toFixed(4)}%` : '—' },
+    {
+      label: 'Next Funding',
+      value: '—',
+      hint: 'This market accrues funding continuously by rate differential, not on a discrete schedule, so there is no fixed "next" timestamp to show.',
+    },
     { label: 'Margin Mode', value: 'Portfolio' },
     { label: 'Initial Margin', value: `${(imrBps / 100).toFixed(2)}%`, hint: `SettlementEngine.LEVERAGE_CEILING for ${market.id}` },
     { label: 'Max Leverage', value: `${market.leverage}x`, hint: `SettlementEngine.LEVERAGE_CEILING for ${market.id}` },

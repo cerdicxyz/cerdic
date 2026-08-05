@@ -95,6 +95,10 @@ sol! {
             address liquidator,
             uint256 liquidatorReward
         ) external;
+
+        function fundingIndex(bytes32 marketId) external view returns (int256);
+
+        event SealedPositionTouched(bytes32 indexed portfolioKey, bytes32 indexed marketId);
     }
 }
 
@@ -467,6 +471,82 @@ pub async fn load_sealed(
     let decoded = ISettlementEngine::loadSealedCall::abi_decode_returns(&raw, true)
         .map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
     Ok(SealedPosition { sealed_params: decoded.sealedParams, collateral: decoded.collateral })
+}
+
+/// Reads this market's current cumulative funding index (a plaintext,
+/// public contract value — not sealed, unlike position size/side).
+/// Same plain-`eth_call` shape as `load_sealed`. The index is a running
+/// integral (see `PerpMarket.sol`/`FxPerpMarket.sol`'s own
+/// `_updateFundingIndexInternal`), not a rate on its own — callers
+/// derive a rate by sampling this twice and dividing by elapsed time
+/// (see `api::poll_funding_and_oi`'s own doc on why that's only exact
+/// for FxPerpMarket, whose index accrues by real seconds; PerpMarket
+/// accrues by BLOCK count instead, so a wall-clock-derived rate for
+/// those markets is a stated approximation, not exact).
+pub async fn load_funding_index(
+    market_id: FixedBytes<32>,
+    contract: Option<Address>,
+) -> Result<i128, LoadSealedError> {
+    use alloy::{
+        network::TransactionBuilder,
+        providers::{Provider, ProviderBuilder},
+        rpc::types::TransactionRequest,
+    };
+
+    let (rpc_url, contract) = broadcast_config(contract).ok_or(LoadSealedError::NotConfigured)?;
+    let provider =
+        ProviderBuilder::new().on_http(rpc_url.parse().map_err(|e| LoadSealedError::Rpc(format!("{e}")))?);
+
+    let call = ISettlementEngine::fundingIndexCall { marketId: market_id };
+    let calldata = Bytes::from(call.abi_encode());
+
+    let tx = TransactionRequest::default().with_to(contract).with_input(calldata);
+    let raw = provider.call(&tx).await.map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+
+    let decoded = ISettlementEngine::fundingIndexCall::abi_decode_returns(&raw, true)
+        .map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+    i128::try_from(decoded._0).map_err(|_| LoadSealedError::Rpc("fundingIndex overflowed i128".into()))
+}
+
+/// Discovers every `portfolioKey` this market's contract has ever
+/// touched (via the public `SealedPositionTouched` event — the exact
+/// discovery surface `docs/spec-contracts-tee.md` section 2.4 describes
+/// for keepers, see that event's own Solidity doc) and sums each one's
+/// CURRENT plaintext collateral. This is NOT open interest in the usual
+/// sense (total position size) — position size/side stays sealed,
+/// genuinely unreadable, by design. It's a real, honest proxy instead:
+/// total collateral committed to this market right now, which is public
+/// precisely because `SealedPosition.collateral` was never sealed (see
+/// `SettlementEngine.sol`'s own doc on why: it's the kernel's own
+/// solvency bound, not private position detail). `from_block` lets
+/// `poll_funding_and_oi` avoid rescanning the whole chain every cycle.
+pub async fn index_open_interest(
+    market_id: FixedBytes<32>,
+    contract: Option<Address>,
+    from_block: u64,
+) -> Result<(Vec<FixedBytes<32>>, u64), LoadSealedError> {
+    use alloy::{
+        primitives::B256,
+        providers::{Provider, ProviderBuilder},
+        rpc::types::Filter,
+        sol_types::SolEvent,
+    };
+
+    let (rpc_url, contract) = broadcast_config(contract).ok_or(LoadSealedError::NotConfigured)?;
+    let provider =
+        ProviderBuilder::new().on_http(rpc_url.parse().map_err(|e| LoadSealedError::Rpc(format!("{e}")))?);
+
+    let latest = provider.get_block_number().await.map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+    let filter = Filter::new()
+        .address(contract)
+        .event_signature(ISettlementEngine::SealedPositionTouched::SIGNATURE_HASH)
+        .topic2(B256::from(market_id))
+        .from_block(from_block)
+        .to_block(latest);
+
+    let logs = provider.get_logs(&filter).await.map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+    let keys = logs.iter().filter_map(|log| log.topics().get(1).copied()).collect();
+    Ok((keys, latest + 1))
 }
 
 async fn broadcast(

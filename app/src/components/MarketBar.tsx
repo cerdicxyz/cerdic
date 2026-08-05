@@ -1,5 +1,7 @@
 import type { Market } from './MarketDropdown';
 import { MarketDropdown } from './MarketDropdown';
+import { useFunding } from '../hooks/useFunding';
+import { useOpenInterest } from '../hooks/useOpenInterest';
 import { useOrderBook } from '../hooks/useOrderBook';
 import { formatMarketPrice } from '../lib/priceScale';
 
@@ -18,12 +20,16 @@ import { formatMarketPrice } from '../lib/priceScale';
 // OrderBookDepth uses (useOrderBook.ts) — a second independent
 // subscription to the same market, not shared state, since the backend's
 // broadcast channel already fans out to as many subscribers as connect
-// (book_updates in api.rs). Funding/OI stay "—": no backend endpoint
-// exposes either today (no funding-index read surface, no open-interest
-// tracking), so they're honest placeholders, not wiring gaps.
+// (book_updates in api.rs). Funding/OI are real too now: Funding reads
+// the deployed market contract's own on-chain fundingIndex
+// (useFunding.ts); OI is a collateral proxy indexed off the public
+// SealedPositionTouched event, not exact position size, which stays
+// TEE-sealed by design (useOpenInterest.ts).
 
 export function MarketBar({ market, onSelect }: { market: Market; onSelect: (market: Market) => void }) {
   const liveBook = useOrderBook(market.id);
+  const funding = useFunding(market.id);
+  const oi = useOpenInterest(market.id);
 
   return (
     <div className="flex items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
@@ -34,8 +40,8 @@ export function MarketBar({ market, onSelect }: { market: Market; onSelect: (mar
         value={liveBook.change24hBps !== null ? `${(liveBook.change24hBps / 100).toFixed(2)}%` : '—'}
         tone={liveBook.change24hBps === null ? 'neutral' : liveBook.change24hBps < 0 ? 'short' : 'long'}
       />
-      <Stat label="Funding" value="—" />
-      <Stat label="OI" value="—" />
+      <Stat label="Funding" value={funding.rate1hBps !== null ? `${(funding.rate1hBps / 100).toFixed(4)}%` : '—'} />
+      <Stat label="OI" value={oi.totalCollateral !== null ? oi.totalCollateral.toFixed(0) : '—'} />
     </div>
   );
 }
