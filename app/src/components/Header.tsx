@@ -34,12 +34,7 @@ export function Header() {
         href="/"
         className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline"
       >
-        <span
-          aria-hidden="true"
-          className="text-[15px] leading-none text-accent"
-        >
-          ↗
-        </span>
+        <img src="/logos/android-chrome-192x192.png" alt="" aria-hidden="true" className="h-5 w-5 flex-shrink-0" />
         <span>Cerdic</span>
       </a>
 
