@@ -74,7 +74,10 @@ export function TradesPanel() {
         {TRADES.map((trade, i) => (
           <div key={i} className="grid grid-cols-3 px-[var(--space-4)] py-[var(--space-1)] text-xs">
             <span className="text-text-quaternary">{trade.time}</span>
-            <span className="text-text-primary">{trade.pair}</span>
+            <span className="flex items-center gap-[var(--space-2)] text-text-primary">
+              <img src="/eur.svg" alt="" aria-hidden="true" className="h-4 w-4 flex-shrink-0" />
+              {trade.pair}
+            </span>
             <span className="text-right text-text-primary">{formatSize(trade.size)}</span>
           </div>
         ))}

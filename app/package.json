@@ -9,20 +9,34 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@circle-fin/modular-wallets-core": "^1.0.15",
+    "@privy-io/react-auth": "^3.36.1",
     "@tabler/icons-react": "^3.46.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/react-query": "^5.101.4",
+    "@wagmi/core": "3.6.4",
+    "@web3auth/modal": "^11.3.0",
     "framer-motion": "^12.23.24",
+    "libsodium-wrappers-sumo": "^0.8.4",
     "lightweight-charts": "^5.2.0",
+    "permissionless": "^0.3.7",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router": "^8.3.0",
-    "tailwindcss": "^4.3.3"
+    "rxjs": "^7.8.2",
+    "tailwindcss": "^4.3.3",
+    "viem": "2.55.5",
+    "wagmi": "^3.7.6"
   },
   "devDependencies": {
+    "@types/libsodium-wrappers-sumo": "^0.8.2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.8.3",
     "vite": "^7.0.6"
+  },
+  "overrides": {
+    "viem": "2.55.5"
   }
 }

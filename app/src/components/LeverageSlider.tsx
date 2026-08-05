@@ -4,17 +4,18 @@ import { AnimatePresence, MotionConfig, animate, motion, useMotionValue, useRedu
 // Ported from cer-perp's trading panel (see app/design.md's "why this
 // palette" note): a bar-chart ramp, not a flat <input type="range">, per
 // design.md's Leverage control anti-patterns.
+//
+// Bar generation is derived entirely from the `maxValue` prop (TradePanel
+// passes the real, backend-enforced ceiling: `10_000 / IMR_BPS`, 20x),
+// not a hardcoded range: an earlier version baked in a fixed 1-50 ramp
+// regardless of what maxValue was actually passed, so a 20x ceiling left
+// most of the track rendering dead, unreachable ticks up to 50 and
+// squeezed the real 1-20 range into a fraction of the width, sparse and
+// choppy. One bar per whole step, plus 3 interpolated (decorative, not
+// separately selectable) bars between each pair of steps, keeps the ramp
+// dense regardless of how big maxValue is.
 
 const MIN_LEV = 1;
-// Drives bar heights and tick marks — dense on purpose, the ramp reads as a
-// continuous shape.
-const BAR_MARKS = [1, 3, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50];
-// Drives the clickable text row underneath. A trade panel this narrow can't
-// fit "1x 3x 5x" without the labels colliding, so this is a thinned subset
-// of BAR_MARKS, not the same list — 3x is still a real step (drag or arrow
-// keys reach it), it just isn't its own button.
-const STEP_LABELS = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50];
-const DEFAULT_MAX = 50;
 
 function barHeight(step: number, totalSteps: number) {
   return 10 + (step / totalSteps) * 54;
@@ -26,14 +27,27 @@ export interface LeverageSliderProps {
   maxValue?: number;
 }
 
-export function LeverageSlider({ value, onChange, maxValue = DEFAULT_MAX }: LeverageSliderProps) {
+export function LeverageSlider({ value, onChange, maxValue = 20 }: LeverageSliderProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const thumbX = useMotionValue(0);
   const dragging = useRef(false);
   const [showHandle, setShowHandle] = useState(false);
   const reducedMotion = useReducedMotion();
 
-  const totalSteps = DEFAULT_MAX - MIN_LEV;
+  const totalSteps = maxValue - MIN_LEV;
+  const barMarks = Array.from({ length: totalSteps + 1 }, (_, i) => MIN_LEV + i);
+  // Clickable text row underneath: a trade panel this narrow can't fit a
+  // label per whole step without them colliding, so this is a small,
+  // evenly-spaced subset of barMarks — every other step is still a real,
+  // reachable value (drag or arrow keys), it just isn't its own button.
+  const labelCount = Math.min(6, totalSteps + 1);
+  const stepLabels = Array.from(
+    new Set(
+      Array.from({ length: labelCount }, (_, i) =>
+        Math.round(MIN_LEV + (i / (labelCount - 1)) * totalSteps),
+      ),
+    ),
+  );
   const trackWidth = () => trackRef.current?.clientWidth ?? 0;
   const leverageToX = (lev: number) => {
     const width = trackWidth();
@@ -116,16 +130,16 @@ export function LeverageSlider({ value, onChange, maxValue = DEFAULT_MAX }: Leve
     }
   };
 
-  const majors = BAR_MARKS.map((mark) => ({
+  const majors = barMarks.map((mark) => ({
     pos: (mark - MIN_LEV) / totalSteps,
     height: barHeight(mark - MIN_LEV, totalSteps),
     active: mark <= value,
   }));
 
   const minors: { pos: number; height: number }[] = [];
-  for (let i = 0; i < BAR_MARKS.length - 1; i++) {
-    const stepA = (BAR_MARKS[i] ?? MIN_LEV) - MIN_LEV;
-    const stepB = (BAR_MARKS[i + 1] ?? DEFAULT_MAX) - MIN_LEV;
+  for (let i = 0; i < barMarks.length - 1; i++) {
+    const stepA = (barMarks[i] ?? MIN_LEV) - MIN_LEV;
+    const stepB = (barMarks[i + 1] ?? maxValue) - MIN_LEV;
     for (let j = 1; j <= 3; j++) {
       const fraction = j / 4;
       const step = stepA + fraction * (stepB - stepA);
@@ -225,7 +239,7 @@ export function LeverageSlider({ value, onChange, maxValue = DEFAULT_MAX }: Leve
         </div>
 
         <div className="leverage-slider__step-labels">
-          {STEP_LABELS.map((lev) => (
+          {stepLabels.map((lev) => (
             <button
               key={lev}
               type="button"

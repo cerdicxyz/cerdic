@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { Panel } from './Panel';
 import { PositionsPanel } from './PositionsPanel';
 import { DepositModal } from './DepositModal';
+import { LoginModal } from './LoginModal';
+import { useWallet } from '../wallet/wallet-context';
 
 // Account overview as a modal, not a routed page — reachable from
 // Sidebar's Portfolio icon from anywhere, same overlay pattern as
@@ -19,17 +21,28 @@ import { DepositModal } from './DepositModal';
 //   (T1_HAIRCUT_BPS = 0, T2_HAIRCUT_BPS_MIN = 200 in ProtocolConstants.sol)
 //   — balances themselves come from Account.sol's getCollateralBalance.
 //
-// No wallet is connected yet (see Header.tsx's Connect button), so every
-// balance/number here is a dash — same honesty convention as the rest of
-// the terminal, not fabricated portfolio data.
+// Every balance/number here is still a dash even once a wallet IS
+// connected (see wallet/wallet-context.tsx) — that's a second, distinct
+// honest reason now, not the same one: CollateralEngine.sol/Account.sol
+// aren't deployed on Arc yet (no broadcast/deployments folder exists in
+// packages/contracts), so there's genuinely nothing on-chain to read a
+// balance from, connected or not. The header now shows the real
+// connected address once one exists, so "nothing's connected" and
+// "nothing's deployed" don't get conflated into the same blank state.
 
 const COLLATERAL_ASSETS = [
   { symbol: 'USDC', tier: 1, haircutBps: 0 },
   { symbol: 'USYC', tier: 2, haircutBps: 200 },
 ];
 
+function truncateAddress(address: string) {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
 export function PortfolioModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const wallet = useWallet();
   const [depositOpen, setDepositOpen] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -54,11 +67,21 @@ export function PortfolioModal({ open, onClose }: { open: boolean; onClose: () =
         style={{ boxShadow: 'rgba(255,255,255,0.08) 0 0.4px 0 0 inset, rgb(0,0,0) 0 0 0 0.5px' }}
       >
         <div className="flex items-center justify-between border-b border-border-subtle px-[var(--space-6)] py-[var(--space-4)]">
-          <h2 className="text-sm font-semibold text-text-primary">Portfolio</h2>
+          <div className="flex items-center gap-[var(--space-3)]">
+            <h2 className="text-sm font-semibold text-text-primary">Portfolio</h2>
+            {wallet.status === 'connected' && wallet.address && (
+              <span
+                className="rounded-pill border border-border-subtle bg-surface-raised px-[var(--space-3)] py-px text-[10px] text-text-tertiary"
+                title={wallet.address}
+              >
+                {truncateAddress(wallet.address)}
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-[var(--space-3)]">
             <button
               type="button"
-              onClick={() => setDepositOpen(true)}
+              onClick={() => (wallet.status === 'connected' ? setDepositOpen(true) : setLoginOpen(true))}
               className="rounded-md bg-accent/10 px-[var(--space-5)] py-[var(--space-2)] text-xs font-semibold text-accent transition-colors duration-150 hover:bg-accent/20"
             >
               Deposit
@@ -118,6 +141,7 @@ export function PortfolioModal({ open, onClose }: { open: boolean; onClose: () =
       </div>
 
       <DepositModal open={depositOpen} onClose={() => setDepositOpen(false)} />
+      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Panel } from '../components/Panel';
 import { OrderBookDepth } from '../components/OrderBookDepth';
 import { TradePanel } from '../components/TradePanel';
@@ -6,6 +7,7 @@ import { StatsPanel } from '../components/StatsPanel';
 import { PositionsPanel } from '../components/PositionsPanel';
 import { TradesPanel } from '../components/TradesPanel';
 import { TradeModeDropdown } from '../components/TradeModeDropdown';
+import { MARKETS } from '../components/MarketDropdown';
 
 // Grid ported from cer-perp's trade/route.tsx (24 cols × 12 rows:
 // chart/book/trade on top at h9, positions/stats/tape below at h3). Static
@@ -16,18 +18,25 @@ import { TradeModeDropdown } from '../components/TradeModeDropdown';
 // the shell (Header/Sidebar/ToastContainer) shared across routes.
 // MarketBar lives inside ChartPanel now, not as a row here — see that
 // component's own doc comment for why.
+//
+// Selected-market state lives here, not inside MarketBar/MarketDropdown
+// anymore: OrderBookDepth needs to know which market to stream
+// (useOrderBook.ts), so the selection has to be a sibling both panels
+// can read, not private state a chart-only component owned.
 
 export function TradePage() {
+  const [market, setMarket] = useState(MARKETS[0]);
+
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="trade-grid">
         <div className="trade-grid-main">
           <div className="trade-grid-row trade-grid-row--top">
             <Panel label="Chart" area="chart" noPadding>
-              <ChartPanel />
+              <ChartPanel market={market} onSelectMarket={setMarket} />
             </Panel>
             <Panel label="Order Book" area="book" noPadding>
-              <OrderBookDepth />
+              <OrderBookDepth marketId={market.id} />
             </Panel>
           </div>
           <div className="trade-grid-row trade-grid-row--bottom">
@@ -41,7 +50,7 @@ export function TradePage() {
         </div>
         <div className="trade-grid-side">
           <Panel label="Trade" area="trade" noPadding headerRight={<TradeModeDropdown />}>
-            <TradePanel />
+            <TradePanel market={market} />
           </Panel>
           <Panel label="Trades" area="tape" noPadding>
             <TradesPanel />

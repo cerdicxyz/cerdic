@@ -23,19 +23,19 @@
 
   --color-border-subtle: oklch(1 0 0 / 0.075);
   --color-border-default: #2b2b30;
-  --color-border-focus: #ff0040;
+  --color-border-focus: #e11d48;
 
   --color-text-primary: oklch(0.964 0 0);
   --color-text-secondary: oklch(0.741 0.005 258);
   --color-text-tertiary: oklab(0.964 0 0 / 0.8);
   --color-text-quaternary: oklch(0.559 0.006 275);
 
-  --color-accent: #ff0040;
-  --color-accent-dim: color-mix(in oklch, #ff0040 16%, transparent);
-  --color-accent-strong: #ff3363;
+  --color-accent: #e11d48;
+  --color-accent-dim: color-mix(in oklch, #e11d48 16%, transparent);
+  --color-accent-strong: #f43f5e;
 
   --color-long: oklch(0.72 0.19 152);
-  --color-short: #ff0040;
+  --color-short: #e11d48;
   --color-warning: #ffb454;
   /* Same lightness/chroma as --color-long, hue rotated — the trade
      panel's "Private (shielded)" indicator needed its own color (it
@@ -185,7 +185,7 @@ input[type='number'] {
 
 .trade-grid-row--top {
   flex: 3;
-  grid-template-columns: 15.8fr 3.2fr;
+  grid-template-columns: minmax(0, 15.8fr) minmax(190px, 3.2fr);
   grid-template-areas: 'chart book';
 }
 
@@ -239,8 +239,11 @@ input[type='number'] {
   }
 }
 
-/* ---- Landing hero: the ASCII-dithered wordmark. Not rendered on the
-   current page (see App.tsx), kept here so the treatment isn't lost. ---- */
+/* ---- Landing hero: the ASCII-dithered wordmark. Now rendered on
+   LandingPage.tsx. Recolored from an earlier navy/mint direction
+   (rgba(118,255,214,...)) to the crimson accent design.md's "Why
+   Lighter's tokens" section settled on — that mint was a leftover from
+   before that pivot, never updated when the rest of the app moved. ---- */
 
 .scene {
   position: relative;
@@ -251,8 +254,8 @@ input[type='number'] {
   padding: 24px;
   isolation: isolate;
   background:
-    radial-gradient(circle at top, rgba(118, 255, 214, 0.18), transparent 35%),
-    linear-gradient(135deg, #07111e 0%, #04070d 45%, #010205 100%);
+    radial-gradient(circle at top, rgba(225, 29, 72, 0.16), transparent 35%),
+    linear-gradient(135deg, #1a0508 0%, #050203 45%, #010101 100%);
 }
 
 .scene::before {
@@ -262,7 +265,7 @@ input[type='number'] {
   pointer-events: none;
   background:
     radial-gradient(circle at center, rgba(255, 255, 255, 0.08), transparent 28%),
-    radial-gradient(circle at center, rgba(120, 255, 214, 0.14), transparent 42%);
+    radial-gradient(circle at center, rgba(225, 29, 72, 0.16), transparent 42%);
   filter: blur(32px);
   animation: drift 9s ease-in-out infinite alternate;
 }
@@ -302,14 +305,14 @@ input[type='number'] {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.02) inset,
     0 24px 80px rgba(0, 0, 0, 0.45);
-  color: rgba(236, 255, 248, 0.92);
+  color: rgba(255, 241, 244, 0.92);
   font-family: var(--font-sans);
   font-size: clamp(0.5rem, 0.95vw, 0.95rem);
   line-height: 1.03;
   letter-spacing: 0;
   white-space: pre;
   text-shadow:
-    0 0 10px rgba(120, 255, 214, 0.14),
+    0 0 10px rgba(225, 29, 72, 0.35),
     0 0 1px rgba(255, 255, 255, 0.55);
   animation:
     float 7s ease-in-out infinite,
@@ -428,7 +431,7 @@ input[type='number'] {
 }
 
 .leverage-slider__bar--major[data-active='true'] {
-  background-color: var(--color-privacy);
+  background-color: var(--color-accent);
 }
 
 .leverage-slider__bar--minor {
@@ -452,7 +455,7 @@ input[type='number'] {
 }
 
 .leverage-slider__tick--major[data-active='true'] {
-  background-color: var(--color-privacy);
+  background-color: var(--color-accent);
   opacity: 0.7;
 }
 
@@ -479,7 +482,7 @@ input[type='number'] {
   bottom: 0;
   width: 2px;
   transform: translateX(-1px);
-  background-color: var(--color-privacy);
+  background-color: var(--color-accent);
 }
 
 .leverage-slider__handle {
@@ -497,8 +500,8 @@ input[type='number'] {
 .leverage-slider__handle-grip {
   width: 22px;
   height: 28px;
-  background-color: var(--color-privacy-dim);
-  border: 1px solid var(--color-privacy);
+  background-color: var(--color-accent-dim);
+  border: 1px solid var(--color-accent);
   border-radius: var(--radius-xs);
   display: grid;
   grid-template-columns: repeat(2, 4px);
@@ -513,7 +516,7 @@ input[type='number'] {
   width: 4px;
   height: 4px;
   border-radius: var(--radius-pill);
-  background-color: var(--color-privacy);
+  background-color: var(--color-accent);
   opacity: 0.75;
 }
 
@@ -541,7 +544,7 @@ input[type='number'] {
 
 .leverage-slider__step-label[data-current='true'] {
   font-weight: 600;
-  color: var(--color-privacy);
+  color: var(--color-accent);
 }
 
 .leverage-slider__step-label:disabled {

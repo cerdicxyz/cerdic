@@ -13,7 +13,7 @@ Implementation-ready, token-driven UI guidance for Cerdic's trading terminal. To
 
 ## Why Lighter's tokens, taken directly
 
-Ostium, Meridian, and Lighter are three real extracted systems; the earlier version of this doc blended their scales and kept Cerdic's original navy/mint accent rather than any reference site's own color, on the theory that "verified" reads better than "urgent" for a privacy-first kernel. That reasoning still applies in the abstract — but the current direction is Lighter's system used wholesale: pure black surface, Inter, the tight ~1.76px-multiple spacing scale, 2–4px radii, and Lighter's own `#ff0040` as the one accent, not a substitute mint. Where Lighter's own extraction didn't capture something Cerdic's terminal still needs (a long/bullish color — Lighter's page never surfaced one), that gap is filled with a value tuned to sit at the same brightness as the red, called out explicitly below, not silently invented.
+Ostium, Meridian, and Lighter are three real extracted systems; the earlier version of this doc blended their scales and kept Cerdic's original navy/mint accent rather than any reference site's own color, on the theory that "verified" reads better than "urgent" for a privacy-first kernel. That reasoning still applies in the abstract — but the current direction is Lighter's system used wholesale: pure black surface, Inter, the tight ~1.76px-multiple spacing scale, 2–4px radii, and one accent red. Lighter's own `#ff0040` was the starting point but read too warm/neon in practice, so the accent moved to `#e11d48`, a deeper, more blue-leaning crimson, a deliberate departure from the source, not an oversight. Where Lighter's own extraction didn't capture something Cerdic's terminal still needs (a long/bullish color — Lighter's page never surfaced one), that gap is filled with a value tuned to sit at the same brightness as the red, called out explicitly below, not silently invented.
 
 ## Design Tokens and Foundations
 
@@ -27,22 +27,23 @@ color.surface.pressed   = oklch(1 0 0 / 0.03)
 
 color.border.subtle     = oklch(1 0 0 / 0.07)
 color.border.default    = #2b2b30
-color.border.focus      = #ff0040
+color.border.focus      = #e11d48
 
 color.text.primary      = oklch(0.964 0 0)
 color.text.secondary    = oklch(0.741 0.005 258)
 color.text.tertiary     = oklab(0.964 0 0 / 0.8)
 color.text.quaternary   = oklch(0.559 0.006 275)
 
-color.accent            = #ff0040   /* Lighter's own surface.strong */
-color.accent.dim        = color-mix(in oklch, #ff0040 16%, transparent)
-color.accent.strong     = #ff3363
+color.accent            = #e11d48   /* crimson, deliberately deeper/cooler than Lighter's
+                                        own #ff0040, see "Why Lighter's tokens" above */
+color.accent.dim        = color-mix(in oklch, #e11d48 16%, transparent)
+color.accent.strong     = #f43f5e
 
 color.long              = oklch(0.72 0.19 152)  /* not one of Lighter's extracted tokens —
                                                      the one addition, see "Why Lighter's
                                                      tokens" above */
-color.short             = #ff0040   /* same value as color.accent: they coincide on the
-                                        real site, this is intentional, not a collision */
+color.short             = #e11d48   /* same value as color.accent, intentional, not a
+                                        collision */
 color.warning           = #ffb454
 ```
 

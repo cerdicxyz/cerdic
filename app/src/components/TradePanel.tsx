@@ -1,6 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { LeverageSlider } from './LeverageSlider';
-import { toast } from '../toast/toast-context';
+import { ConnectWallet } from './ConnectWallet';
+import { useWallet } from '../wallet/wallet-context';
+import type { Market } from './MarketDropdown';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -11,8 +13,13 @@ import { toast } from '../toast/toast-context';
 //   (crates/cerdic-tee-matcher/src/api.rs): Market and Limit both post to
 //   POST /order, Offer posts to POST /offer — a standing maker-only quote,
 //   not just a post-only order.
-// - Leverage caps at 20x: required_margin's IMR_BPS = 500 (5%) in api.rs
-//   is 1/0.05 = 20x, the real math this backend enforces.
+// - Leverage caps at the selected market's own ceiling
+//   (SettlementEngine.LEVERAGE_CEILING — genuinely per-market now, 50x for
+//   FX majors, 30x for everything else, see MarketDropdown.tsx's MARKETS).
+//   The matcher itself doesn't enforce or validate leverage (a deliberate
+//   simplicity choice — it forwards whatever a signed order carries
+//   straight into SealedParams), so this cap is purely what the contract
+//   side will actually accept.
 // - "Exit Strategy" is Ostium's name for the same thing our SealedParams
 //   already models: take_profit/stop_loss.
 // - Margin Requirement is computed live from the trader's own Price ×
@@ -22,9 +29,6 @@ import { toast } from '../toast/toast-context';
 //   fabricated numbers — same convention as the rest of the terminal, and
 //   the honest reason this doesn't copy Ostium's "0.02%" fee figures: this
 //   backend has no fee schedule or funding-rate calculation yet.
-
-const IMR_BPS = 500; // api.rs's required_margin: tick * qty * IMR_BPS / 10_000
-const MAX_LEVERAGE = 10_000 / IMR_BPS; // = 20x, derived, not a round number picked by hand
 
 type Side = 'long' | 'short';
 type OrderType = 'market' | 'limit' | 'offer';
@@ -47,7 +51,8 @@ function sanitizeDecimal(value: string): string {
   return cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, '');
 }
 
-export function TradePanel() {
+export function TradePanel({ market }: { market: Market }) {
+  const wallet = useWallet();
   const [side, setSide] = useState<Side>('long');
   const [orderType, setOrderType] = useState<OrderType>('market');
   const [leverageOpen, setLeverageOpen] = useState(false);
@@ -58,6 +63,20 @@ export function TradePanel() {
   const [takeProfit, setTakeProfit] = useState('');
   const [stopLoss, setStopLoss] = useState('');
 
+  const maxLeverage = market.leverage;
+  // Solidity's own integer-division truncation (SettlementEngine's
+  // `IMR_BPS = BPS_DENOMINATOR / leverageCeiling_`), not a fractional bps
+  // value — kept in the same rounding direction so this estimate matches
+  // what the contract will actually require, not a prettier number.
+  const imrBps = Math.floor(10_000 / maxLeverage);
+
+  // A leverage chosen under a previous market's higher ceiling can exceed
+  // this one's — clamp down rather than let the slider silently hold an
+  // invalid value across a market switch.
+  useEffect(() => {
+    setLeverage((current) => Math.min(current, maxLeverage));
+  }, [maxLeverage]);
+
   // Derived from the trader's own Price/Amount, mirroring
   // SettlementEngine.requiredMargin's formula shape — real arithmetic,
   // not a placeholder, only ever computed from what's typed in.
@@ -65,8 +84,8 @@ export function TradePanel() {
     const qty = parseNum(amount);
     const tick = parseNum(price);
     if (qty === null || tick === null) return null;
-    return (qty * tick * IMR_BPS) / 10_000;
-  }, [amount, price]);
+    return (qty * tick * imrBps) / 10_000;
+  }, [amount, price, imrBps]);
 
   const showPrice = orderType === 'limit' || orderType === 'offer';
 
@@ -129,9 +148,9 @@ export function TradePanel() {
 
       {leverageOpen && (
         <div className="rounded-md border border-border-subtle bg-surface-raised p-[var(--space-4)]">
-          <LeverageSlider value={leverage} onChange={setLeverage} maxValue={MAX_LEVERAGE} />
+          <LeverageSlider value={leverage} onChange={setLeverage} maxValue={maxLeverage} />
           <p className="mt-[var(--space-2)] text-[10px] text-text-quaternary">
-            Max {MAX_LEVERAGE}x — {IMR_BPS / 100}% initial margin, portfolio-margined across every open position
+            Max {maxLeverage}x — {(imrBps / 100).toFixed(2)}% initial margin, portfolio-margined across every open position
           </p>
         </div>
       )}
@@ -227,13 +246,22 @@ export function TradePanel() {
         </div>
       )}
 
-      <button
-        type="button"
-        onClick={() => toast.info('Wallet connection coming soon', 'No wallet integration is wired up yet.')}
-        className="rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent transition-colors duration-150 hover:bg-accent/20"
-      >
-        Connect Wallet to Trade
-      </button>
+      {wallet.status === 'connected' ? (
+        // Order submission itself isn't wired to cerdic-tee-matcher yet
+        // (a separate, larger backend-wiring task, deliberately out of
+        // scope here) — this stays honestly disabled rather than
+        // pretending a connected wallet can already place a real order.
+        <button
+          type="button"
+          disabled
+          title="Order submission isn't wired to the backend yet"
+          className="cursor-not-allowed rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent opacity-50"
+        >
+          Trading not wired up yet
+        </button>
+      ) : (
+        <ConnectWallet variant="panel" />
+      )}
 
       <div className="flex flex-col gap-[var(--space-2)] text-xs">
         <div className="flex items-center justify-between">

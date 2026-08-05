@@ -1,6 +1,7 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
 import { MarketBar } from './MarketBar';
+import type { Market } from './MarketDropdown';
 import { usePersistedState } from '../hooks/usePersistedState';
 
 // Chart panel, structured like the reference (Lighter's own chart widget):
@@ -20,6 +21,9 @@ import { usePersistedState } from '../hooks/usePersistedState';
 // from OrderBookDepth's heatmap) is simply a later phase.
 
 const TIMEFRAMES: Timeframe[] = ['5m', '15m', '1h', '4h'];
+// Not in the pill row above — reachable through "More" instead, same
+// setTimeframe/persisted-state path either way.
+const MORE_TIMEFRAMES: Timeframe[] = ['1m', '30m', '1d'];
 type SubTab = 'price' | 'funding' | 'details';
 type ChartType = 'original' | 'tradingview' | 'depth';
 
@@ -34,17 +38,35 @@ function formatOhlc(candle: OhlcHover) {
   };
 }
 
-export function ChartPanel() {
+export function ChartPanel({ market, onSelectMarket }: { market: Market; onSelectMarket: (market: Market) => void }) {
   const [subTab, setSubTab] = useState<SubTab>('price');
   const [chartType, setChartType] = useState<ChartType>('original');
   const [timeframe, setTimeframe] = usePersistedState<Timeframe>('chartTimeframe', '5m');
   const [hover, setHover] = useState<OhlcHover | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
 
   const handleHover = useCallback((candle: OhlcHover | null) => setHover(candle), []);
 
+  useEffect(() => {
+    if (!moreOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (moreRef.current && !moreRef.current.contains(event.target as Node)) setMoreOpen(false);
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') setMoreOpen(false);
+    }
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [moreOpen]);
+
   return (
     <div className="flex h-full flex-col">
-      <MarketBar />
+      <MarketBar market={market} onSelect={onSelectMarket} />
       <div className="flex items-center gap-[var(--space-5)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
         {(['price', 'funding', 'details'] as const).map((tab) => (
           <button
@@ -80,9 +102,44 @@ export function ChartPanel() {
                   {tf}
                 </button>
               ))}
-              <button type="button" className="text-xs font-medium text-text-tertiary hover:text-text-secondary">
-                More ▾
-              </button>
+              <div ref={moreRef} className="relative">
+                <button
+                  type="button"
+                  onClick={() => setMoreOpen((v) => !v)}
+                  aria-expanded={moreOpen}
+                  className={`text-xs font-medium transition-colors duration-150 ${
+                    moreOpen || MORE_TIMEFRAMES.includes(timeframe)
+                      ? 'text-text-primary'
+                      : 'text-text-tertiary hover:text-text-secondary'
+                  }`}
+                >
+                  {MORE_TIMEFRAMES.includes(timeframe) ? timeframe : 'More'} ▾
+                </button>
+                {moreOpen && (
+                  <div
+                    className="absolute left-0 top-[calc(100%+var(--space-2))] z-50 flex min-w-20 flex-col gap-[var(--space-1)] rounded-md border border-border-subtle bg-surface-overlay p-[var(--space-2)]"
+                    style={{ boxShadow: 'rgba(255,255,255,0.08) 0 0.4px 0 0 inset, rgb(0,0,0) 0 0 0 0.5px' }}
+                  >
+                    {MORE_TIMEFRAMES.map((tf) => (
+                      <button
+                        key={tf}
+                        type="button"
+                        onClick={() => {
+                          setTimeframe(tf);
+                          setMoreOpen(false);
+                        }}
+                        className={`rounded-sm px-[var(--space-2)] py-[var(--space-1)] text-left text-xs font-medium transition-colors duration-150 ${
+                          timeframe === tf
+                            ? 'bg-surface-hover text-text-primary'
+                            : 'text-text-tertiary hover:text-text-secondary'
+                        }`}
+                      >
+                        {tf}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
             <div className="flex items-center gap-[var(--space-4)]">
               {(['tradingview', 'original', 'depth'] as const).map((type) => (
@@ -137,7 +194,7 @@ export function ChartPanel() {
                 <span className="text-chart-line">MA20: {hover.ma20?.toFixed(2) ?? '—'}</span>
               </div>
             )}
-            <PriceChart timeframe={timeframe} onHover={handleHover} />
+            <PriceChart marketId={market.id} timeframe={timeframe} onHover={handleHover} />
           </div>
         </>
       )}

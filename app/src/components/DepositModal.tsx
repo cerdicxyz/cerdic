@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { IconCheck } from '@tabler/icons-react';
 import { toast } from '../toast/toast-context';
+import { useWallet } from '../wallet/wallet-context';
 
 // Deposit flow, modal so it's reachable from anywhere (Header, Portfolio)
 // without a full page navigation for what's a quick action.
@@ -20,9 +21,15 @@ import { toast } from '../toast/toast-context';
 // this deployment the formula reduces to amount * (1 - haircut), which
 // is exactly what's computed below.
 //
-// No wallet integration exists yet (see Header.tsx's Connect button), so
-// both steps end in the same "connect a wallet first" toast rather than
-// pretending to submit a transaction that has nowhere to go.
+// Two distinct honest end states now, not one: disconnected still ends
+// in "connect a wallet first," but a CONNECTED wallet (see
+// wallet/wallet-context.tsx) ends in a different, more specific message
+// — Account.sol/CollateralEngine.sol aren't deployed on Arc yet (no
+// broadcast/deployments folder exists in packages/contracts), so even a
+// real connected smart account has nowhere real to send an approve/
+// deposit transaction to. Conflating "no wallet" and "no deployed
+// contract" into the same generic toast would have been less honest
+// than either one on its own.
 
 const ASSETS = [
   { symbol: 'USDC', tier: 1, haircutBps: 0 },
@@ -39,6 +46,7 @@ function sanitizeDecimal(value: string): string {
 type Step = 'approve' | 'deposit';
 
 export function DepositModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const wallet = useWallet();
   const [asset, setAsset] = useState(ASSETS[0].symbol);
   const [amount, setAmount] = useState('');
   const [step, setStep] = useState<Step>('approve');
@@ -156,12 +164,19 @@ export function DepositModal({ open, onClose }: { open: boolean; onClose: () => 
               type="button"
               disabled={amountValue === null}
               onClick={() => {
-                // No wallet is connected, so there's no real allowance to
-                // request — this advances the local step UI so the
-                // two-step shape is visible, while the toast stays honest
-                // that nothing was actually submitted on-chain.
+                // Advances the local step UI either way so the two-step
+                // shape is visible, but the toast now tells the truth
+                // about WHICH thing is actually missing, not always the
+                // same "connect a wallet" line regardless of real state.
                 setStep('deposit');
-                toast.info('Wallet connection required', 'Connect a wallet to actually approve and deposit.');
+                if (wallet.status !== 'connected') {
+                  toast.info('Wallet connection required', 'Connect a wallet to actually approve and deposit.');
+                } else {
+                  toast.info(
+                    'Contracts not deployed yet',
+                    "CollateralEngine.sol isn't deployed on Arc Testnet yet, nothing to send this approval to.",
+                  );
+                }
               }}
               className="rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent transition-colors duration-150 hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -172,7 +187,14 @@ export function DepositModal({ open, onClose }: { open: boolean; onClose: () => 
               type="button"
               disabled={amountValue === null}
               onClick={() => {
-                toast.info('Wallet connection required', 'Connect a wallet to approve and deposit.');
+                if (wallet.status !== 'connected') {
+                  toast.info('Wallet connection required', 'Connect a wallet to approve and deposit.');
+                } else {
+                  toast.info(
+                    'Contracts not deployed yet',
+                    "Account.sol isn't deployed on Arc Testnet yet, nothing to send this deposit to.",
+                  );
+                }
               }}
               className="rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent transition-colors duration-150 hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
             >

@@ -1,7 +1,7 @@
 import { Link, useLocation } from 'react-router';
 import { IconCopy } from '@tabler/icons-react';
-import { toast } from '../toast/toast-context';
 import { SettingsDropdown } from './SettingsDropdown';
+import { ConnectWallet } from './ConnectWallet';
 
 // Site-level header, layout ported from the reference: wordmark left,
 // section nav centered, utility icons + Connect right. Sits above the
@@ -78,18 +78,7 @@ export function Header() {
           <IconCopy size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
         </button>
         <SettingsDropdown />
-        <button
-          type="button"
-          onClick={() =>
-            toast.info(
-              'Wallet connection coming soon',
-              'No wallet integration is wired up yet.',
-            )
-          }
-          className="rounded-pill bg-accent/10 px-[var(--space-6)] py-[var(--space-3)] text-[13px] font-semibold text-accent transition-colors duration-150 hover:bg-accent/20"
-        >
-          Connect
-        </button>
+        <ConnectWallet variant="header" />
       </div>
     </header>
   );
