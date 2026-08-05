@@ -35,11 +35,15 @@ export function Sidebar({
       aria-label="Primary"
       className="flex w-14 flex-shrink-0 flex-col items-center gap-[var(--space-6)] border-r border-border-subtle py-[var(--space-4)]"
     >
+      {/* Same mark as Header.tsx's own wordmark (↗, accent color) — this
+          used to be a plain "c" monogram in a colored box, a different,
+          unrelated mark sitting right below the real one. */}
       <div
         title="Cerdic"
-        className="grid h-7 w-7 place-items-center rounded-xs bg-accent-dim text-sm font-bold lowercase text-accent"
+        aria-hidden="true"
+        className="grid h-7 w-7 place-items-center rounded-xs bg-accent-dim text-base leading-none text-accent"
       >
-        c
+        ↗
       </div>
       <div className="flex flex-col gap-[var(--space-2)]">
         <Link
