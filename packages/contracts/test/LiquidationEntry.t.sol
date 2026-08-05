@@ -40,6 +40,46 @@ contract MockMarkPriceOracle {
     }
 }
 
+/// @dev Stand-in mark-price oracle that also implements the optional
+///      IDiscoveryBoundsOracle surface, so tests can flip `live` to simulate
+///      OracleHub's discovery-bounds fallback engaging (docs/trade-xyz-research.md
+///      section 2). Existing tests keep using the plain MockMarkPriceOracle above,
+///      which does NOT implement this surface, to prove the gate fails open for
+///      any oracle that doesn't support it.
+contract MockDiscoveryBoundsOracle {
+    uint256 public price;
+    bool public boundsEnabled;
+    bool public live = true;
+
+    constructor(uint256 initialPrice) {
+        price = initialPrice;
+    }
+
+    function setPrice(uint256 newPrice) external {
+        price = newPrice;
+    }
+
+    function setBoundsEnabled(bool enabled) external {
+        boundsEnabled = enabled;
+    }
+
+    function setLive(bool isLive) external {
+        live = isLive;
+    }
+
+    function markPrice(bytes32) external view returns (uint256) {
+        return price;
+    }
+
+    function discoveryBoundsEnabled(bytes32) external view returns (bool) {
+        return boundsEnabled;
+    }
+
+    function isPriceLive(bytes32) external view returns (bool) {
+        return live;
+    }
+}
+
 /// @dev Stand-in market extension (todo #14): permissive validator, no-op
 ///      lifecycle hooks with an `onLiquidation` invocation record, and the
 ///      canonical `MarketPosition` decoder (absolute size, matching the
@@ -511,6 +551,83 @@ contract LiquidationEntryTest is Test {
         vm.prank(admin);
         account.freezeAccount(trader);
         vm.expectRevert(LiquidationEntry.OracleNotSet.selector);
+        vm.prank(liquidator);
+        entry.executeStandardLiquidation(trader, MARKET_ID, type(uint256).max);
+    }
+
+    // ---------------------------------------------------------------------
+    // Discovery-bounds gating (docs/trade-xyz-research.md section 2).
+    // ---------------------------------------------------------------------
+
+    /// @notice A plain oracle that doesn't implement IDiscoveryBoundsOracle at all
+    ///         (MockMarkPriceOracle, same as every other test in this file) never
+    ///         gates — liquidation flags exactly as before this feature existed.
+    function test_LiquidationStillFlagsWhenOracleDoesNotSupportDiscoveryBounds() public {
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice A discovery-bounds oracle with bounds DISABLED for this market
+    ///         behaves exactly like a plain oracle — the gate only ever engages
+    ///         for a market that opted in.
+    function test_LiquidationFlagsWhenBoundsSupportedButDisabled() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice Bounds enabled but the live feed unavailable: checkAndFlag refuses
+    ///         to flag off the fallback price rather than triggering a liquidation
+    ///         nobody could have defended against during a price gap.
+    function test_CheckAndFlagRefusesToFlagOnUnreliableFallback() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertFalse(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice Once the feed is live again, the exact same account flags normally.
+    function test_CheckAndFlagResumesOnceFeedIsLiveAgain() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertFalse(entry.checkAndFlag(trader, MARKET_ID));
+
+        boundsOracle.setLive(true);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice executeStandardLiquidation reverts (rather than silently no-op'ing)
+    ///         when the fallback is unreliable, since a caller reaching execute
+    ///         already believes the account was validly flagged.
+    function test_ExecuteStandardLiquidationRevertsOnUnreliableFallback() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+
+        vm.expectRevert(abi.encodeWithSelector(LiquidationEntry.PriceUnreliable.selector, MARKET_ID));
         vm.prank(liquidator);
         entry.executeStandardLiquidation(trader, MARKET_ID, type(uint256).max);
     }

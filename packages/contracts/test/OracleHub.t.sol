@@ -510,6 +510,165 @@ contract OracleHubTest is Test {
     }
 
     // ---------------------------------------------------------------------
+    // Discovery bounds (docs/trade-xyz-research.md section 2).
+    // ---------------------------------------------------------------------
+
+    /// @dev EXPECTED_PRICE = 60_000e18; 500 bps = +-5%, so lo=57_000e18, hi=63_000e18.
+    uint16 internal constant BOUND_BPS = 500;
+
+    function test_DiscoveryBoundsDisabledByDefault() public view {
+        assertFalse(hub.discoveryBoundsEnabled(BTC_USD_FEED));
+    }
+
+    /// @notice A market without discovery bounds keeps reverting exactly as before —
+    ///         enabling bounds for one market must never change another market's
+    ///         (or the same market's, before opt-in) behavior.
+    function test_MarkPriceRevertsOnStaleWhenBoundsNotEnabled() public {
+        vm.warp(block.timestamp + 61);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PythConsumer.StalePrice.selector, BTC_USD_FEED, block.timestamp - 61, block.timestamp
+            )
+        );
+        hub.markPrice(BTC_USD_FEED);
+    }
+
+    /// @notice Enabling bounds and then losing the live feed (stale Pyth) falls back
+    ///         to the reference price instead of reverting.
+    function test_MarkPriceFallsBackToReferenceWhenLiveFeedStale() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+
+        vm.warp(block.timestamp + 61);
+        assertEq(hub.markPrice(BTC_USD_FEED), EXPECTED_PRICE);
+    }
+
+    /// @notice While the live feed is fresh, bounds-enabled markets still read the
+    ///         real median — the fallback only ever engages when the live path fails.
+    function test_MarkPriceUsesLiveFeedWhenBoundsEnabledButFresh() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+        assertEq(hub.markPrice(BTC_USD_FEED), EXPECTED_PRICE);
+    }
+
+    function test_SetDiscoveryBoundsOnlyAdmin() public {
+        vm.expectRevert(OracleHub.NotAdmin.selector);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+    }
+
+    function test_SetDiscoveryBoundsRevertsOnZeroReferenceWhileEnabling() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OracleHub.InvalidDiscoveryBounds.selector, BTC_USD_FEED));
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, 0, BOUND_BPS, 2);
+    }
+
+    function test_SetDiscoveryBoundsRevertsOnZeroBoundBpsWhileEnabling() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OracleHub.InvalidDiscoveryBounds.selector, BTC_USD_FEED));
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, 0, 2);
+    }
+
+    function test_IsPriceLiveTracksFeedAvailability() public {
+        assertTrue(hub.isPriceLive(BTC_USD_FEED));
+        vm.warp(block.timestamp + 61);
+        assertFalse(hub.isPriceLive(BTC_USD_FEED));
+    }
+
+    function test_RefreshDiscoveryReferenceRevertsWhenNotEnabled() public {
+        vm.expectRevert(abi.encodeWithSelector(OracleHub.DiscoveryBoundsNotEnabled.selector, BTC_USD_FEED));
+        hub.refreshDiscoveryReference(BTC_USD_FEED);
+    }
+
+    function test_RefreshDiscoveryReferenceRevertsWhenLiveFeedUnavailable() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+        vm.warp(block.timestamp + 61);
+        vm.expectRevert(abi.encodeWithSelector(OracleHub.PriceUnavailable.selector, BTC_USD_FEED));
+        hub.refreshDiscoveryReference(BTC_USD_FEED);
+    }
+
+    /// @notice A live price that stays mid-band leaves the reference untouched.
+    function test_RefreshDiscoveryReferenceNoOpMidBand() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+
+        uint256 newRef = hub.refreshDiscoveryReference(BTC_USD_FEED);
+        assertEq(newRef, EXPECTED_PRICE);
+        (, uint256 referencePrice,, uint8 resetsRemaining) = hub.discoveryBounds(BTC_USD_FEED);
+        assertEq(referencePrice, EXPECTED_PRICE);
+        assertEq(resetsRemaining, 2);
+    }
+
+    /// @notice A live price that closes >=90% of the distance to the lower bound
+    ///         re-anchors the reference to that edge and consumes one reset.
+    ///         lo = 57_000e18, boundAmount = 3_000e18, edgeMargin (10%) = 300e18,
+    ///         so any live price <= 57_300e18 should trigger the reset.
+    function test_RefreshDiscoveryReferenceReanchorsNearLowerEdge() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+
+        vm.warp(block.timestamp + 1);
+        int64 nearLowEdgePrice = 5_720_000_000_000; // 57_200.00000000 at expo -8
+        _pushPythPrice(nearLowEdgePrice);
+        vm.prank(admin);
+        aggregator.updateAnswer(5_720_000_000_000);
+
+        uint256 newRef = hub.refreshDiscoveryReference(BTC_USD_FEED);
+        assertEq(newRef, 57_000e18);
+        (, uint256 referencePrice,, uint8 resetsRemaining) = hub.discoveryBounds(BTC_USD_FEED);
+        assertEq(referencePrice, 57_000e18);
+        assertEq(resetsRemaining, 1);
+    }
+
+    /// @notice Symmetric to the lower-edge case: a price near the upper bound
+    ///         re-anchors to hi = 63_000e18.
+    function test_RefreshDiscoveryReferenceReanchorsNearUpperEdge() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 2);
+
+        vm.warp(block.timestamp + 1);
+        int64 nearHighEdgePrice = 6_280_000_000_000; // 62_800.00000000 at expo -8
+        _pushPythPrice(nearHighEdgePrice);
+        vm.prank(admin);
+        aggregator.updateAnswer(6_280_000_000_000);
+
+        uint256 newRef = hub.refreshDiscoveryReference(BTC_USD_FEED);
+        assertEq(newRef, 63_000e18);
+        (, uint256 referencePrice,,) = hub.discoveryBounds(BTC_USD_FEED);
+        assertEq(referencePrice, 63_000e18);
+    }
+
+    /// @notice Once resets are exhausted, a live price beyond the (now-stale) edge no
+    ///         longer moves the reference — the capped-resets safety property.
+    function test_RefreshDiscoveryReferenceStopsMovingOnceResetsExhausted() public {
+        vm.prank(admin);
+        hub.setDiscoveryBounds(BTC_USD_FEED, true, EXPECTED_PRICE, BOUND_BPS, 1);
+
+        vm.warp(block.timestamp + 1);
+        int64 nearLowEdgePrice = 5_720_000_000_000;
+        _pushPythPrice(nearLowEdgePrice);
+        vm.prank(admin);
+        aggregator.updateAnswer(5_720_000_000_000);
+        hub.refreshDiscoveryReference(BTC_USD_FEED);
+        (, uint256 refAfterFirst,, uint8 resetsAfterFirst) = hub.discoveryBounds(BTC_USD_FEED);
+        assertEq(refAfterFirst, 57_000e18);
+        assertEq(resetsAfterFirst, 0);
+
+        // Reference is now 57_000e18; a price near ITS lower edge would normally
+        // reset again, but resetsRemaining is exhausted so it must no-op.
+        vm.warp(block.timestamp + 1);
+        int64 stillFallingPrice = 5_430_000_000_000; // 54_300.00000000
+        _pushPythPrice(stillFallingPrice);
+        vm.prank(admin);
+        aggregator.updateAnswer(5_430_000_000_000);
+        uint256 finalRef = hub.refreshDiscoveryReference(BTC_USD_FEED);
+        assertEq(finalRef, 57_000e18);
+        (, uint256 refAfterSecond,, uint8 resetsAfterSecond) = hub.discoveryBounds(BTC_USD_FEED);
+        assertEq(refAfterSecond, 57_000e18);
+        assertEq(resetsAfterSecond, 0);
+    }
+
+    // ---------------------------------------------------------------------
     // Gas budget.
     // ---------------------------------------------------------------------
 

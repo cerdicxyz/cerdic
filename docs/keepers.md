@@ -26,11 +26,23 @@ PYTH_CONTRACT_ADDRESS=<real Pyth contract on Arc testnet> \
 KEEPER_PRIVATE_KEY=<funded keeper key> \
 PYTH_FEED_IDS=a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b,e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43 \
 KEEPER_POLL_INTERVAL_SECS=20 \
+FX_MARKET_IDS=a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b \
+ORACLE_HUB_ADDRESS=<deployed OracleHub address> \
 cargo run --release --bin keeper_price_pusher
 ```
 
 Run one instance per (RPC, feed set) pair; feed ids should cover every
 market's Pyth feed at once, not one process per market.
+
+`FX_MARKET_IDS`/`ORACLE_HUB_ADDRESS` are optional, and needed only for
+markets with `OracleHub.setDiscoveryBounds` enabled (see the discovery-bounds
+section below): every id in `FX_MARKET_IDS` must also be listed in
+`PYTH_FEED_IDS`. Two effects (`crates/cerdic-tee-matcher/src/market_hours.rs`,
+`docs/trade-xyz-research.md` sections 1/9): a large move on a closed FX
+weekend logs at `info`, not `warn` (an expected gap, not an alarm), and while
+the FX week is open this keeper also calls `OracleHub.refreshDiscoveryReference`
+for each configured id, keeping that market's discovery-bounds reference
+walking forward with real price moves instead of going stale.
 
 ## 2. `keeper_liquidator` — the spec's own liquidation-keeper role
 
@@ -121,10 +133,44 @@ is fine, real central-bank rates only move on policy schedule) and
 
 ```bash
 RPC_URL=<arc-testnet-rpc> \
+MATCHER_URL=http://<matcher-host>:8787 \
 FX_MARKET_ADDRESS=<FxPerpMarket address> \
+FX_MARKET_ID="EURC/USDC" \
 PRIVATE_KEY=<key holding RATE_KEEPER_ROLE> \
 ./scripts/keeper-fx-rate.sh
 ```
+
+Market-hours aware (`docs/trade-xyz-research.md` section 9): the premium
+term is forced to 0 during the closed FX week (Friday 21:00 UTC - Sunday
+21:00 UTC, approximating 5pm ET) rather than trusting a thin weekend
+order-book mid — the rate-differential term still pushes on the same
+schedule regardless, since central-bank rates don't stop mattering over a
+weekend.
+
+## 5. Discovery bounds — `OracleHub.setDiscoveryBounds`
+
+Not a standing keeper process, a one-time (or as-needed) admin call, but
+listed here since it's what `keeper_price_pusher`'s `FX_MARKET_IDS` above
+actually feeds. Bounds mark price to `referencePrice ± boundBps` for a
+market whenever the live Pyth/Chainlink feed is unavailable, instead of
+reverting — see `docs/trade-xyz-research.md` section 2 for the full
+mechanism and its one real simplification versus trade[XYZ]'s own design
+(no order-flow-driven EWMA, since the TEE matcher has no RPC client to read
+chain state).
+
+```bash
+cast send <OracleHub address> \
+  "setDiscoveryBounds(bytes32,bool,uint256,uint16,uint8)" \
+  <marketId> true <initial reference price, 1e18-scaled> 500 2 \
+  --rpc-url <arc-testnet-rpc> --private-key <admin key>
+```
+
+`boundBps=500` is ±5% (matching the existing 20x leverage every market
+runs at today); `maxResets=2` caps how many times the reference can walk to
+a bound edge before it stops moving until an admin resets it. Liquidation is
+refused (`LiquidationEntry.checkAndFlag`/`executeStandardLiquidation`) for a
+bounds-enabled market whenever its live feed is unavailable — `keeper_liquidator`
+needs no changes for this, the gate lives entirely in the contracts.
 
 ## Operational notes common to all four
 

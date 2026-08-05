@@ -433,6 +433,10 @@ pub struct AppState {
     /// and skips broadcasting rather than guessing, same "honest nothing
     /// to submit to" posture as an unconfigured `SETTLEMENT_RPC_URL`.
     settlement_contracts: HashMap<MarketId, alloy::primitives::Address>,
+    /// Cumulative notional volume per trader, priced against `fees::FEE_TIERS`.
+    /// See `fees.rs`'s module doc: cumulative-since-inception, not a rolling
+    /// window, and the same unbounded-growth caveat as `last_nonce`.
+    trader_volume: Mutex<HashMap<Address, u128>>,
 }
 
 impl AppState {
@@ -459,6 +463,7 @@ impl AppState {
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
+            trader_volume: Mutex::new(HashMap::new()),
         }
     }
 
@@ -485,6 +490,7 @@ impl AppState {
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
+            trader_volume: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -770,6 +776,11 @@ async fn post_order(
     let mut taker_total_qty: u128 = 0;
     let mut taker_weighted_price: u128 = 0;
     let mut taker_total_margin: u128 = 0;
+    // Priced once against volume BEFORE this sweep (fees.rs's own doc: a
+    // trader can't buy a better rate on the same trade that earns it), then
+    // applied per-fill below at that one fixed tier for the whole sweep.
+    let taker_prior_volume =
+        *state.trader_volume.lock().expect("trader_volume mutex poisoned").get(&signer).unwrap_or(&0);
     let mut provable_fills = Vec::new();
     for (fill_index, fill) in result.fills.iter().enumerate() {
         if crate::proof::should_prove(fill.qty) {
@@ -814,10 +825,17 @@ async fn post_order(
             index.entry(maker_leg.portfolio_key).or_default().insert(payload.market_id.clone());
         }
 
+        let notional = fill.tick as u128 * fill.qty as u128;
         taker_total_qty += fill.qty as u128;
-        taker_weighted_price += fill.tick as u128 * fill.qty as u128;
-        taker_total_margin += required_margin(fill.tick, fill.qty);
+        taker_weighted_price += notional;
+        taker_total_margin +=
+            required_margin(fill.tick, fill.qty) + crate::fees::taker_fee(notional, taker_prior_volume);
         maker_legs.push(maker_leg);
+    }
+
+    if taker_weighted_price > 0 {
+        let mut volume = state.trader_volume.lock().expect("trader_volume mutex poisoned");
+        *volume.entry(signer).or_insert(0) += taker_weighted_price;
     }
 
     // One Groth16 proof per MAX_BATCH_SIZE-sized chunk of this sweep's
@@ -1129,6 +1147,13 @@ struct PortfolioMarketState {
     /// kept precise (not pre-summed) so `/liquidate` can build an exact
     /// closing leg per market.
     collateral: I256,
+    /// Carried through from the unsealed `SealedParams` alongside
+    /// `signed_size`/`entry_price` above, needed only by `/liquidate`'s
+    /// partial-close sizing (`size_liquidation_legs`) to re-seal a
+    /// smaller remaining position — `/liquidation-check` never reads these.
+    leverage: u64,
+    take_profit: Option<u64>,
+    stop_loss: Option<u64>,
 }
 
 /// Loads, reads, and unseals every market a `portfolioKey` is known to
@@ -1185,6 +1210,9 @@ async fn load_portfolio_state(
             signed_size,
             entry_price: params.entry_price,
             collateral: sealed.collateral,
+            leverage: params.leverage,
+            take_profit: params.take_profit,
+            stop_loss: params.stop_loss,
         });
     }
     result
@@ -1322,6 +1350,103 @@ async fn post_liquidation_check(
 /// every other bps constant in this module (`IMR_BPS`, `risk::portfolio`'s defaults).
 const LIQUIDATION_REWARD_BPS: u128 = 50;
 
+/// Extra size closed beyond the mathematical minimum needed to restore health,
+/// so the position survives a small amount of further adverse price movement
+/// between this computation and the liquidation tx actually confirming on
+/// chain (the on-chain check re-reads `collateralBefore` at confirmation time,
+/// not now — this buffer is what keeps a just-barely-healed portfolio from
+/// still being liquidatable one block later).
+const LIQUIDATION_SAFETY_BUFFER_BPS: u128 = 1_000; // 10%
+
+/// Sizes each leg of a liquidation to close only as much as needed to
+/// restore health, per `docs/spec-contracts-tee.md` section 2.4: "one
+/// `liquidate` call closes enough size to restore health, not the whole
+/// position, unless [nothing smaller would work]" — trade[XYZ]'s liquidation
+/// sequencing (docs/trade-xyz-research.md section 6) independently describes
+/// the same shape (size to restore health first, full close only as a last
+/// resort), and this had been a real gap between Cerdic's own spec and what
+/// `/liquidate` actually did (always closed 100%, see this function's
+/// predecessor in `post_liquidate`).
+///
+/// Since `requiredMargin` scales linearly with size at a fixed IMR/MMR, the
+/// fraction of the portfolio that must close to bring
+/// `margin_requirement * (1 - f) <= effective_collateral` is exactly
+/// `f_min = 1 - effective_collateral / margin_requirement`, computed here as
+/// `f_min_bps` via integer ceiling division (never round down and quietly
+/// under-close). `LIQUIDATION_SAFETY_BUFFER_BPS` on top absorbs price drift
+/// before the tx confirms. The same `close_bps` fraction applies to every
+/// leg: a portfolio-wide margin figure gives no principled way to prefer
+/// closing one market over another, so this spreads the close evenly rather
+/// than picking a market arbitrarily.
+///
+/// Falls back to a full close per-leg (the old, only-ever-mode behavior)
+/// whenever a partial close wouldn't leave anything meaningful open: `f`
+/// resolves to >=100%, or a leg's own size is too small to split without
+/// rounding its "remaining" side to zero anyway.
+fn size_liquidation_legs(
+    market_states: &[PortfolioMarketState],
+    margin: &risk::MarginResult,
+    sealed_key: &crate::sealed::SealedKey,
+) -> (Vec<crate::settle::LiquidationLegDelta>, u128) {
+    let margin_requirement = margin.margin_requirement;
+    let effective_collateral = margin.effective_collateral;
+
+    let deficit = margin_requirement.saturating_sub(effective_collateral);
+    let f_min_bps: u128 = if margin_requirement == 0 {
+        10_000
+    } else {
+        // Ceiling division: never under-close due to integer truncation.
+        (deficit * 10_000).div_ceil(margin_requirement)
+    };
+    let close_bps = f_min_bps.saturating_add(LIQUIDATION_SAFETY_BUFFER_BPS).min(10_000);
+
+    let legs = market_states
+        .iter()
+        .map(|m| {
+            let market_hash = keccak256(m.market_id.as_bytes());
+            let collateral_u128 = i128::try_from(m.collateral).unwrap_or(0).max(0) as u128;
+            let size_abs = m.signed_size.unsigned_abs();
+
+            if close_bps >= 10_000 || size_abs == 0 {
+                return crate::settle::LiquidationLegDelta {
+                    market_id: market_hash,
+                    collateral_delta: -m.collateral,
+                    sealed_params: Bytes::new(),
+                };
+            }
+
+            let close_size = size_abs * close_bps / 10_000;
+            let remaining_size = size_abs - close_size;
+            if close_size == 0 || remaining_size == 0 {
+                return crate::settle::LiquidationLegDelta {
+                    market_id: market_hash,
+                    collateral_delta: -m.collateral,
+                    sealed_params: Bytes::new(),
+                };
+            }
+
+            let freed_collateral = collateral_u128 * close_size / size_abs;
+            let remaining_params = crate::sealed::SealedParams {
+                side_is_buy: m.signed_size > 0,
+                entry_price: m.entry_price,
+                // forge-lint style cast note: remaining_size < size_abs <= u64::MAX by construction.
+                size: remaining_size as u64,
+                leverage: m.leverage,
+                take_profit: m.take_profit,
+                stop_loss: m.stop_loss,
+            };
+
+            crate::settle::LiquidationLegDelta {
+                market_id: market_hash,
+                collateral_delta: -I256::try_from(freed_collateral).unwrap_or(I256::ZERO),
+                sealed_params: Bytes::from(sealed_key.seal(&remaining_params)),
+            }
+        })
+        .collect();
+
+    (legs, close_bps)
+}
+
 /// TEE-only action: recomputes a portfolio's margin fresh (never trusts a prior
 /// `/liquidation-check` call, which could be stale by the time a keeper acts on it), and
 /// if still underwater, closes every known position and submits `liquidateSealed`.
@@ -1353,17 +1478,17 @@ async fn post_liquidate(
         return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
 
-    let legs: Vec<crate::settle::LiquidationLegDelta> = market_states
-        .iter()
-        .map(|m| crate::settle::LiquidationLegDelta {
-            market_id: keccak256(m.market_id.as_bytes()),
-            collateral_delta: -m.collateral,
-            sealed_params: Bytes::new(),
-        })
-        .collect();
+    let (legs, close_bps) = size_liquidation_legs(&market_states, &margin, &state.sealed_key);
 
+    // Reward scales with what's actually being closed this call (close_bps,
+    // an approximation shared across every leg — see size_liquidation_legs'
+    // doc), not the whole portfolio: a partial close that only touches a
+    // fraction of the position shouldn't pay out as if the liquidator did
+    // the full job.
     let liquidator_reward = U256::from(margin.effective_collateral) * U256::from(LIQUIDATION_REWARD_BPS)
-        / U256::from(BPS_DENOMINATOR);
+        / U256::from(BPS_DENOMINATOR)
+        * U256::from(close_bps)
+        / U256::from(10_000u64);
 
     let sweep = crate::settle::LiquidationSweep {
         portfolio_key,
@@ -2257,6 +2382,9 @@ mod tests {
             signed_size: 10,
             entry_price: 100,
             collateral: I256::try_from(1_000i64).unwrap(),
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
         }];
         let with_entry_price = compute_margin(&states, &HashMap::new()).unwrap();
         assert_eq!(with_entry_price.margin_requirement, 30);
@@ -2275,6 +2403,9 @@ mod tests {
             signed_size: 10,
             entry_price: 100, // stale: the position opened at $100
             collateral: I256::try_from(1_000i64).unwrap(),
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
         }];
         let at_entry_price = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
         assert_eq!(at_entry_price, 30);
@@ -2292,12 +2423,18 @@ mod tests {
                 signed_size: 10,
                 entry_price: 100,
                 collateral: I256::try_from(1_000i64).unwrap(),
+                leverage: 1,
+                take_profit: None,
+                stop_loss: None,
             },
             PortfolioMarketState {
                 market_id: "0xBTCUSDC".to_string(),
                 signed_size: 1,
                 entry_price: 50_000,
                 collateral: I256::try_from(0i64).unwrap(),
+                leverage: 1,
+                take_profit: None,
+                stop_loss: None,
             },
         ];
         // Only EURC/USDC has a live price (double its entry price); BTC/USDC
@@ -2312,12 +2449,149 @@ mod tests {
             signed_size: 10,
             entry_price: 100,
             collateral: I256::try_from(1_000i64).unwrap(),
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
         }];
         let eurc_leg_at_entry =
             compute_margin(&eurc_only_states, &HashMap::new()).unwrap().margin_requirement;
         // The total moved by exactly EURC's own leg doubling, proving BTC's
         // leg (computed from its untouched entry price) didn't move at all.
         assert_eq!(overridden, baseline + eurc_leg_at_entry);
+    }
+
+    // -----------------------------------------------------------------
+    // size_liquidation_legs: partial-close-first liquidation sizing
+    // (docs/trade-xyz-research.md section 6; docs/spec-contracts-tee.md
+    // section 2.4's "closes enough size to restore health").
+    // -----------------------------------------------------------------
+
+    fn margin_result(margin_requirement: u128, effective_collateral: u128) -> risk::MarginResult {
+        risk::MarginResult {
+            margin_requirement,
+            effective_collateral,
+            maintenance_breached: margin_requirement > effective_collateral,
+        }
+    }
+
+    #[test]
+    fn size_liquidation_legs_partially_closes_when_a_smaller_close_restores_health() {
+        // margin_requirement=100, effective_collateral=80: deficit is 20% of
+        // margin, so f_min_bps = 2_000; plus the 1_000bps safety buffer =
+        // 3_000bps (30%) closed, well short of the whole position.
+        let states = vec![PortfolioMarketState {
+            market_id: "0xBTCUSDC".to_string(),
+            signed_size: 100,
+            entry_price: 1,
+            collateral: I256::try_from(80i64).unwrap(),
+            leverage: 1,
+            take_profit: Some(150),
+            stop_loss: Some(50),
+        }];
+        let margin = margin_result(100, 80);
+        let sealed_key = crate::sealed::SealedKey::generate();
+        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+
+        assert_eq!(close_bps, 3_000);
+        assert_eq!(legs.len(), 1);
+        let leg = &legs[0];
+        assert!(!leg.sealed_params.is_empty(), "a partial close must leave real sealed_params, not empty");
+
+        let reopened = sealed_key.unseal(&leg.sealed_params).unwrap();
+        assert_eq!(reopened.size, 70, "100 - 30% closed == 70 remaining");
+        assert_eq!(reopened.entry_price, 1, "entry price carries forward unchanged");
+        assert_eq!(reopened.leverage, 1);
+        assert_eq!(reopened.take_profit, Some(150), "TP/SL thresholds carry forward on the reduced position");
+        assert_eq!(reopened.stop_loss, Some(50));
+        assert!(reopened.side_is_buy);
+
+        // 30% of the 80 collateral, floored.
+        assert_eq!(leg.collateral_delta, -I256::try_from(24i64).unwrap());
+    }
+
+    #[test]
+    fn size_liquidation_legs_falls_back_to_a_full_close_when_nothing_smaller_restores_health() {
+        // effective_collateral=0 against any positive margin_requirement:
+        // f_min_bps saturates to 10_000 (100%), so this must behave exactly
+        // like the pre-partial-close full-close path (empty sealed_params).
+        let states = vec![PortfolioMarketState {
+            market_id: "0xBTCUSDC".to_string(),
+            signed_size: 100,
+            entry_price: 1,
+            collateral: I256::try_from(50i64).unwrap(),
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
+        }];
+        let margin = margin_result(100, 0);
+        let sealed_key = crate::sealed::SealedKey::generate();
+        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+
+        assert_eq!(close_bps, 10_000);
+        assert_eq!(legs.len(), 1);
+        assert!(legs[0].sealed_params.is_empty());
+        assert_eq!(legs[0].collateral_delta, -I256::try_from(50i64).unwrap());
+    }
+
+    #[test]
+    fn size_liquidation_legs_applies_the_same_fraction_across_every_leg() {
+        let states = vec![
+            PortfolioMarketState {
+                market_id: "0xBTCUSDC".to_string(),
+                signed_size: 100,
+                entry_price: 1,
+                collateral: I256::try_from(80i64).unwrap(),
+                leverage: 1,
+                take_profit: None,
+                stop_loss: None,
+            },
+            PortfolioMarketState {
+                market_id: "0xEURCUSDC".to_string(),
+                signed_size: -200, // a short leg: side_is_buy must come out false
+                entry_price: 2,
+                collateral: I256::try_from(40i64).unwrap(),
+                leverage: 3,
+                take_profit: None,
+                stop_loss: None,
+            },
+        ];
+        let margin = margin_result(100, 80); // same 30% close as the single-leg test above
+        let sealed_key = crate::sealed::SealedKey::generate();
+        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+
+        assert_eq!(close_bps, 3_000);
+        assert_eq!(legs.len(), 2);
+
+        let btc_leg = sealed_key.unseal(&legs[0].sealed_params).unwrap();
+        assert_eq!(btc_leg.size, 70);
+        assert!(btc_leg.side_is_buy);
+
+        let eurc_leg = sealed_key.unseal(&legs[1].sealed_params).unwrap();
+        assert_eq!(eurc_leg.size, 140, "200 - 30% closed == 140 remaining");
+        assert!(!eurc_leg.side_is_buy, "a short position's remaining leg must stay marked short");
+        assert_eq!(eurc_leg.leverage, 3, "leverage carries forward per-leg, not shared");
+    }
+
+    #[test]
+    fn size_liquidation_legs_closes_fully_when_a_tiny_position_cannot_split() {
+        // A 1-unit position can't be split into a nonzero close and a
+        // nonzero remainder: closing anything at all must fully close it.
+        let states = vec![PortfolioMarketState {
+            market_id: "0xBTCUSDC".to_string(),
+            signed_size: 1,
+            entry_price: 1,
+            collateral: I256::try_from(10i64).unwrap(),
+            leverage: 1,
+            take_profit: None,
+            stop_loss: None,
+        }];
+        let margin = margin_result(100, 80);
+        let sealed_key = crate::sealed::SealedKey::generate();
+        let (legs, _close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+
+        assert_eq!(legs.len(), 1);
+        assert!(legs[0].sealed_params.is_empty());
+        assert_eq!(legs[0].collateral_delta, -I256::try_from(10i64).unwrap());
     }
 
     #[tokio::test]

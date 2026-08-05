@@ -13,6 +13,16 @@ interface IMarkPriceOracle {
     function markPrice(bytes32 marketId) external view returns (uint256);
 }
 
+/// @title IDiscoveryBoundsOracle
+/// @notice Optional surface an IMarkPriceOracle implementation may also support
+///         (OracleHub does). Queried defensively via try/catch — an oracle that
+///         doesn't implement it (any test mock, or a market with no discovery
+///         bounds configured) is treated exactly as before this surface existed.
+interface IDiscoveryBoundsOracle {
+    function discoveryBoundsEnabled(bytes32 marketId) external view returns (bool);
+    function isPriceLive(bytes32 marketId) external view returns (bool);
+}
+
 /// @title  LiquidationEntry
 /// @notice Standard-stage liquidation: flag under-margined accounts, then close them out.
 /// @dev    Isolated margin only, no cross-market offsets, no backstop pool/ADL/unwind stages.
@@ -62,6 +72,7 @@ contract LiquidationEntry {
     error OracleNotSet();
     error NoLiquidation(address trader, bytes32 marketId);
     error NoPosition(address trader, bytes32 marketId);
+    error PriceUnreliable(bytes32 marketId);
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
@@ -91,6 +102,14 @@ contract LiquidationEntry {
     ///      division rounding. No position or zero collateral both resolve trivially.
     function checkAndFlag(address trader, bytes32 marketId) external returns (bool flagged) {
         if (trader == address(0)) revert ZeroAddress();
+        // Discovery-bounds markets (docs/trade-xyz-research.md section 2): refuse to
+        // flag off a fallback price we can't currently verify live, rather than
+        // triggering a liquidation nobody could have defended against during a
+        // weekend/closed-market price gap. No-op (not a revert) since checkLiquidation
+        // loops over every registered market and a false here just skips this one.
+        if (_isUnreliableFallback(marketId)) {
+            return false;
+        }
 
         if (settlementEngine.load(trader, marketId).length == 0) {
             return false;
@@ -122,6 +141,11 @@ contract LiquidationEntry {
         if (marketId == bytes32(0)) revert PositionEngine.ZeroMarketId();
         if (maxNotional == 0) revert ZeroAmount();
         if (!account.accounts(trader)) revert NoLiquidation(trader, marketId);
+        // Same gate as checkAndFlag, but a revert here rather than a silent skip:
+        // a caller reaching execute already believes the account was flagged, so
+        // silently no-op'ing would look like a successful liquidation that never
+        // happened. See discovery-bounds doc in OracleHub.isPriceLive.
+        if (_isUnreliableFallback(marketId)) revert PriceUnreliable(marketId);
 
         IMarket.MarketPosition memory position = _loadPosition(trader, marketId);
 
@@ -150,6 +174,33 @@ contract LiquidationEntry {
     function setInsuranceFund(address fund) external onlyAdmin {
         insuranceFund = fund;
         emit InsuranceFundUpdated(fund);
+    }
+
+    /// @dev Fail-open by design: an oracle that doesn't implement
+    ///      IDiscoveryBoundsOracle at all (any pre-existing test mock, or the
+    ///      oracle wired for a market that never opted into discovery bounds)
+    ///      returns false here, exactly the "always gate off" behavior this
+    ///      contract had before discovery bounds existed. Only ever returns
+    ///      true for a market that BOTH has bounds enabled AND is currently
+    ///      unable to fetch a live price.
+    function _isUnreliableFallback(bytes32 marketId) internal view returns (bool) {
+        address oracleAddr = address(markPriceOracle);
+        // A call to an address with no code (unset oracle, or a plain EOA) reverts
+        // with empty data at the Solidity-generated call site before try/catch ever
+        // gets a chance to run — check codesize directly instead of relying on catch
+        // to absorb it.
+        if (oracleAddr == address(0) || oracleAddr.code.length == 0) return false;
+        IDiscoveryBoundsOracle boundsOracle = IDiscoveryBoundsOracle(oracleAddr);
+        try boundsOracle.discoveryBoundsEnabled(marketId) returns (bool enabled) {
+            if (!enabled) return false;
+            try boundsOracle.isPriceLive(marketId) returns (bool live) {
+                return !live;
+            } catch {
+                return false;
+            }
+        } catch {
+            return false;
+        }
     }
 
     function _markPrice(bytes32 marketId) internal view returns (uint256) {

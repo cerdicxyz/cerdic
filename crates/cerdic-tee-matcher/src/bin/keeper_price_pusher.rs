@@ -20,14 +20,29 @@
 //! inspected this session, its `binary.data` field is exactly the
 //! hex-encoded blob array this module decodes and submits.
 //!
-//! Usage (env vars, all required):
-//!   SETTLEMENT_RPC_URL       - chain RPC endpoint
-//!   PYTH_CONTRACT_ADDRESS    - the real (or mock) IPyth contract to push into
-//!   KEEPER_PRIVATE_KEY       - funded key that submits the update tx
-//!   PYTH_FEED_IDS            - comma-separated Hermes feed ids (no 0x prefix)
+//! Usage (env vars):
+//!   SETTLEMENT_RPC_URL       - chain RPC endpoint (required)
+//!   PYTH_CONTRACT_ADDRESS    - the real (or mock) IPyth contract to push into (required)
+//!   KEEPER_PRIVATE_KEY       - funded key that submits the update tx (required)
+//!   PYTH_FEED_IDS            - comma-separated Hermes feed ids (no 0x prefix) (required)
 //!   KEEPER_POLL_INTERVAL_SECS - optional, default 20 (well under the 60s
 //!                               staleness window, leaves margin for a
 //!                               missed tick or slow block)
+//!   FX_MARKET_IDS            - optional, comma-separated subset of PYTH_FEED_IDS
+//!                               that are FX pairs (market_id doubles as the
+//!                               Pyth feed id, see FxPerpMarket's own doc).
+//!                               Two effects (docs/trade-xyz-research.md
+//!                               sections 1 and 9's "no market-hours awareness"
+//!                               gap): (1) a large move on a closed FX weekend
+//!                               is logged at info, not warn — an expected wide
+//!                               read during a liquidity gap isn't the same
+//!                               signal as one during normal hours; (2) while
+//!                               the FX week is open, this keeper also calls
+//!                               OracleHub.refreshDiscoveryReference for each
+//!                               id, keeping that market's discovery-bounds
+//!                               reference price walking forward with real
+//!                               moves instead of going stale.
+//!   ORACLE_HUB_ADDRESS       - required only if FX_MARKET_IDS is set.
 
 use alloy::{
     network::{EthereumWallet, TransactionBuilder},
@@ -38,7 +53,7 @@ use alloy::{
     sol,
     sol_types::SolCall,
 };
-use cerdic_tee_matcher::oracle;
+use cerdic_tee_matcher::{market_hours, oracle};
 use std::time::Duration;
 
 sol! {
@@ -46,6 +61,10 @@ sol! {
         function updatePriceFeeds(bytes[] calldata updateData) external payable;
         function getUpdateFee(bytes[] calldata updateData) external view returns (uint256 feeAmount);
         function getPriceUnsafe(bytes32 id) external view returns (int64 price, uint64 conf, int32 expo, uint256 publishTime);
+    }
+
+    interface IOracleHub {
+        function refreshDiscoveryReference(bytes32 marketId) external returns (uint256);
     }
 }
 
@@ -79,6 +98,20 @@ async fn main() {
     let poll_interval = Duration::from_secs(
         std::env::var("KEEPER_POLL_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20),
     );
+    let fx_market_ids: Vec<String> = std::env::var("FX_MARKET_IDS")
+        .ok()
+        .map(|raw| raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let oracle_hub: Option<Address> = if fx_market_ids.is_empty() {
+        None
+    } else {
+        Some(
+            std::env::var("ORACLE_HUB_ADDRESS")
+                .expect("ORACLE_HUB_ADDRESS not set (required when FX_MARKET_IDS is set)")
+                .parse()
+                .expect("invalid ORACLE_HUB_ADDRESS"),
+        )
+    };
 
     let signer: PrivateKeySigner = private_key.parse().expect("invalid KEEPER_PRIVATE_KEY");
     let keeper_address = signer.address();
@@ -92,6 +125,7 @@ async fn main() {
         keeper = %keeper_address,
         pyth_contract = %pyth_contract,
         feeds = ?feed_ids,
+        fx_market_ids = ?fx_market_ids,
         interval_secs = poll_interval.as_secs(),
         "keeper_price_pusher starting"
     );
@@ -99,17 +133,24 @@ async fn main() {
     let mut interval = tokio::time::interval(poll_interval);
     loop {
         interval.tick().await;
-        if let Err(e) = push_once(&provider, pyth_contract, &feed_ids).await {
+        if let Err(e) = push_once(&provider, pyth_contract, &feed_ids, &fx_market_ids, oracle_hub).await {
             tracing::error!(error = %e, "price push failed, will retry next tick");
         }
     }
 }
 
-async fn push_once<P>(provider: &P, pyth_contract: Address, feed_ids: &[String]) -> Result<(), String>
+async fn push_once<P>(
+    provider: &P,
+    pyth_contract: Address,
+    feed_ids: &[String],
+    fx_market_ids: &[String],
+    oracle_hub: Option<Address>,
+) -> Result<(), String>
 where
     P: Provider<alloy::transports::http::Http<reqwest::Client>>,
 {
     let feed_refs: Vec<&str> = feed_ids.iter().map(String::as_str).collect();
+    let fx_open = market_hours::fx_market_open_now();
 
     // Sanity-check the move against whatever's currently on-chain, purely
     // to log a warning, see WARN_MOVE_BPS's doc on why this never blocks.
@@ -126,14 +167,29 @@ where
                 let new_scaled = new_price.price as f64 * 10f64.powi(new_price.expo);
                 if old_scaled > 0.0 {
                     let move_bps = ((new_scaled - old_scaled) / old_scaled).abs() * 10_000.0;
+                    let is_closed_fx = fx_market_ids.iter().any(|m| m == feed_id) && !fx_open;
                     if move_bps > WARN_MOVE_BPS {
-                        tracing::warn!(
-                            feed_id,
-                            move_bps,
-                            old = old_scaled,
-                            new = new_scaled,
-                            "large price move, pushing anyway"
-                        );
+                        if is_closed_fx {
+                            // A wide divergence while the FX week is closed is the
+                            // expected shape of a weekend liquidity gap, not a signal
+                            // something is wrong — logged at info so it doesn't page
+                            // anyone watching warn-level alerts.
+                            tracing::info!(
+                                feed_id,
+                                move_bps,
+                                old = old_scaled,
+                                new = new_scaled,
+                                "large price move on a closed FX market, expected weekend gap"
+                            );
+                        } else {
+                            tracing::warn!(
+                                feed_id,
+                                move_bps,
+                                old = old_scaled,
+                                new = new_scaled,
+                                "large price move, pushing anyway"
+                            );
+                        }
                     }
                 }
             }
@@ -162,5 +218,39 @@ where
     pending.get_receipt().await.map_err(|e| format!("tx did not confirm: {e}"))?;
 
     tracing::info!(tx_hash = %tx_hash, feeds = feed_ids.len(), fee_wei = %fee, "price update pushed on-chain");
+
+    // Best-effort, never blocks the main price push: keep each configured FX
+    // market's discovery-bounds reference walking forward with real moves
+    // while the week is open. Skipped entirely while closed — the whole
+    // point of the reference is to anchor what a LIVE market was doing, a
+    // closed-market read shouldn't move it (OracleHub.markPrice already
+    // falls back to it, unaffected either way).
+    if let Some(hub) = oracle_hub {
+        if fx_open {
+            for market_id in fx_market_ids {
+                let Ok(market_bytes32) = market_id.parse::<alloy::primitives::FixedBytes<32>>() else {
+                    tracing::warn!(
+                        market_id,
+                        "bad FX_MARKET_IDS entry, skipping discovery-reference refresh"
+                    );
+                    continue;
+                };
+                let call = IOracleHub::refreshDiscoveryReferenceCall { marketId: market_bytes32 };
+                let tx =
+                    TransactionRequest::default().with_to(hub).with_input(Bytes::from(call.abi_encode()));
+                match provider.send_transaction(tx).await {
+                    Ok(pending) => {
+                        if let Err(e) = pending.get_receipt().await {
+                            tracing::warn!(market_id, error = %e, "discovery-reference refresh tx did not confirm");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(market_id, error = %e, "discovery-reference refresh tx failed to send");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }

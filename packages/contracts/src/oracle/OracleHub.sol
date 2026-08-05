@@ -24,6 +24,12 @@ contract OracleHub {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     uint16 public constant DEFAULT_MAX_DIVERGENCE_BPS = 500;
 
+    /// @notice A live price is treated as "near the bound edge" once it has closed
+    ///         this fraction of the distance from the reference price to that edge.
+    ///         Matches trade[XYZ]'s discovery-bounds re-anchoring threshold
+    ///         (docs/trade-xyz-research.md section 2: "~90%").
+    uint256 internal constant REANCHOR_THRESHOLD_BPS = 9_000;
+
     address public immutable admin;
     PythConsumer public pythConsumer;
     ChainlinkConsumer public chainlinkConsumer;
@@ -36,11 +42,42 @@ contract OracleHub {
     /// @notice Latched by tripIfDiverged; cleared only by admin unpause.
     bool public paused;
 
+    /// @notice Weekend/closed-market price-continuity fallback for markets whose
+    ///         live oracle feed can legitimately go stale or unavailable (FX trades
+    ///         on-chain 24/7 but has no live institutional quote outside its home
+    ///         market's hours). While enabled and the live feed is unavailable,
+    ///         markPrice returns referencePrice instead of reverting, bounded to
+    ///         +-boundBps of that reference — trade[XYZ]'s discovery-bounds
+    ///         mechanism (docs/trade-xyz-research.md section 2).
+    /// @dev    Cerdic has no on-chain order-flow signal to drive a continuous EWMA
+    ///         fallback the way that research describes (the TEE matcher has no RPC
+    ///         client to read chain state, see RiskMonitor.ExecutionMode's own doc)
+    ///         — the fallback here is the last reference price, flat, not moving,
+    ///         until refreshDiscoveryReference next observes a live price. resetsRemaining
+    ///         caps how many times that reference can walk to a bound edge, the same
+    ///         "capped resets" safety property the research describes: a real,
+    ///         sustained move can still shift the reference, but only a finite
+    ///         number of times, never an unbounded walk.
+    struct DiscoveryBounds {
+        bool enabled;
+        uint256 referencePrice;
+        uint16 boundBps;
+        uint8 resetsRemaining;
+    }
+
+    mapping(bytes32 => DiscoveryBounds) public discoveryBounds;
+
     event CircuitBreakerReset(address indexed admin);
     event PythConsumerUpdated(address indexed consumer);
     event ChainlinkConsumerUpdated(address indexed consumer);
     event ImpactTwapUpdated(address indexed impactTwap);
     event MaxDivergenceBpsUpdated(uint16 oldBps, uint16 newBps);
+    event DiscoveryBoundsSet(
+        bytes32 indexed marketId, bool enabled, uint256 referencePrice, uint16 boundBps, uint8 maxResets
+    );
+    event DiscoveryReferenceReset(
+        bytes32 indexed marketId, uint256 oldReference, uint256 newReference, uint8 resetsRemaining
+    );
 
     error NotAdmin();
     error ZeroAddress();
@@ -49,6 +86,9 @@ contract OracleHub {
     error ChainlinkConsumerNotSet();
     error AggregatorNotSet(bytes32 marketId);
     error InvalidDivergenceBps(uint16 bps);
+    error DiscoveryBoundsNotEnabled(bytes32 marketId);
+    error InvalidDiscoveryBounds(bytes32 marketId);
+    error PriceUnavailable(bytes32 marketId);
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
@@ -62,16 +102,110 @@ contract OracleHub {
         maxDivergenceBps = DEFAULT_MAX_DIVERGENCE_BPS;
     }
 
+    /// @dev Markets without discovery bounds keep the exact original behavior
+    ///      (specific PythConsumerNotSet/ChainlinkConsumerNotSet/AggregatorNotSet/
+    ///      upstream reverts bubble up unchanged) — the fallback path below only
+    ///      ever runs for a marketId that has opted into discoveryBounds, so it
+    ///      can never silently change what a caller who never set up bounds sees.
     function markPrice(bytes32 marketId) external view returns (uint256) {
         if (paused) revert CircuitBreakerTripped();
 
-        (uint256 pythPrice, uint256 chainlinkPrice) = _fetchPrices(marketId);
+        if (discoveryBounds[marketId].enabled) {
+            (bool ok, uint256 pythPrice, uint256 chainlinkPrice) = _tryFetchPrices(marketId);
+            if (!ok) {
+                return discoveryBounds[marketId].referencePrice;
+            }
+            if (_divergenceBps(pythPrice, chainlinkPrice) > maxDivergenceBps) {
+                revert CircuitBreakerTripped();
+            }
+            uint256 twapPriceB = _tertiaryPrice(marketId, pythPrice);
+            return _medianOf3(pythPrice, chainlinkPrice, twapPriceB);
+        }
+
+        (uint256 pythPriceA, uint256 chainlinkPriceA) = _fetchPrices(marketId);
+        if (_divergenceBps(pythPriceA, chainlinkPriceA) > maxDivergenceBps) {
+            revert CircuitBreakerTripped();
+        }
+
+        uint256 twapPrice = _tertiaryPrice(marketId, pythPriceA);
+        return _medianOf3(pythPriceA, chainlinkPriceA, twapPrice);
+    }
+
+    /// @notice Enables/updates/disables discovery bounds for marketId. Disabling
+    ///         (enabled=false) does not clear referencePrice/resetsRemaining, so
+    ///         re-enabling later resumes from where it left off unless the admin
+    ///         explicitly passes a new referencePrice.
+    function setDiscoveryBounds(
+        bytes32 marketId,
+        bool enabled,
+        uint256 referencePrice,
+        uint16 boundBps,
+        uint8 maxResets
+    ) external onlyAdmin {
+        if (enabled && (referencePrice == 0 || boundBps == 0 || boundBps > BPS_DENOMINATOR)) {
+            revert InvalidDiscoveryBounds(marketId);
+        }
+        discoveryBounds[marketId] = DiscoveryBounds({
+            enabled: enabled, referencePrice: referencePrice, boundBps: boundBps, resetsRemaining: maxResets
+        });
+        emit DiscoveryBoundsSet(marketId, enabled, referencePrice, boundBps, maxResets);
+    }
+
+    /// @notice Permissionless: re-anchors marketId's discovery-bounds reference price
+    ///         toward the live oracle price once it gets within REANCHOR_THRESHOLD_BPS
+    ///         of the current bound's edge, consuming one of a capped number of resets.
+    ///         A live price that stays mid-band leaves the reference untouched. Meant
+    ///         to be called by the same keeper that pushes price updates
+    ///         (keeper_price_pusher), each cycle, for every discovery-bounds-enabled
+    ///         market — a no-op most of the time, only moving the reference near an edge.
+    function refreshDiscoveryReference(bytes32 marketId) external returns (uint256) {
+        DiscoveryBounds storage bounds = discoveryBounds[marketId];
+        if (!bounds.enabled) revert DiscoveryBoundsNotEnabled(marketId);
+
+        (bool ok, uint256 pythPrice, uint256 chainlinkPrice) = _tryFetchPrices(marketId);
+        if (!ok) revert PriceUnavailable(marketId);
         if (_divergenceBps(pythPrice, chainlinkPrice) > maxDivergenceBps) {
             revert CircuitBreakerTripped();
         }
 
-        uint256 twapPrice = _tertiaryPrice(marketId, pythPrice);
-        return _medianOf3(pythPrice, chainlinkPrice, twapPrice);
+        uint256 livePrice = _medianOf3(pythPrice, chainlinkPrice, _tertiaryPrice(marketId, pythPrice));
+
+        uint256 ref = bounds.referencePrice;
+        uint256 boundAmount = ref * bounds.boundBps / BPS_DENOMINATOR;
+        uint256 lo = boundAmount < ref ? ref - boundAmount : 0;
+        uint256 hi = ref + boundAmount;
+        uint256 edgeMargin = boundAmount - (boundAmount * REANCHOR_THRESHOLD_BPS / BPS_DENOMINATOR);
+
+        if (bounds.resetsRemaining > 0 && livePrice <= lo + edgeMargin) {
+            bounds.referencePrice = lo;
+            bounds.resetsRemaining -= 1;
+            emit DiscoveryReferenceReset(marketId, ref, lo, bounds.resetsRemaining);
+        } else if (bounds.resetsRemaining > 0 && livePrice >= hi - edgeMargin) {
+            bounds.referencePrice = hi;
+            bounds.resetsRemaining -= 1;
+            emit DiscoveryReferenceReset(marketId, ref, hi, bounds.resetsRemaining);
+        }
+
+        return bounds.referencePrice;
+    }
+
+    function discoveryBoundsEnabled(bytes32 marketId) external view returns (bool) {
+        return discoveryBounds[marketId].enabled;
+    }
+
+    /// @notice Whether markPrice(marketId) is currently reading a live oracle price
+    ///         rather than the discovery-bounds fallback. Consumed by LiquidationEntry
+    ///         to refuse to trigger a liquidation off a price it cannot currently
+    ///         verify live — trade[XYZ]'s "a position cannot be liquidated while its
+    ///         liquidation price sits outside the active bound" rule
+    ///         (docs/trade-xyz-research.md section 2), applied here as "don't
+    ///         liquidate off the fallback price" since Cerdic's fallback has no
+    ///         order-flow signal to bound a liquidation price against directly.
+    ///         Always true for a market with discovery bounds disabled — this only
+    ///         ever gates markets that opted in.
+    function isPriceLive(bytes32 marketId) public view returns (bool) {
+        (bool ok,,) = _tryFetchPrices(marketId);
+        return ok;
     }
 
     /// @notice Raw Pyth price, bypassing the circuit breaker and median. Used as the
@@ -138,6 +272,38 @@ contract OracleHub {
         address aggregator = secondary.aggregators(marketId);
         if (aggregator == address(0)) revert AggregatorNotSet(marketId);
         (chainlinkPrice,) = secondary.fetchPrice(aggregator);
+    }
+
+    /// @dev Non-reverting sibling of _fetchPrices: returns ok=false instead of bubbling
+    ///      any upstream revert (PythContractNotSet, StalePrice, AggregatorNotSet,
+    ///      IncompleteRound, ...). Only ever used on the discovery-bounds path — the
+    ///      plain _fetchPrices above still backs every market without bounds enabled,
+    ///      so a failure there still reverts with the original specific error.
+    function _tryFetchPrices(bytes32 marketId)
+        internal
+        view
+        returns (bool ok, uint256 pythPrice, uint256 chainlinkPrice)
+    {
+        PythConsumer primary = pythConsumer;
+        if (address(primary) == address(0)) return (false, 0, 0);
+        ChainlinkConsumer secondary = chainlinkConsumer;
+        if (address(secondary) == address(0)) return (false, 0, 0);
+
+        try primary.fetchPrice(marketId) returns (uint256 p, uint256) {
+            pythPrice = p;
+        } catch {
+            return (false, 0, 0);
+        }
+
+        address aggregator = secondary.aggregators(marketId);
+        if (aggregator == address(0)) return (false, 0, 0);
+        try secondary.fetchPrice(aggregator) returns (uint256 c, uint256) {
+            chainlinkPrice = c;
+        } catch {
+            return (false, 0, 0);
+        }
+
+        ok = true;
     }
 
     /// @dev Fails open to the primary price on an unwired/empty TWAP; a missing tertiary
