@@ -120,6 +120,54 @@ const COLORS = {
 const FONT = '10px Inter, ui-sans-serif, system-ui, sans-serif';
 const FONT_BOLD = '600 10px Inter, ui-sans-serif, system-ui, sans-serif';
 
+// Every websocket snapshot used to redraw the whole canvas instantly —
+// correct, but a real feed pushing several times a second read as a
+// flicker rather than a live book. Two, independent motion layers, same
+// "drag/release only" restraint LeverageSlider's own doc argues for
+// (nothing idle-animates on its own): a short eased transition of each
+// row's bar/curve length between the previous and next snapshot, and a
+// brief highlight flash on rows whose price or size actually changed.
+// Both respect prefers-reduced-motion by skipping straight to the settled
+// frame — same convention LeverageSlider already uses for its own spring.
+const TRANSITION_MS = 180;
+const FLASH_MS = 500;
+const FLASH_ALPHA = 0.35;
+
+function easeOutCubic(t: number) {
+  return 1 - (1 - t) ** 3;
+}
+
+function prefersReducedMotion() {
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+/** Interpolates two same-side snapshots by matching PRICE (a row's real
+ *  identity — resting orders don't move price, only size), not array
+ *  index — the book can gain/lose rows between snapshots, so index would
+ *  lerp unrelated rows into each other. A row with no match in `from`
+ *  (newly appeared) or no match in `to` (about to be dropped from this
+ *  frame's target) just renders at its settled value — only a genuine
+ *  price-level match gets the eased size/cumulative tween. */
+function lerpLevels(from: Level[], to: Level[], t: number): Level[] {
+  const fromByPrice = new Map(from.map((level) => [level.price, level]));
+  return to.map((level) => {
+    const prior = fromByPrice.get(level.price);
+    if (!prior) return level;
+    return {
+      price: level.price,
+      size: prior.size + (level.size - prior.size) * t,
+      cumulative: prior.cumulative + (level.cumulative - prior.cumulative) * t,
+    };
+  });
+}
+
+/** Prices that changed size (or are new) between two same-side snapshots
+ *  — what should flash, not everything on screen every tick. */
+function changedPrices(from: Level[], to: Level[]): number[] {
+  const fromByPrice = new Map(from.map((level) => [level.price, level.size]));
+  return to.filter((level) => fromByPrice.get(level.price) !== level.size).map((level) => level.price);
+}
+
 interface Level {
   price: number;
   size: number;
@@ -157,6 +205,12 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const liveBook = useOrderBook(marketId);
+  // Persist across effect re-runs (one per snapshot), not per-render
+  // state: the last actually-drawn snapshot (transition start point) and
+  // per-price flash timestamps, see the TRANSITION_MS/FLASH_MS doc above.
+  const previousLevelsRef = useRef<{ asks: Level[]; bids: Level[] }>({ asks: [], bids: [] });
+  const askFlashRef = useRef<Map<number, number>>(new Map());
+  const bidFlashRef = useRef<Map<number, number>>(new Map());
 
   // Asks: farthest-from-mid first (top row) down to nearest-mid last row
   // (right above the spread) — the backend's own array is nearest-first
@@ -217,6 +271,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       edgeIndex: number,
       remainingBeyondEdge: number,
       remainingPct: number,
+      flashAlphaFor: (price: number) => number,
     ) {
       if (!ctx || levels.length === 0) return;
 
@@ -296,6 +351,12 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
           ctx.fillRect(0, y, width, ROW_HEIGHT);
         }
 
+        const flashAlpha = flashAlphaFor(level.price);
+        if (flashAlpha > 0) {
+          ctx.fillStyle = rgba(curveColor === COLORS.ask ? ASK_HEAT_HIGH : BID_HEAT_HIGH, flashAlpha);
+          ctx.fillRect(0, y, width, ROW_HEIGHT);
+        }
+
         // Heat chip: a fixed-width column between price and bar, full
         // row height, no gap above/below, so the column reads as one
         // continuous strip.
@@ -367,7 +428,12 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       });
     }
 
-    function draw() {
+    // `asksLevels`/`bidsLevels` carry the VALUES to render (either a
+    // mid-transition interpolation or the settled snapshot) — always the
+    // same length/order as `asks`/`bids` (see lerpLevels' own doc), so
+    // row layout (asksHeight, hoverAt) can keep using the outer `asks`/
+    // `bids` for indexing while only size/cumulative come from here.
+    function draw(asksLevels: Level[], bidsLevels: Level[]) {
       if (!ctx || !canvas || !container) return;
       const width = container.clientWidth;
       const height = container.clientHeight;
@@ -398,23 +464,32 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         Math.min(bids.length - 1, Math.floor(bottomVisibleBidLocalY / ROW_HEIGHT)),
       );
       const maxCumulative = Math.max(
-        asks[topVisibleAskIndex]?.cumulative ?? 0,
-        bids[bottomVisibleBidIndex]?.cumulative ?? 0,
+        asksLevels[topVisibleAskIndex]?.cumulative ?? 0,
+        bidsLevels[bottomVisibleBidIndex]?.cumulative ?? 0,
       );
       // One shared scale across both sides, not per-side, so a big ask
       // wall and a big bid wall read as comparably long bars rather
       // than each side normalizing against its own biggest row.
-      const maxSize = Math.max(1e-9, ...asks.map((l) => l.size), ...bids.map((l) => l.size));
+      const maxSize = Math.max(1e-9, ...asksLevels.map((l) => l.size), ...bidsLevels.map((l) => l.size));
 
-      const askTotal = asks[asks.length - 1]?.cumulative ?? 0;
-      const bidTotal = bids[bids.length - 1]?.cumulative ?? 0;
-      const askVisibleCumulative = asks[topVisibleAskIndex]?.cumulative ?? 0;
-      const bidVisibleCumulative = bids[bottomVisibleBidIndex]?.cumulative ?? 0;
+      const askTotal = asksLevels[asksLevels.length - 1]?.cumulative ?? 0;
+      const bidTotal = bidsLevels[bidsLevels.length - 1]?.cumulative ?? 0;
+      const askVisibleCumulative = asksLevels[topVisibleAskIndex]?.cumulative ?? 0;
+      const bidVisibleCumulative = bidsLevels[bottomVisibleBidIndex]?.cumulative ?? 0;
       const askRemaining = askTotal - askVisibleCumulative;
       const bidRemaining = bidTotal - bidVisibleCumulative;
 
+      const now = performance.now();
+      const flashAlphaFor = (flashMap: Map<number, number>) => (price: number) => {
+        const changedAt = flashMap.get(price);
+        if (changedAt === undefined) return 0;
+        const elapsed = now - changedAt;
+        if (elapsed >= FLASH_MS) return 0;
+        return FLASH_ALPHA * (1 - elapsed / FLASH_MS);
+      };
+
       drawSide(
-        asks,
+        asksLevels,
         centerOffset,
         width,
         ASK_HEAT_LOW,
@@ -427,10 +502,11 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         topVisibleAskIndex,
         askRemaining,
         (askRemaining / askTotal) * 100,
+        flashAlphaFor(askFlashRef.current),
       );
 
       drawSide(
-        bids,
+        bidsLevels,
         bidsStartY,
         width,
         BID_HEAT_LOW,
@@ -443,6 +519,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         bottomVisibleBidIndex,
         bidRemaining,
         (bidRemaining / bidTotal) * 100,
+        flashAlphaFor(bidFlashRef.current),
       );
 
       // Last-price marker: a single thin cyan line at the ask/bid
@@ -514,22 +591,78 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       const changed = next?.side !== hover?.side || next?.index !== hover?.index;
       hover = next;
       canvas.style.cursor = next ? 'pointer' : 'default';
-      if (changed) draw();
+      if (changed) draw(displayed.asks, displayed.bids);
     }
 
     function handleLeave() {
       if (!hover) return;
       hover = null;
-      draw();
+      draw(displayed.asks, displayed.bids);
     }
 
-    draw();
-    const resizeObserver = new ResizeObserver(draw);
+    // Transition from whatever was last actually drawn to this effect's
+    // new `asks`/`bids` — see lerpLevels' own doc for why matching is by
+    // price, not index. Reduced motion skips straight to the settled
+    // frame (t=1 immediately), same "position updates, no easing"
+    // convention LeverageSlider's own spring already follows.
+    const from = previousLevelsRef.current;
+    const to = { asks, bids };
+    const reduced = prefersReducedMotion();
+
+    if (!reduced) {
+      const changeTime = performance.now();
+      changedPrices(from.asks, to.asks).forEach((price) => askFlashRef.current.set(price, changeTime));
+      changedPrices(from.bids, to.bids).forEach((price) => bidFlashRef.current.set(price, changeTime));
+    }
+    // Prune stale entries every update rather than letting either map
+    // grow for the life of the panel — a flash long past FLASH_MS is
+    // already invisible (flashAlphaFor returns 0), this just reclaims it.
+    const pruneStale = (map: Map<number, number>, now: number) => {
+      for (const [price, changedAt] of map) {
+        if (now - changedAt > FLASH_MS) map.delete(price);
+      }
+    };
+
+    let displayed = to;
+    let rafId: number | null = null;
+    const startTime = performance.now();
+
+    const hasFreshFlash = (map: Map<number, number>, now: number) =>
+      Array.from(map.values()).some((changedAt) => now - changedAt < FLASH_MS);
+
+    function frame(now: number) {
+      const elapsed = now - startTime;
+      const t = reduced ? 1 : Math.min(1, elapsed / TRANSITION_MS);
+      const eased = easeOutCubic(t);
+      displayed = { asks: lerpLevels(from.asks, to.asks, eased), bids: lerpLevels(from.bids, to.bids, eased) };
+      draw(displayed.asks, displayed.bids);
+      pruneStale(askFlashRef.current, now);
+      pruneStale(bidFlashRef.current, now);
+
+      const flashActive = !reduced && (hasFreshFlash(askFlashRef.current, now) || hasFreshFlash(bidFlashRef.current, now));
+      if (t < 1 || flashActive) {
+        rafId = requestAnimationFrame(frame);
+      } else {
+        previousLevelsRef.current = to;
+        rafId = null;
+      }
+    }
+    rafId = requestAnimationFrame(frame);
+
+    const resizeObserver = new ResizeObserver(() => draw(displayed.asks, displayed.bids));
     resizeObserver.observe(container);
     canvas.addEventListener('mousemove', handleMove);
     canvas.addEventListener('mouseleave', handleLeave);
 
     return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      // A fast-updating book can interrupt this transition before it
+      // settles (a new snapshot arriving mid-flight re-runs this whole
+      // effect) — commit wherever `displayed` visually was, not the
+      // pre-transition `from`, so the NEXT transition continues from
+      // there instead of snapping back and re-animating over already-
+      // covered ground.
+      previousLevelsRef.current = displayed;
       resizeObserver.disconnect();
       canvas.removeEventListener('mousemove', handleMove);
       canvas.removeEventListener('mouseleave', handleLeave);
