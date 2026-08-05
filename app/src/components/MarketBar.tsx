@@ -1,6 +1,7 @@
 import type { Market } from './MarketDropdown';
 import { MarketDropdown } from './MarketDropdown';
 import { useOrderBook } from '../hooks/useOrderBook';
+import { formatMarketPrice } from '../lib/priceScale';
 
 // Market stat row, embedded as ChartPanel's own top row (matching the
 // Lighter reference this chart widget follows: MARK/INDEX/24H/FUNDING
@@ -27,7 +28,7 @@ export function MarketBar({ market, onSelect }: { market: Market; onSelect: (mar
   return (
     <div className="flex items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
       <MarketDropdown selected={market} onSelect={onSelect} />
-      <Stat label="Mark" value={liveBook.lastPrice !== null ? formatStat(liveBook.lastPrice) : '—'} />
+      <Stat label="Mark" value={liveBook.lastPrice !== null ? formatMarketPrice(liveBook.lastPrice, market.id) : '—'} />
       <Stat
         label="24h"
         value={liveBook.change24hBps !== null ? `${(liveBook.change24hBps / 100).toFixed(2)}%` : '—'}
@@ -37,12 +38,6 @@ export function MarketBar({ market, onSelect }: { market: Market; onSelect: (mar
       <Stat label="OI" value="—" />
     </div>
   );
-}
-
-function formatStat(value: number) {
-  if (value >= 1000) return value.toFixed(1);
-  if (value >= 1) return value.toFixed(4);
-  return value.toFixed(6);
 }
 
 function Stat({ label, value, tone }: { label: string; value: string; tone?: 'long' | 'short' | 'neutral' }) {

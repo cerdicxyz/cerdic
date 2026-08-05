@@ -3,6 +3,7 @@ import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
 import { MarketBar } from './MarketBar';
 import type { Market } from './MarketDropdown';
 import { usePersistedState } from '../hooks/usePersistedState';
+import { decimalsForMarket } from '../lib/priceScale';
 
 // Chart panel, structured like the reference (Lighter's own chart widget):
 // a market stat row, sub-tabs, timeframe pills, a chart-type toggle, then
@@ -27,8 +28,13 @@ const MORE_TIMEFRAMES: Timeframe[] = ['1m', '30m', '1d'];
 type SubTab = 'price' | 'funding' | 'details';
 type ChartType = 'original' | 'tradingview' | 'depth';
 
-function formatOhlc(candle: OhlcHover) {
-  const digits = 4;
+// PriceChart.tsx's `candles` are already real prices, not raw ticks (see
+// that file's own doc), so this is display precision only — but it still
+// has to match this market's own resolution (priceScale.ts), not a fixed
+// 4 that was wrong for both FX (needs 5) and everything else (2 is
+// plenty, 4 prints two meaningless trailing digits).
+function formatOhlc(candle: OhlcHover, marketId: string) {
+  const digits = decimalsForMarket(marketId);
   return {
     open: candle.open.toFixed(digits),
     high: candle.high.toFixed(digits),
@@ -171,11 +177,11 @@ export function ChartPanel({ market, onSelectMarket }: { market: Market; onSelec
           <div className="relative min-h-0 flex-1">
             {hover && (
               <div className="pointer-events-none absolute left-[var(--space-4)] top-[var(--space-2)] z-10 flex items-center gap-[var(--space-4)] text-xs">
-                <OhlcField label="Open" value={formatOhlc(hover).open} up={hover.up} />
-                <OhlcField label="High" value={formatOhlc(hover).high} up={hover.up} />
-                <OhlcField label="Low" value={formatOhlc(hover).low} up={hover.up} />
-                <OhlcField label="Close" value={formatOhlc(hover).close} up={hover.up} />
-                <OhlcField label="Volume" value={formatOhlc(hover).volume} up={hover.up} muted />
+                <OhlcField label="Open" value={formatOhlc(hover, market.id).open} up={hover.up} />
+                <OhlcField label="High" value={formatOhlc(hover, market.id).high} up={hover.up} />
+                <OhlcField label="Low" value={formatOhlc(hover, market.id).low} up={hover.up} />
+                <OhlcField label="Close" value={formatOhlc(hover, market.id).close} up={hover.up} />
+                <OhlcField label="Volume" value={formatOhlc(hover, market.id).volume} up={hover.up} muted />
               </div>
             )}
             {hover && (

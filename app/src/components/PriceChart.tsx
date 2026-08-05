@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useCandles } from '../hooks/useCandles';
+import { decimalsForMarket, priceScaleForMarket, tickToPrice } from '../lib/priceScale';
 import {
   CandlestickSeries,
   ColorType,
@@ -115,9 +116,23 @@ export function PriceChart({
   onHoverRef.current = onHover;
 
   const { candles: liveCandles } = useCandles(marketId, timeframe);
+  // Un-scales raw ticks into real prices at this market's own resolution
+  // (priceScale.ts) — `useCandles` passes the matcher's OHLC through
+  // unscaled, same raw-tick convention `useOrderBook` uses (see that
+  // hook's own doc), so this is the one place PriceChart converts before
+  // anything downstream (the candle series, the MA lines, the OHLC hover
+  // legend) ever sees a price.
   const candles = useMemo<Candle[]>(
-    () => liveCandles.map((c) => ({ ...c, time: c.time as UTCTimestamp })),
-    [liveCandles],
+    () =>
+      liveCandles.map((c) => ({
+        time: c.time as UTCTimestamp,
+        open: tickToPrice(c.open, marketId),
+        high: tickToPrice(c.high, marketId),
+        low: tickToPrice(c.low, marketId),
+        close: tickToPrice(c.close, marketId),
+        volume: c.volume,
+      })),
+    [liveCandles, marketId],
   );
 
   // Chart creation: mount-only. Switching timeframes used to tear this
@@ -260,6 +275,17 @@ export function PriceChart({
     const maSeries = maSeriesRef.current;
     if (!candleSeries || !volumeSeries || !maSeries) return;
 
+    // The chart-creation effect above is mount-only (switching markets
+    // doesn't tear the chart down, same reasoning as that effect's own
+    // doc on timeframe switches), so this market's own price precision
+    // has to be applied here, on every data update, not just once at
+    // creation. `minMove` is the smallest representable price step
+    // (1 / scale) — lightweight-charts needs it to know how to round/
+    // snap the crosshair and axis labels at this market's resolution.
+    candleSeries.applyOptions({
+      priceFormat: { type: 'price', precision: decimalsForMarket(marketId), minMove: 1 / priceScaleForMarket(marketId) },
+    });
+
     candleSeries.setData(candles);
     volumeSeries.setData(
       candles.map((c) => ({
@@ -298,7 +324,7 @@ export function PriceChart({
         ma20: sma(candles, 20, lastIndex),
       });
     }
-  }, [candles]);
+  }, [candles, marketId]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

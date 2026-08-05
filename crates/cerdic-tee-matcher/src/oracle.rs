@@ -192,16 +192,45 @@ pub async fn fetch_update_data(feed_ids: &[&str]) -> Result<Vec<Vec<u8>>, Oracle
         .collect()
 }
 
-/// Converts a raw Pyth price (`price * 10^expo`) into this crate's plain
-/// unscaled `u64` tick convention (`book.rs`'s `Tick`, and the entry-price
-/// convention `PortfolioMarketState` already uses, whole-dollar integer
-/// ticks, matching the test fixtures' `tick = 100` meaning "$100"). Rounds
-/// to the nearest whole unit rather than truncating, and floors negative
-/// results at zero (a negative price is nonsensical for anything Cerdic
-/// trades, and this keeps the conversion total instead of panicking on
-/// a market this function was never meant to be used for).
-pub fn pyth_price_to_tick(price: i64, expo: i32) -> u64 {
-    let scaled = price as f64 * 10f64.powi(expo);
+/// This market's tick resolution: a whole number of ticks per one real
+/// unit of price. Scale 100_000 means a tick of 108_543 represents a
+/// real price of 1.08543; scale 100 means a tick of 10_810_785
+/// represents 108_107.85. Chosen per asset class, not one global
+/// constant: FX majors trade close to 1.0, so they need real sub-cent
+/// resolution (5 decimal places, standard FX "pipette" precision) or
+/// every realistic price rounds to the same tick — confirmed live: with
+/// no scale at all (the previous convention), a 1.08-ish EUR/USD price
+/// only ever produced tick 1, a degenerate order book with zero usable
+/// price resolution. Crypto/commodities/equities trade at $10-$100k+
+/// magnitudes, where 2 decimal places (cent resolution) is already
+/// finer than most real venues quote.
+///
+/// The single source of truth for turning a real price into a tick —
+/// every caller (`pyth_price_to_tick` below, `market_maker.rs`'s own mid
+/// calculation) goes through this, so they can't independently drift
+/// into different scales the way an earlier ad hoc per-market seed
+/// script did. The frontend keeps a hand-matched copy
+/// (app/src/lib/priceScale.ts) since there's no live sync between a
+/// Rust binary and a browser bundle — same "kept in sync by hand,
+/// documented as such" posture as every other cross-system convention
+/// in this codebase (see e.g. `book::PriceLevel`'s own doc).
+pub fn price_scale_for_market(market_id: &str) -> u64 {
+    match market_id {
+        "EURC/USDC" | "GBP/USD" | "AUD/USD" | "USD/JPY" => 100_000,
+        _ => 100,
+    }
+}
+
+/// Converts a raw Pyth price (`price * 10^expo`) into this crate's `u64`
+/// tick convention, scaled by `price_scale_for_market`'s per-market
+/// resolution (see that function's own doc for why a market-specific
+/// scale exists at all). Rounds to the nearest whole tick rather than
+/// truncating, and floors negative results at zero (a negative price is
+/// nonsensical for anything Cerdic trades, and this keeps the conversion
+/// total instead of panicking on a market this function was never meant
+/// to be used for).
+pub fn pyth_price_to_tick(price: i64, expo: i32, scale: u64) -> u64 {
+    let scaled = price as f64 * 10f64.powi(expo) * scale as f64;
     if scaled <= 0.0 {
         0
     } else {
@@ -302,23 +331,48 @@ mod tests {
 
     #[test]
     fn pyth_price_to_tick_matches_the_real_captured_btc_price() {
-        // 6271068500001 * 10^-8 = 62710.685...00001, rounds to 62711.
-        assert_eq!(pyth_price_to_tick(6_271_068_500_001, -8), 62_711);
+        // 6271068500001 * 10^-8 = 62710.685...00001, rounds to 62711 at
+        // BTC/USDC's scale-100 resolution (62710.685 * 100 = 6271068.5).
+        assert_eq!(pyth_price_to_tick(6_271_068_500_001, -8, 100), 6_271_069);
     }
 
     #[test]
-    fn pyth_price_to_tick_rounds_to_the_nearest_whole_unit() {
-        assert_eq!(pyth_price_to_tick(1_085_000_000, -9), 1); // 1.085 -> 1
-        assert_eq!(pyth_price_to_tick(1_585_000_000, -9), 2); // 1.585 -> 2
+    fn pyth_price_to_tick_rounds_to_the_nearest_whole_tick() {
+        assert_eq!(pyth_price_to_tick(1_085_000_000, -9, 1), 1); // 1.085 -> 1 at scale 1
+        assert_eq!(pyth_price_to_tick(1_585_000_000, -9, 1), 2); // 1.585 -> 2 at scale 1
     }
 
     #[test]
     fn pyth_price_to_tick_floors_a_nonsensical_negative_price_at_zero() {
-        assert_eq!(pyth_price_to_tick(-100, -2), 0);
+        assert_eq!(pyth_price_to_tick(-100, -2, 100_000), 0);
     }
 
     #[test]
     fn pyth_price_to_tick_of_zero_is_zero() {
-        assert_eq!(pyth_price_to_tick(0, -8), 0);
+        assert_eq!(pyth_price_to_tick(0, -8, 100_000), 0);
+    }
+
+    #[test]
+    fn price_scale_gives_fx_majors_real_sub_unit_resolution() {
+        // Without a scale, a EUR/USD-magnitude price only ever rounds to
+        // tick 1 — this is the real, live-caught bug the scale exists to
+        // fix, not a hypothetical.
+        let eur_usd_scale = price_scale_for_market("EURC/USDC");
+        assert_eq!(eur_usd_scale, 100_000);
+        // 1.08543 * 100_000 = 108543.
+        assert_eq!(pyth_price_to_tick(1_085_430_000, -9, eur_usd_scale), 108_543);
+    }
+
+    #[test]
+    fn price_scale_gives_higher_magnitude_markets_cent_resolution() {
+        let btc_scale = price_scale_for_market("BTC/USDC");
+        assert_eq!(btc_scale, 100);
+        let xau_scale = price_scale_for_market("XAU/USD");
+        assert_eq!(xau_scale, 100);
+    }
+
+    #[test]
+    fn price_scale_falls_back_to_cent_resolution_for_an_unlisted_market() {
+        assert_eq!(price_scale_for_market("SOME/NEWMARKET"), 100);
     }
 }

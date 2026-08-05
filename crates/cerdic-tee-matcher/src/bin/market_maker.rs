@@ -134,7 +134,7 @@ async fn main() {
         interval.tick().await;
 
         let mid = match oracle::fetch_price(&feed_id).await {
-            Ok(p) => oracle::pyth_price_to_tick(p.price, p.expo),
+            Ok(p) => oracle::pyth_price_to_tick(p.price, p.expo, oracle::price_scale_for_market(&market_id)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to fetch live mid price, skipping this cycle");
                 continue;

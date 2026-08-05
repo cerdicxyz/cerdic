@@ -1,5 +1,6 @@
 import { useMemo, useEffect, useRef } from 'react';
 import { useOrderBook } from '../hooks/useOrderBook';
+import { formatMarketPrice } from '../lib/priceScale';
 
 // Depth-heatmap order book, rendered on a single canvas — matching how
 // tapesurf.com/app actually builds theirs (confirmed directly from the
@@ -10,12 +11,15 @@ import { useOrderBook } from '../hooks/useOrderBook';
 // doesn't do it that way.
 //
 // Live data: streams from the matcher's real /ws/orderbook/:marketId
-// (useOrderBook.ts) — no more seeded-random mock ladder. `price`/`size`
-// are the matcher's own raw tick/qty units passed straight through, not
-// rescaled (see useOrderBook.ts's own doc on why), so major-level
-// grouping below groups by ROW POSITION (every GROUP_INTERVAL-th row from
-// the spread), not by a price-magnitude assumption a real ~$60k BTC tick
-// and a ~1.08 EUR/USD tick can't both share.
+// (useOrderBook.ts) — no more seeded-random mock ladder. `size` is the
+// matcher's own raw qty unit, unscaled; `price` is the matcher's raw tick,
+// un-scaled to a real price only at display time via priceScale.ts (see
+// that file's own doc — ticks themselves carry no fixed decimals
+// convention, price_scale_for_market is what assigns one per market).
+// Major-level grouping below still groups by ROW POSITION (every
+// GROUP_INTERVAL-th row from the spread), not a price-magnitude
+// assumption, since a real ~$108k BTC price and a ~1.08 EUR/USD price
+// still don't share a magnitude even after un-scaling.
 
 // 12 levels/side, not 26 — fewer, bigger rows read better in this
 // panel's actual width than a long dense ladder. ROW_HEIGHT is scaled
@@ -179,17 +183,12 @@ interface HoverState {
   index: number;
 }
 
-// Adaptive, not a fixed toFixed(4): real markets on this book span wildly
-// different magnitudes (BTC ticks in the tens of thousands, an FX pair
-// near 1) with no shared decimals convention today (see useOrderBook.ts's
-// doc), so a single fixed precision would either lose real digits on a
-// small-magnitude market or print meaningless trailing zeros on a large
-// one.
-function formatPrice(price: number) {
-  if (price >= 1000) return price.toFixed(1);
-  if (price >= 1) return price.toFixed(4);
-  return price.toFixed(6);
-}
+// `formatMarketPrice` (priceScale.ts) un-scales a raw tick into a real
+// price and formats it at this market's own resolution — replaces an
+// earlier magnitude-based adaptive formatter that applied fake decimal
+// precision to what was, before that scale existed, an unscaled
+// whole-number tick with no fractional information to show at all (a
+// real, live-caught wrong-prices bug, not a cosmetic one).
 
 function formatSize(size: number) {
   return size >= 1000 ? `${(size / 1000).toFixed(2)}K` : size.toFixed(1);
@@ -404,7 +403,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         ctx.fillStyle = major ? COLORS.textPrimary : COLORS.textTertiary;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(formatPrice(level.price), PADDING_X, y + ROW_HEIGHT / 2 + 0.5);
+        ctx.fillText(formatMarketPrice(level.price, marketId), PADDING_X, y + ROW_HEIGHT / 2 + 0.5);
 
         ctx.font = level.size > HEAT_MAX_SIZE ? FONT_BOLD : FONT;
         ctx.fillStyle = COLORS.textPrimary;
@@ -538,7 +537,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       ctx.fillStyle = COLORS.markerLine;
       ctx.textAlign = 'right';
       ctx.textBaseline = 'middle';
-      ctx.fillText(midPrice !== null ? formatPrice(midPrice) : '—', width - PADDING_X, boundaryY + 0.5);
+      ctx.fillText(midPrice !== null ? formatMarketPrice(midPrice, marketId) : '—', width - PADDING_X, boundaryY + 0.5);
 
       // 24h change (real: MarketSnapshot.change_24h_bps), embedded in the
       // first bid row rather than a separate row. "—" when there isn't
@@ -667,7 +666,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       canvas.removeEventListener('mousemove', handleMove);
       canvas.removeEventListener('mouseleave', handleLeave);
     };
-  }, [asks, bids, midPrice, change24hPct]);
+  }, [asks, bids, midPrice, change24hPct, marketId]);
 
   return (
     <div ref={containerRef} className="relative h-full w-full">

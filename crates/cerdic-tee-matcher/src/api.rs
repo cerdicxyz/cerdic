@@ -1325,7 +1325,11 @@ async fn live_mark_prices(state: &AppState, market_ids: &[MarketId]) -> HashMap<
             .into_iter()
             .filter_map(|(feed_id, price)| {
                 feed_to_market.get(feed_id.as_str()).map(|market_id| {
-                    (market_id.clone(), crate::oracle::pyth_price_to_tick(price.price, price.expo) as u128)
+                    let scale = crate::oracle::price_scale_for_market(market_id);
+                    (
+                        market_id.clone(),
+                        crate::oracle::pyth_price_to_tick(price.price, price.expo, scale) as u128,
+                    )
                 })
             })
             .collect(),
