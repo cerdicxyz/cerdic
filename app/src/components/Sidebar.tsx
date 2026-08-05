@@ -39,10 +39,10 @@ export function Sidebar({
           unicode glyph or a plain "c" monogram — this used to be two
           different, unrelated marks between Header and Sidebar. */}
       <img
-        src="/logos/android-chrome-192x192.png"
+        src="/logos/android-chrome-512x512.png"
         alt="Cerdic"
         title="Cerdic"
-        className="h-7 w-7 flex-shrink-0"
+        className="h-9 w-9 flex-shrink-0"
       />
       <div className="flex flex-col gap-[var(--space-2)]">
         <Link

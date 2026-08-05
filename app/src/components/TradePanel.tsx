@@ -5,6 +5,7 @@ import { useWallet } from '../wallet/wallet-context';
 import { useOrderBook } from '../hooks/useOrderBook';
 import { useSubmitOrder, type OrderResult } from '../hooks/useSubmitOrder';
 import type { Market } from './MarketDropdown';
+import { formatMarketPrice } from '../lib/priceScale';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -153,7 +154,9 @@ export function TradePanel({ market }: { market: Market }) {
             }`}
           >
             <span className="text-[10px] uppercase tracking-[0.06em] text-text-quaternary">Buy</span>
-            <span className={`text-sm font-semibold ${side === 'long' ? 'text-long' : 'text-text-secondary'}`}>—</span>
+            <span className={`text-sm font-semibold ${side === 'long' ? 'text-long' : 'text-text-secondary'}`}>
+              {book.bestAsk !== null ? formatMarketPrice(book.bestAsk, market.id) : '—'}
+            </span>
           </button>
           <button
             type="button"
@@ -163,10 +166,14 @@ export function TradePanel({ market }: { market: Market }) {
             }`}
           >
             <span className="text-[10px] uppercase tracking-[0.06em] text-text-quaternary">Sell</span>
-            <span className={`text-sm font-semibold ${side === 'short' ? 'text-short' : 'text-text-secondary'}`}>—</span>
+            <span className={`text-sm font-semibold ${side === 'short' ? 'text-short' : 'text-text-secondary'}`}>
+              {book.bestBid !== null ? formatMarketPrice(book.bestBid, market.id) : '—'}
+            </span>
           </button>
         </div>
-        <p className="text-center text-[10px] text-text-quaternary">Spread —</p>
+        <p className="text-center text-[10px] text-text-quaternary">
+          Spread {book.bestAsk !== null && book.bestBid !== null ? formatMarketPrice(book.bestAsk - book.bestBid, market.id) : '—'}
+        </p>
       </div>
 
       <div className="flex items-center gap-[var(--space-2)]">
