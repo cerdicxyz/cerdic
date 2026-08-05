@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { LeverageSlider } from './LeverageSlider';
 import { ConnectWallet } from './ConnectWallet';
 import { useWallet } from '../wallet/wallet-context';
+import { useOrderBook } from '../hooks/useOrderBook';
+import { useSubmitOrder, type OrderResult } from '../hooks/useSubmitOrder';
 import type { Market } from './MarketDropdown';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
@@ -53,6 +55,8 @@ function sanitizeDecimal(value: string): string {
 
 export function TradePanel({ market }: { market: Market }) {
   const wallet = useWallet();
+  const book = useOrderBook(market.id);
+  const { submitOrder } = useSubmitOrder(wallet.address);
   const [side, setSide] = useState<Side>('long');
   const [orderType, setOrderType] = useState<OrderType>('market');
   const [leverageOpen, setLeverageOpen] = useState(false);
@@ -62,6 +66,8 @@ export function TradePanel({ market }: { market: Market }) {
   const [exitStrategyOpen, setExitStrategyOpen] = useState(false);
   const [takeProfit, setTakeProfit] = useState('');
   const [stopLoss, setStopLoss] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitStatus, setSubmitStatus] = useState<{ kind: 'ok' | 'error'; message: string } | null>(null);
 
   const maxLeverage = market.leverage;
   // Solidity's own integer-division truncation (SettlementEngine's
@@ -88,6 +94,52 @@ export function TradePanel({ market }: { market: Market }) {
   }, [amount, price, imrBps]);
 
   const showPrice = orderType === 'limit' || orderType === 'offer';
+
+  // A market order still needs an explicit tick — this matcher has no
+  // separate "no price" order type, a marketable order just names a price
+  // guaranteed to cross (see api.rs's OrderPayload, `tick` is required on
+  // every /order submission). Crosses at the live opposite-side best price
+  // from the real order book this panel is already streaming
+  // (useOrderBook.ts); with nothing resting on that side yet, there's
+  // genuinely no price to submit at, so the button stays disabled rather
+  // than guessing one.
+  const marketTick = side === 'long' ? book.bestAsk : book.bestBid;
+
+  async function handleSubmit() {
+    if (orderType === 'offer') return; // POST /offer isn't wired here yet, a real stated gap
+    const qty = Math.round(parseNum(amount) ?? NaN);
+    const tick = orderType === 'limit' ? Math.round(parseNum(price) ?? NaN) : marketTick;
+    if (!Number.isFinite(qty) || qty <= 0 || tick === null || !Number.isFinite(tick) || tick <= 0) return;
+
+    setSubmitting(true);
+    setSubmitStatus(null);
+    try {
+      const result: OrderResult = await submitOrder({
+        marketId: market.id,
+        side: side === 'long' ? 'Buy' : 'Sell',
+        tick,
+        qty,
+        tif: orderType === 'market' ? 'ImmediateOrCancel' : 'GoodTilCancel',
+        postOnly: false,
+        leverage,
+      });
+      if (result.status === 'rejected') {
+        setSubmitStatus({ kind: 'error', message: result.reason });
+      } else if (result.status === 'filled') {
+        setSubmitStatus({ kind: 'ok', message: `Filled (${result.fills} fill${result.fills === 1 ? '' : 's'})` });
+      } else {
+        setSubmitStatus({ kind: 'ok', message: `Resting (order #${result.order_id})` });
+      }
+    } catch (error) {
+      setSubmitStatus({ kind: 'error', message: error instanceof Error ? error.message : 'submission failed' });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const qtyValid = (parseNum(amount) ?? 0) > 0;
+  const tickForValidation = orderType === 'limit' ? parseNum(price) : marketTick;
+  const canSubmit = orderType !== 'offer' && qtyValid && tickForValidation !== null && tickForValidation > 0 && !submitting;
 
   return (
     <div className="flex h-full flex-col gap-[var(--space-4)] overflow-y-auto p-[var(--space-4)]">
@@ -247,18 +299,28 @@ export function TradePanel({ market }: { market: Market }) {
       )}
 
       {wallet.status === 'connected' ? (
-        // Order submission itself isn't wired to cerdic-tee-matcher yet
-        // (a separate, larger backend-wiring task, deliberately out of
-        // scope here) — this stays honestly disabled rather than
-        // pretending a connected wallet can already place a real order.
-        <button
-          type="button"
-          disabled
-          title="Order submission isn't wired to the backend yet"
-          className="cursor-not-allowed rounded-md bg-accent/10 px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold text-accent opacity-50"
-        >
-          Trading not wired up yet
-        </button>
+        <div className="flex flex-col gap-[var(--space-2)]">
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            title={
+              orderType === 'offer'
+                ? 'Offer submission (POST /offer) is a separate, not-yet-wired flow'
+                : undefined
+            }
+            className={`rounded-md px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold transition-opacity duration-150 ${
+              canSubmit ? 'bg-accent/10 text-accent hover:bg-accent/20' : 'cursor-not-allowed bg-accent/10 text-accent opacity-50'
+            }`}
+          >
+            {submitting ? 'Submitting…' : orderType === 'offer' ? 'Offers not wired up yet' : `${side === 'long' ? 'Buy' : 'Sell'} ${market.label}`}
+          </button>
+          {submitStatus && (
+            <p className={`text-xs ${submitStatus.kind === 'ok' ? 'text-long' : 'text-short'}`}>
+              {submitStatus.message}
+            </p>
+          )}
+        </div>
       ) : (
         <ConnectWallet variant="panel" />
       )}
