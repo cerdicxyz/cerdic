@@ -83,10 +83,16 @@ contract DeployLocal is Script {
 
         t.pyth = new MockPyth(60, 1);
         t.feedId = keccak256("EURC/USDC");
-        bytes memory updateData = t.pyth.createPriceFeedUpdateData(
-            t.feedId, int64(uint64(EUR_USD_PRICE)), 500, EUR_USD_EXPO, int64(uint64(EUR_USD_PRICE)), 500,
-            uint64(block.timestamp)
-        );
+        bytes memory updateData = t.pyth
+            .createPriceFeedUpdateData(
+                t.feedId,
+                int64(uint64(EUR_USD_PRICE)),
+                500,
+                EUR_USD_EXPO,
+                int64(uint64(EUR_USD_PRICE)),
+                500,
+                uint64(block.timestamp)
+            );
         bytes[] memory updates = new bytes[](1);
         updates[0] = updateData;
         t.pyth.updatePriceFeeds{value: t.pyth.getUpdateFee(updates)}(updates);

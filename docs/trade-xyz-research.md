@@ -87,13 +87,20 @@ dampen "aggressive funding during weekend price discovery" (`changelog/funding-r
 Synchra's `FxPerpMarket` funding was pure interest-rate differential with no premium/basis
 term at all (a keeper pushes `rateDifferentialBps` directly, no on-chain computation).
 `scripts/keeper-fx-rate.sh` (this pass) now computes a blended rate matching XYZ's shape:
-`0.5 × (premium_bps + clamp(interest_rate_diff_bps, -50, 50))`, where the premium term is
-the FxPerpMarket's own live mark-vs-average-entry-price basis (queried from the deployed
-contract), and the interest-rate differential term is the same live EFFR-vs-ECB-DFR figure
-already being fetched (see the earlier session's real-rate keeper work). Real central-bank
-rates only move on policy-meeting cadence so the differential term is still safe to poll
-daily; the premium term needs to be pushed far more often (hourly, matching XYZ's cadence)
-since it tracks live market pricing, not policy — the keeper now supports both cadences.
+`0.5 × (premium_bps + clamp(interest_rate_diff_bps, -50, 50))`. The premium term is the
+market's own order-book mid (read from the matcher's real `/orderbook` endpoint) versus
+the live Pyth EUR/USD oracle price — the same "does the book trade above/below spot"
+concept `PerpMarket.sol`'s own on-chain funding model already uses for BTC/USDC, computed
+off-chain here since `FxPerpMarket`'s funding is keeper-pushed rather than on-chain. An
+earlier draft of this script tried to use "average entry price across open positions"
+for the premium term instead — dropped, it's not actually queryable: entry prices live
+inside `sealedParams`, encrypted under the enclave's own key, there is no public
+aggregate to read (the same "makers can't read their own fills" constraint
+`market_maker.rs` documents extensively). The interest-rate differential term is the same
+live EFFR-vs-ECB-DFR figure already being fetched. Real central-bank rates only move on
+policy-meeting cadence so that term is still safe to poll daily; the premium term needs
+pushing far more often (hourly, matching XYZ's cadence) since it tracks live market
+pricing, not policy.
 
 ## 5. Margin tiers (not carried over — noted for later)
 

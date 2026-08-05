@@ -78,7 +78,7 @@ use tokio::sync::broadcast;
 /// Wire-level side, kept separate from `common::types::Side` so this
 /// crate's HTTP surface doesn't force a serde dependency onto the
 /// shared cross-crate type mirror.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     Buy,
     Sell,
@@ -890,6 +890,25 @@ async fn post_order(
         // Never awaited: settlement is async network I/O (or a no-op
         // when unconfigured, see settle.rs), not something the trader's
         // response should wait on.
+        //
+        // Real, load-bearing consequence, hit directly while building
+        // `market_maker.rs`: the off-chain match above ALREADY happened
+        // and this response ALREADY says "filled" by the time this
+        // broadcast even starts, so a broadcast failure (e.g. a
+        // `StalePrice` revert from a price feed nobody's kept fresh,
+        // `keeper_price_pusher.rs`'s whole reason for existing) does NOT
+        // roll back the in-memory match: the maker's resting liquidity
+        // stays consumed, the client keeps its "filled" response, and
+        // the only record of the failure is this function's own error
+        // log. There is currently no retry, no reconciliation, and no
+        // way for either party to learn their on-chain state never
+        // actually moved short of independently reading `loadSealed`
+        // and noticing collateral that should be there isn't. A real
+        // deployment needs one of: a retry queue here, or a
+        // reconciliation keeper that diffs "matches the book thinks
+        // happened" against "SealedPositionTouched events actually
+        // emitted" and re-drives the gap. Not built this pass, flagged
+        // because it's a genuine correctness gap, not a hypothetical one.
         tokio::spawn(async move {
             let result =
                 crate::settle::settle_taker_sweep(&state_for_settlement.settlement_signer, &sweep, contract)
@@ -1419,8 +1438,15 @@ fn portfolio_key(secret: &[u8; 32], address: Address) -> FixedBytes<32> {
     keccak256(&bytes)
 }
 
-const IMR_BPS: u128 = 500;
-const BPS_DENOMINATOR: u128 = 10_000;
+/// `pub`, not private: `market_maker.rs` needs the exact same constant to
+/// invert `required_margin` (a collateral delta back into an implied
+/// filled quantity) when estimating its own inventory from public
+/// `loadSealed` collateral reads, see that binary's own doc on why it
+/// can't just read a fill size directly. Keeping one definition here
+/// rather than a second copy there is what keeps them from drifting out
+/// of sync silently.
+pub const IMR_BPS: u128 = 500;
+pub const BPS_DENOMINATOR: u128 = 10_000;
 
 /// Mirrors `SettlementEngine.requiredMargin`'s formula shape (full
 /// product before one floor division), but `tick`/`qty` here are the
