@@ -310,7 +310,15 @@ export function TradePanel({ market }: { market: Market }) {
                 : undefined
             }
             className={`rounded-md px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold transition-opacity duration-150 ${
-              canSubmit ? 'bg-accent/10 text-accent hover:bg-accent/20' : 'cursor-not-allowed bg-accent/10 text-accent opacity-50'
+              orderType === 'offer'
+                ? 'cursor-not-allowed bg-accent/10 text-accent opacity-50'
+                : side === 'long'
+                  ? canSubmit
+                    ? 'bg-long/10 text-long hover:bg-long/20'
+                    : 'cursor-not-allowed bg-long/10 text-long opacity-50'
+                  : canSubmit
+                    ? 'bg-short/10 text-short hover:bg-short/20'
+                    : 'cursor-not-allowed bg-short/10 text-short opacity-50'
             }`}
           >
             {submitting ? 'Submitting…' : orderType === 'offer' ? 'Offers not wired up yet' : `${side === 'long' ? 'Buy' : 'Sell'} ${market.label}`}
