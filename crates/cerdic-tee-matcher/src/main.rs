@@ -28,6 +28,7 @@ async fn main() {
     let mut app_state = api::AppState::from_secrets(secrets);
     configure_oracle_feeds(&mut app_state);
     configure_settlement_contracts(&mut app_state);
+    configure_backstop_notional_cap(&mut app_state);
     let state = Arc::new(app_state);
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
@@ -117,6 +118,25 @@ fn configure_settlement_contracts(state: &mut api::AppState) {
                 "malformed CERDIC_SETTLEMENT_CONTRACTS entry, expected marketId=contractAddress, skipping"
             ),
         }
+    }
+}
+
+/// Reads `CERDIC_BACKSTOP_NOTIONAL_CAP` (a plain integer, same raw `Qty`
+/// unit as an order's own `qty`), see
+/// `AppState::configure_backstop_notional_cap`'s own doc for what this
+/// is for. Unset (the default) keeps the backstop's own unbounded
+/// default (`BackstopConfig::default`), i.e. today's existing behavior,
+/// unchanged for any deployment that doesn't opt in.
+fn configure_backstop_notional_cap(state: &mut api::AppState) {
+    let Ok(raw) = std::env::var("CERDIC_BACKSTOP_NOTIONAL_CAP") else {
+        return;
+    };
+    match raw.parse() {
+        Ok(cap) => {
+            tracing::info!(cap, "backstop notional cap overridden");
+            state.configure_backstop_notional_cap(cap);
+        }
+        Err(e) => tracing::warn!(raw, error = %e, "malformed CERDIC_BACKSTOP_NOTIONAL_CAP, ignoring"),
     }
 }
 

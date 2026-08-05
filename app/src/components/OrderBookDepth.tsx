@@ -668,19 +668,49 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     };
   }, [asks, bids, midPrice, change24hPct, marketId]);
 
+  // Only the true first-load case (never connected, nothing to show yet)
+  // gets the blocking skeleton — a reconnect blip with stale data already
+  // on screen (liveBook.connected can flip false while `asks`/`bids`
+  // still hold the last good snapshot, see useOrderBook.ts's own doc)
+  // shouldn't cover real numbers with a loading state, that read as a
+  // bug in its own right, not a loading indicator.
+  const loading = !liveBook.connected && asks.length === 0 && bids.length === 0;
+
   return (
     <div ref={containerRef} className="relative h-full w-full">
       <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
-      {!liveBook.connected && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-surface-base/60 text-xs text-text-tertiary">
-          Connecting to matcher…
-        </div>
-      )}
+      {loading && <OrderBookSkeleton />}
       {liveBook.connected && asks.length === 0 && bids.length === 0 && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-text-tertiary">
           No resting orders
         </div>
       )}
+    </div>
+  );
+}
+
+/** Row-shaped placeholders, not a spinner/text overlay — mirrors this
+ *  panel's own real layout (price | chip | bar) so the transition into
+ *  real data doesn't jump. `motion-safe:` is Tailwind's own
+ *  prefers-reduced-motion gate, same posture as this file's canvas
+ *  transitions and LeverageSlider's spring. */
+function OrderBookSkeleton() {
+  const rows = Array.from({ length: 10 });
+  return (
+    <div aria-hidden="true" className="pointer-events-none absolute inset-0 flex flex-col justify-center gap-px px-2">
+      {rows.map((_, i) => {
+        const side = i < 5 ? 'ask' : 'bid';
+        const width = 30 + ((i * 13) % 45);
+        return (
+          <div key={i} className="flex items-center gap-2" style={{ height: ROW_HEIGHT }}>
+            <div className="h-3 w-10 motion-safe:animate-pulse rounded-sm bg-surface-hover" />
+            <div
+              className={`h-3 motion-safe:animate-pulse rounded-sm ${side === 'ask' ? 'bg-short/15' : 'bg-long/15'}`}
+              style={{ width: `${width}%` }}
+            />
+          </div>
+        );
+      })}
     </div>
   );
 }

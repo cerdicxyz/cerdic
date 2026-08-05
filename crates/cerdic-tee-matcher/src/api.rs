@@ -579,6 +579,22 @@ impl AppState {
         self.settlement_contracts.insert(market_id, contract);
     }
 
+    /// Overrides the backstop maker's `notional_cap` (default
+    /// `Qty::MAX`, see `BackstopConfig::default`'s own doc), same
+    /// deployment-config posture as `configure_oracle_feed`. Real
+    /// operational need this closes: with an unbounded cap, EVERY GTC
+    /// order that would otherwise rest gets immediately absorbed by the
+    /// backstop's own synthetic liquidity (the "rescue the whole
+    /// remainder" branch in `post_order`), which is exactly the
+    /// intended behavior for a market nobody's making real markets on
+    /// yet — but it also means a resting order book can never
+    /// accumulate any visible depth, confirmed live while trying to
+    /// seed one for a demo. Capping it (or setting it to 0 to disable
+    /// the rescue outright) lets real limit orders actually rest.
+    pub fn configure_backstop_notional_cap(&mut self, cap: crate::book::Qty) {
+        self.backstop_config.notional_cap = cap;
+    }
+
     /// Fetches a fresh Pyth price for every market `configure_oracle_feed`
     /// was called for, and records each into that market's
     /// [`backstop::BackstopState`] TWAP (`record_price`), the same call
