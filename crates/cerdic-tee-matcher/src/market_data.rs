@@ -47,6 +47,16 @@ pub struct MarketSnapshot {
     /// change" are different facts.
     pub change_24h_bps: Option<i64>,
     pub volume_24h: u64,
+    /// Highest/lowest trade price still in the retained window (see
+    /// `WINDOW_SECONDS`'s own doc on why that's not always literally the
+    /// last 24 calendar hours). `None` only when there's no trade at all
+    /// yet, same "no data, not a fabricated zero" rule `change_24h_bps`
+    /// already follows. This was previously left as an honest "not
+    /// tracked" gap on the frontend — it didn't need new state, the same
+    /// `self.trades` this snapshot already scans for volume has always
+    /// had the answer, this method just never computed it.
+    pub high_24h: Option<u64>,
+    pub low_24h: Option<u64>,
 }
 
 /// One OHLCV bar. Prices/volume are the matcher's own raw tick/qty
@@ -60,6 +70,21 @@ pub struct Candle {
     pub low: u64,
     pub close: u64,
     pub volume: u64,
+}
+
+/// One real print off the tape — the raw trade a live trades ticker
+/// needs, distinct from `Candle`'s aggregated bars. No `side`: the book
+/// only records a fill's price/qty at settlement time (see `record`'s
+/// own callers in `post_order`), never which party was taker — adding
+/// that would mean threading it through the whole fill pipeline for a
+/// column this ticker doesn't strictly need (real venues color a print
+/// by whether price moved up or down since the last one instead, which
+/// the frontend can already derive from consecutive prices).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Trade {
+    pub timestamp: u64,
+    pub price: u64,
+    pub qty: u64,
 }
 
 impl TradeTape {
@@ -88,6 +113,8 @@ impl TradeTape {
             last_price: last.map(|t| t.price),
             last_trade_at: last.map(|t| t.timestamp),
             change_24h_bps,
+            high_24h: self.trades.iter().map(|t| t.price).max(),
+            low_24h: self.trades.iter().map(|t| t.price).min(),
             volume_24h: self.trades.iter().map(|t| t.qty).sum(),
         }
     }
@@ -137,6 +164,17 @@ impl TradeTape {
 
         let start = candles.len().saturating_sub(limit);
         candles[start..].to_vec()
+    }
+
+    /// Most recent `limit` real prints, newest first — a live trades
+    /// ticker's own shape, distinct from `candles`' aggregated bars.
+    pub fn recent(&self, limit: usize) -> Vec<Trade> {
+        self.trades
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|t| Trade { timestamp: t.timestamp, price: t.price, qty: t.qty })
+            .collect()
     }
 }
 

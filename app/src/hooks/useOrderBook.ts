@@ -24,6 +24,12 @@ export interface LiveOrderBook {
    *  yet, not zero change, matching MarketSnapshot's own doc in market_data.rs. */
   change24hBps: number | null;
   volume24h: number;
+  /** Highest/lowest trade price still in the matcher's retained window
+   *  (market_data.rs's TradeTape — see that module's own doc on why this
+   *  isn't always literally the last 24 calendar hours). `null` only
+   *  when there's no trade at all yet. */
+  high24h: number | null;
+  low24h: number | null;
   connected: boolean;
 }
 
@@ -35,6 +41,8 @@ const EMPTY_BOOK: LiveOrderBook = {
   lastPrice: null,
   change24hBps: null,
   volume24h: 0,
+  high24h: null,
+  low24h: null,
   connected: false,
 };
 
@@ -59,6 +67,8 @@ interface WireOrderBookResponse {
   last_trade_at: number | null;
   change_24h_bps: number | null;
   volume_24h: number;
+  high_24h: number | null;
+  low_24h: number | null;
 }
 
 function toLevels(levels: WirePriceLevel[]): OrderBookLevel[] {
@@ -100,6 +110,8 @@ export function useOrderBook(marketId: string): LiveOrderBook {
             lastPrice: data.last_price,
             change24hBps: data.change_24h_bps,
             volume24h: data.volume_24h,
+            high24h: data.high_24h,
+            low24h: data.low_24h,
             connected: true,
           });
         } catch {

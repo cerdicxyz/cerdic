@@ -675,23 +675,18 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     };
   }, [asks, bids, midPrice, change24hPct, marketId]);
 
-  // Only the true first-load case (never connected, nothing to show yet)
-  // gets the blocking skeleton — a reconnect blip with stale data already
-  // on screen (liveBook.connected can flip false while `asks`/`bids`
-  // still hold the last good snapshot, see useOrderBook.ts's own doc)
-  // shouldn't cover real numbers with a loading state, that read as a
-  // bug in its own right, not a loading indicator.
-  const loading = !liveBook.connected && asks.length === 0 && bids.length === 0;
+  // Same skeleton for "not connected yet" and "connected but genuinely
+  // empty" — a reconnect blip with stale data already on screen
+  // (liveBook.connected can flip false while `asks`/`bids` still hold
+  // the last good snapshot, see useOrderBook.ts's own doc) is the only
+  // case that should NOT show it, real numbers already on screen
+  // shouldn't get covered by a loading state.
+  const showSkeleton = asks.length === 0 && bids.length === 0;
 
   return (
     <div ref={containerRef} className="relative h-full w-full">
       <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
-      {loading && <OrderBookSkeleton />}
-      {liveBook.connected && asks.length === 0 && bids.length === 0 && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-text-tertiary">
-          No resting orders
-        </div>
-      )}
+      {showSkeleton && <OrderBookSkeleton />}
     </div>
   );
 }

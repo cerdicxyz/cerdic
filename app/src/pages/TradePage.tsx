@@ -76,7 +76,7 @@ export function TradePage() {
               <PositionsPanel />
             </Panel>
             <Panel label="Stats" area="stats" noPadding>
-              <StatsPanel />
+              <StatsPanel market={market} />
             </Panel>
           </div>
         </div>
@@ -85,7 +85,7 @@ export function TradePage() {
             <TradePanel market={market} />
           </Panel>
           <Panel label="Trades" area="tape" noPadding>
-            <TradesPanel />
+            <TradesPanel market={market} />
           </Panel>
         </div>
       </div>

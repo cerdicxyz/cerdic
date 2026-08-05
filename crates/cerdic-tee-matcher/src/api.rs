@@ -54,7 +54,7 @@ use crate::backstop::{BackstopConfig, BACKSTOP_OWNER_ID};
 use crate::book::{BookSnapshot, Fill, NewOrder, OrderBook, OrderId, OwnerId, Tick, TimeInForce};
 use crate::decrypt::{self, DecryptError, Envelope, SignedPayload};
 use crate::keystore::Keystore;
-use crate::market_data::{MarketSnapshot, TradeTape};
+use crate::market_data::{MarketSnapshot, Trade, TradeTape};
 use crate::sealed::SealedParams;
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, PrimitiveSignature as Signature, I256, U256};
 use axum::{
@@ -650,6 +650,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/orderbook/:market_id", get(get_orderbook))
         .route("/ws/orderbook/:market_id", get(ws_orderbook))
         .route("/candles/:market_id", get(get_candles))
+        .route("/trades/:market_id", get(get_trades))
         .route("/debug/seed-history", post(post_debug_seed_history))
         .with_state(state)
 }
@@ -1188,6 +1189,38 @@ async fn get_candles(
     Ok(Json(CandlesResponse { market_id, interval: query.interval, candles }))
 }
 
+const MAX_TRADES_LIMIT: usize = 200;
+const DEFAULT_TRADES_LIMIT: usize = 50;
+
+#[derive(Debug, Deserialize)]
+struct TradesQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TradesResponse {
+    market_id: MarketId,
+    trades: Vec<Trade>,
+}
+
+/// Real trade prints, newest first — `TradeTape::recent`, the same
+/// retained history `/candles` aggregates into bars, just unaggregated.
+/// A market that has never traded returns an empty list, not a 404,
+/// same posture every other per-market read in this file has for an
+/// unseen market.
+async fn get_trades(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<MarketId>,
+    Query(query): Query<TradesQuery>,
+) -> Json<TradesResponse> {
+    let limit = query.limit.unwrap_or(DEFAULT_TRADES_LIMIT).clamp(1, MAX_TRADES_LIMIT);
+    let trades = {
+        let market_data = state.market_data.lock().expect("market_data mutex poisoned");
+        market_data.get(&market_id).map(|tape| tape.recent(limit)).unwrap_or_default()
+    };
+    Json(TradesResponse { market_id, trades })
+}
+
 #[derive(Debug, Deserialize)]
 struct SeedHistoryPayload {
     market_id: MarketId,
@@ -1233,11 +1266,14 @@ async fn post_debug_seed_history(
     let span_secs = payload.days * 24 * 60 * 60;
     let start_time = now.saturating_sub(span_secs);
 
-    // One synthetic print every 5 minutes across the whole span — dense
-    // enough for 1h/4h/1d candles to show real per-bar high/low/close
-    // variation, not so dense it's an absurd record count for a
-    // multi-day span (3 days -> 864 records).
-    const STEP_SECS: u64 = 5 * 60;
+    // One synthetic print every minute — dense enough that even the
+    // shortest (5m) candle interval contains several real prints and
+    // shows genuine open/high/low/close variation, not one flat print
+    // masquerading as a bar (confirmed live: 5-minute-step prints made
+    // every 5m candle a degenerate doji, since each bucket only ever had
+    // exactly one print). 3 days at this density is 4_320 records/market,
+    // still trivial in-memory.
+    const STEP_SECS: u64 = 60;
     let mut price = payload.start_tick as i64;
     // xorshift64, seeded from the request's own inputs — deterministic,
     // not cryptographic, this only ever feeds a display-only synthetic
@@ -1246,14 +1282,31 @@ async fn post_debug_seed_history(
     let mut count = 0usize;
 
     let mut market_data = state.market_data.lock().expect("market_data mutex poisoned");
-    let tape = market_data.entry(payload.market_id.clone()).or_default();
+    // Replaces, not appends: `TradeTape::record` documents (and relies on,
+    // see its own doc) trades arriving in non-decreasing timestamp order —
+    // appending this backfill's backdated synthetic prints onto whatever
+    // real trades already happened for this market (say, this endpoint
+    // called after the market had already traded a few seconds ago) would
+    // insert an OLDER timestamp after a NEWER one already in the deque,
+    // corrupting that invariant. Confirmed live: this exact sequence
+    // produced a `candles()` result lightweight-charts' own ascending-time
+    // assertion rejected, crashing the whole frontend with no error
+    // boundary to catch it. A full reset is also just the right semantics
+    // for "seed this market's history" — a demo backfill, not an
+    // incremental append.
+    market_data.insert(payload.market_id.clone(), TradeTape::default());
+    let tape = market_data.get_mut(&payload.market_id).expect("just inserted");
 
     let mut t = start_time;
     while t < now {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 7;
         rng_state ^= rng_state << 17;
-        let step_tenths_pct = (rng_state % 21) as i64 - 10; // -1.0%..=+1.0% per step
+        // +-0.2% per 1-minute step — smaller than before (was +-1.0%)
+        // since steps are now 5x more frequent; unchanged compounds to a
+        // similar realistic per-hour range, just spread across more,
+        // smaller candle-visible moves instead of one large jump per bar.
+        let step_tenths_pct = (rng_state % 5) as i64 - 2; // -0.2%..=+0.2% per step
         price += price * step_tenths_pct / 1000;
         if price < 1 {
             price = 1;
@@ -1947,6 +2000,50 @@ mod tests {
             "3 days of history should span well more than 20 hourly bars, got {}",
             candles.len()
         );
+    }
+
+    /// Real, live-caught bug: calling this AFTER the market already had a
+    /// real trade (a fresh `now()` timestamp already sitting in the tape)
+    /// used to append backdated synthetic prints after it, corrupting the
+    /// non-decreasing-timestamp order `candles()` relies on and producing
+    /// a candle sequence lightweight-charts' own ascending-time assertion
+    /// rejected on the frontend, crashing the whole page with no error
+    /// boundary to catch it. This must reset, not append.
+    #[tokio::test]
+    async fn debug_seed_history_resets_the_tape_instead_of_appending_after_existing_trades() {
+        let mut state = AppState::new();
+        state.configure_debug_seed(true);
+        let state = Arc::new(state);
+
+        // A real trade "just happened" (a fresh now() timestamp) before
+        // the backfill call, same as a market that's already live.
+        {
+            let mut market_data = state.market_data.lock().unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            market_data.entry("USD/JPY".to_string()).or_default().record(now, 15_719_897, 5);
+        }
+
+        let app = router(state.clone());
+        let (status, _) = post_raw_json(
+            app,
+            "/debug/seed-history",
+            serde_json::json!({"market_id": "USD/JPY", "start_tick": 15_751_400, "days": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let candles = {
+            let market_data = state.market_data.lock().unwrap();
+            market_data.get("USD/JPY").unwrap().candles(3600, 200)
+        };
+        for pair in candles.windows(2) {
+            assert!(
+                pair[0].open_time <= pair[1].open_time,
+                "candles must be strictly ascending by open_time, same invariant lightweight-charts enforces client-side: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[tokio::test]
@@ -3107,12 +3204,28 @@ mod tests {
         sign(&mut crossing, &taker);
         post_json(app.clone(), "/order", &envelope_for(crossing, &state)).await;
 
-        let (status, body) = get_json(app, "/orderbook/0xEURCUSDC").await;
+        let (status, body) = get_json(app.clone(), "/orderbook/0xEURCUSDC").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["last_price"], 100);
         assert_eq!(body["volume_24h"], 5);
         // Fully filled at the same tick it rested at: both sides are gone.
         assert_eq!(body["bids"], serde_json::json!([]));
         assert_eq!(body["asks"], serde_json::json!([]));
+
+        let (trades_status, trades_body) = get_json(app, "/trades/0xEURCUSDC").await;
+        assert_eq!(trades_status, StatusCode::OK);
+        let trades = trades_body["trades"].as_array().unwrap();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0]["price"], 100);
+        assert_eq!(trades[0]["qty"], 5);
+    }
+
+    #[tokio::test]
+    async fn trades_for_an_unknown_market_is_empty_not_an_error() {
+        let state = Arc::new(AppState::new());
+        let app = router(state);
+        let (status, body) = get_json(app, "/trades/0xNEVERTRADED").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["trades"], serde_json::json!([]));
     }
 }

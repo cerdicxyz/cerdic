@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { IconBolt, IconCheck } from '@tabler/icons-react';
 import type { AssetClass, Market } from './MarketDropdown';
 import { MARKETS } from './MarketDropdown';
+import { useOrderBook } from '../hooks/useOrderBook';
+import { formatMarketPrice } from '../lib/priceScale';
 
 // Full searchable market table, styled after Ostium's own market picker
 // (search bar + asset-class tabs + a price table, not a short listbox) —
@@ -15,12 +17,12 @@ import { MARKETS } from './MarketDropdown';
 //   track/expose yet, and inventing either would be exactly the kind of
 //   fabricated number this codebase avoids everywhere else (see
 //   MarketBar's own "no live market data wired yet" note).
-// - Price / 24H Chg / Volume all render "—", matching MarketBar's STATS
-//   row for the same reason: this page has no live price feed wired to
-//   any market yet. Leverage is the one real number in this table
-//   (SettlementEngine.LEVERAGE_CEILING, genuinely per-market now — 50x
-//   for FX majors, 30x for everything else) — it's contract config, not
-//   something that needs a live feed to be true.
+// - Price / 24H Chg / Volume are real now (useOrderBook.ts, same feed
+//   MarketBar/StatsPanel use) — each visible row opens its own
+//   WebSocket subscription while this modal is open, closed again on
+//   unmount/select, not 9 permanent connections sitting open in the
+//   background. A row for a market with no trades yet still shows "—",
+//   not a fabricated number.
 // - Tabs are exactly the four asset classes Cerdic's markets fall into
 //   today (FX, Crypto, Commodities, Equities) — Ostium's Indices/Stocks/
 //   ETFs tabs would all be empty here, not listed for that reason.
@@ -151,40 +153,70 @@ export function MarketSearchModal({
               No markets match "{query}"
             </p>
           )}
-          {filtered.map((market, index) => {
-            const isSelected = market.id === selected.id;
-            const isHighlighted = index === highlighted;
-            return (
-              <button
-                key={market.id}
-                type="button"
-                role="option"
-                aria-selected={isSelected}
-                onMouseEnter={() => setHighlighted(index)}
-                onClick={() => onSelect(market)}
-                className={`grid w-full grid-cols-[2fr_1fr_1fr_1fr_1fr] items-center gap-[var(--space-3)] rounded-sm px-[var(--space-3)] py-[var(--space-2)] text-left text-xs transition-colors duration-150 ${
-                  isHighlighted ? 'bg-surface-hover' : ''
-                }`}
-              >
-                <span className="flex items-center gap-[var(--space-3)] text-text-primary">
-                  <img src={market.icon} alt="" aria-hidden="true" className="h-5 w-5 flex-shrink-0" />
-                  <span className="flex items-center gap-[var(--space-2)]">
-                    {market.label}
-                    {isSelected && <IconCheck size={13} stroke={2} className="text-accent" aria-hidden="true" />}
-                  </span>
-                </span>
-                <span className="flex items-center justify-end gap-[var(--space-1)] text-text-secondary">
-                  <IconBolt size={11} stroke={2.25} className="text-accent" aria-hidden="true" />
-                  {market.leverage}x
-                </span>
-                <span className="text-right text-text-quaternary">—</span>
-                <span className="text-right text-text-quaternary">—</span>
-                <span className="text-right text-text-quaternary">—</span>
-              </button>
-            );
-          })}
+          {filtered.map((market, index) => (
+            <MarketRow
+              key={market.id}
+              market={market}
+              isSelected={market.id === selected.id}
+              isHighlighted={index === highlighted}
+              onMouseEnter={() => setHighlighted(index)}
+              onClick={() => onSelect(market)}
+            />
+          ))}
         </div>
       </div>
     </div>
+  );
+}
+
+function MarketRow({
+  market,
+  isSelected,
+  isHighlighted,
+  onMouseEnter,
+  onClick,
+}: {
+  market: Market;
+  isSelected: boolean;
+  isHighlighted: boolean;
+  onMouseEnter: () => void;
+  onClick: () => void;
+}) {
+  // One subscription per VISIBLE row, not per market in the full list —
+  // filtering/tabs already narrow `filtered` before this ever renders,
+  // and the whole modal (parent) only mounts rows while it's open.
+  const book = useOrderBook(market.id);
+  const change24hPct = book.change24hBps !== null ? book.change24hBps / 100 : null;
+
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={isSelected}
+      onMouseEnter={onMouseEnter}
+      onClick={onClick}
+      className={`grid w-full grid-cols-[2fr_1fr_1fr_1fr_1fr] items-center gap-[var(--space-3)] rounded-sm px-[var(--space-3)] py-[var(--space-2)] text-left text-xs transition-colors duration-150 ${
+        isHighlighted ? 'bg-surface-hover' : ''
+      }`}
+    >
+      <span className="flex items-center gap-[var(--space-3)] text-text-primary">
+        <img src={market.icon} alt="" aria-hidden="true" className="h-5 w-5 flex-shrink-0" />
+        <span className="flex items-center gap-[var(--space-2)]">
+          {market.label}
+          {isSelected && <IconCheck size={13} stroke={2} className="text-accent" aria-hidden="true" />}
+        </span>
+      </span>
+      <span className="flex items-center justify-end gap-[var(--space-1)] text-text-secondary">
+        <IconBolt size={11} stroke={2.25} className="text-accent" aria-hidden="true" />
+        {market.leverage}x
+      </span>
+      <span className="text-right text-text-secondary">
+        {book.lastPrice !== null ? formatMarketPrice(book.lastPrice, market.id) : '—'}
+      </span>
+      <span className={`text-right ${change24hPct === null ? 'text-text-quaternary' : change24hPct < 0 ? 'text-short' : 'text-long'}`}>
+        {change24hPct !== null ? `${change24hPct.toFixed(2)}%` : '—'}
+      </span>
+      <span className="text-right text-text-quaternary">{book.volume24h > 0 ? book.volume24h.toFixed(1) : '—'}</span>
+    </button>
   );
 }
