@@ -29,6 +29,7 @@ async fn main() {
     configure_oracle_feeds(&mut app_state);
     configure_settlement_contracts(&mut app_state);
     configure_backstop_notional_cap(&mut app_state);
+    configure_debug_seed(&mut app_state);
     let state = Arc::new(app_state);
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
@@ -138,6 +139,21 @@ fn configure_backstop_notional_cap(state: &mut api::AppState) {
         }
         Err(e) => tracing::warn!(raw, error = %e, "malformed CERDIC_BACKSTOP_NOTIONAL_CAP, ignoring"),
     }
+}
+
+/// Reads `CERDIC_ENABLE_DEBUG_SEED` (any non-empty value enables it),
+/// see `api::AppState`'s `debug_seed_enabled` doc for what this gates.
+/// Unset (the default) keeps `POST /debug/seed-history` returning 404 on
+/// every request, i.e. today's behavior, unchanged for any deployment
+/// that doesn't opt in.
+fn configure_debug_seed(state: &mut api::AppState) {
+    let enabled = std::env::var("CERDIC_ENABLE_DEBUG_SEED").is_ok_and(|v| !v.is_empty());
+    if enabled {
+        tracing::warn!(
+            "CERDIC_ENABLE_DEBUG_SEED set — /debug/seed-history can inject synthetic trade history"
+        );
+    }
+    state.configure_debug_seed(enabled);
 }
 
 /// How often the backstop's TWAP is refreshed from Pyth, independent of

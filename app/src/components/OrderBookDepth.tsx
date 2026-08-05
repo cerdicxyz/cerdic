@@ -156,11 +156,18 @@ function lerpLevels(from: Level[], to: Level[], t: number): Level[] {
   const fromByPrice = new Map(from.map((level) => [level.price, level]));
   return to.map((level) => {
     const prior = fromByPrice.get(level.price);
-    if (!prior) return level;
+    // No price match in the prior snapshot — a level that just entered
+    // the visible top-N window (the mid moved, or a genuinely new resting
+    // order landed at this exact tick). Growing it in from zero instead
+    // of snapping straight to its full size is what turns that into a
+    // smooth appearance instead of a pop — this is the actual fix for
+    // rows "flickering," not just calmer demo data (which only reduces
+    // how OFTEN this path is hit, it doesn't fix what happens when it is).
+    const base = prior ?? { price: level.price, size: 0, cumulative: 0 };
     return {
       price: level.price,
-      size: prior.size + (level.size - prior.size) * t,
-      cumulative: prior.cumulative + (level.cumulative - prior.cumulative) * t,
+      size: base.size + (level.size - base.size) * t,
+      cumulative: base.cumulative + (level.cumulative - base.cumulative) * t,
     };
   });
 }

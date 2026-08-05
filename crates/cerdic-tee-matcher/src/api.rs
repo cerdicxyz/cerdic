@@ -489,6 +489,12 @@ pub struct AppState {
     /// See `fees.rs`'s module doc: cumulative-since-inception, not a rolling
     /// window, and the same unbounded-growth caveat as `last_nonce`.
     trader_volume: Mutex<HashMap<Address, u128>>,
+    /// Gates `POST /debug/seed-history`, see that handler's own doc.
+    /// `false` (the default) means the route always rejects — a real
+    /// deployment that never sets `CERDIC_ENABLE_DEBUG_SEED` has zero
+    /// exposure to it, same "opt-in, not opt-out" posture as every other
+    /// deployment-config flag in this file.
+    debug_seed_enabled: bool,
 }
 
 impl AppState {
@@ -516,6 +522,7 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
+            debug_seed_enabled: false,
         }
     }
 
@@ -543,6 +550,7 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
+            debug_seed_enabled: false,
         }
     }
 }
@@ -595,6 +603,11 @@ impl AppState {
         self.backstop_config.notional_cap = cap;
     }
 
+    /// See `debug_seed_enabled`'s own doc.
+    pub fn configure_debug_seed(&mut self, enabled: bool) {
+        self.debug_seed_enabled = enabled;
+    }
+
     /// Fetches a fresh Pyth price for every market `configure_oracle_feed`
     /// was called for, and records each into that market's
     /// [`backstop::BackstopState`] TWAP (`record_price`), the same call
@@ -637,6 +650,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/orderbook/:market_id", get(get_orderbook))
         .route("/ws/orderbook/:market_id", get(ws_orderbook))
         .route("/candles/:market_id", get(get_candles))
+        .route("/debug/seed-history", post(post_debug_seed_history))
         .with_state(state)
 }
 
@@ -1172,6 +1186,85 @@ async fn get_candles(
     };
 
     Ok(Json(CandlesResponse { market_id, interval: query.interval, candles }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SeedHistoryPayload {
+    market_id: MarketId,
+    start_tick: u64,
+    days: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SeedHistoryResponse {
+    market_id: MarketId,
+    trades_seeded: usize,
+}
+
+/// Backfills synthetic-but-plausible trade history directly into
+/// `TradeTape`, entirely bypassing order matching/settlement — this
+/// never touches `OrderBook`, never creates a position, never signs or
+/// settles anything, it only ever appends display-only (price, qty,
+/// timestamp) rows to the same store `/candles` and `/orderbook`'s
+/// `last_price`/`change_24h_bps`/`volume_24h` already read from real
+/// trades. Exists because a market's REAL trade history can only ever
+/// grow at wall-clock speed (`TradeTape::record`'s `now` always comes
+/// from the caller's real clock, `post_order` passes
+/// `SystemTime::now()`), so a testnet demo wanting several days of
+/// candle history to look at has no way to get there except waiting
+/// several real days. Gated behind `debug_seed_enabled` (default off,
+/// see that field's own doc) specifically so this is never reachable on
+/// a real deployment that hasn't explicitly opted in.
+async fn post_debug_seed_history(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SeedHistoryPayload>,
+) -> Result<Json<SeedHistoryResponse>, (StatusCode, String)> {
+    if !state.debug_seed_enabled {
+        return Err((StatusCode::NOT_FOUND, "debug seeding is not enabled on this matcher".into()));
+    }
+    if payload.start_tick == 0 || payload.days == 0 {
+        return Err((StatusCode::BAD_REQUEST, "start_tick and days must both be > 0".into()));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before the Unix epoch")
+        .as_secs();
+    let span_secs = payload.days * 24 * 60 * 60;
+    let start_time = now.saturating_sub(span_secs);
+
+    // One synthetic print every 5 minutes across the whole span — dense
+    // enough for 1h/4h/1d candles to show real per-bar high/low/close
+    // variation, not so dense it's an absurd record count for a
+    // multi-day span (3 days -> 864 records).
+    const STEP_SECS: u64 = 5 * 60;
+    let mut price = payload.start_tick as i64;
+    // xorshift64, seeded from the request's own inputs — deterministic,
+    // not cryptographic, this only ever feeds a display-only synthetic
+    // walk, nothing security-relevant depends on its randomness.
+    let mut rng_state: u64 = now ^ payload.start_tick.wrapping_mul(2_654_435_761);
+    let mut count = 0usize;
+
+    let mut market_data = state.market_data.lock().expect("market_data mutex poisoned");
+    let tape = market_data.entry(payload.market_id.clone()).or_default();
+
+    let mut t = start_time;
+    while t < now {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let step_tenths_pct = (rng_state % 21) as i64 - 10; // -1.0%..=+1.0% per step
+        price += price * step_tenths_pct / 1000;
+        if price < 1 {
+            price = 1;
+        }
+        let qty = 2 + (rng_state % 12);
+        tape.record(t, price as u64, qty);
+        count += 1;
+        t += STEP_SECS;
+    }
+
+    Ok(Json(SeedHistoryResponse { market_id: payload.market_id, trades_seeded: count }))
 }
 
 async fn ws_orderbook(
@@ -1795,6 +1888,65 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    async fn post_raw_json(
+        app: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn debug_seed_history_is_disabled_by_default() {
+        let state = Arc::new(AppState::new());
+        let app = router(state);
+        let (status, _) = post_raw_json(
+            app,
+            "/debug/seed-history",
+            serde_json::json!({"market_id": "EURC/USDC", "start_tick": 108500, "days": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn debug_seed_history_backfills_real_candle_visible_history_when_enabled() {
+        let mut state = AppState::new();
+        state.configure_debug_seed(true);
+        let state = Arc::new(state);
+        let app = router(state.clone());
+
+        let (status, body) = post_raw_json(
+            app,
+            "/debug/seed-history",
+            serde_json::json!({"market_id": "EURC/USDC", "start_tick": 108500, "days": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seeded = body["trades_seeded"].as_u64().unwrap();
+        assert!(seeded > 800, "3 days at 5-minute steps should be ~864 records, got {seeded}");
+
+        let candles = {
+            let market_data = state.market_data.lock().unwrap();
+            market_data.get("EURC/USDC").unwrap().candles(3600, 100)
+        };
+        assert!(
+            candles.len() > 20,
+            "3 days of history should span well more than 20 hourly bars, got {}",
+            candles.len()
+        );
     }
 
     #[tokio::test]

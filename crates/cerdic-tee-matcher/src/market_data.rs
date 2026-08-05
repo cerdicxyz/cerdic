@@ -9,7 +9,16 @@
 
 use std::collections::VecDeque;
 
-const WINDOW_SECONDS: u64 = 24 * 60 * 60;
+/// Widened from a strict 24h to 3 days so longer-timeframe candles (4h,
+/// 1d) have enough real retained history to draw more than one or two
+/// bars — a real, deliberate tradeoff: `MarketSnapshot.change_24h_bps`/
+/// `volume_24h` (named for the original 24h window) now technically
+/// compare against whatever's oldest in this WIDER buffer, which only
+/// diverges from a literal calendar-24h figure once trades that old are
+/// actually still retained. Worth a follow-up rename if that field name
+/// starts reading as misleading in practice; not renamed here since
+/// nothing downstream currently depends on the literal 24h meaning.
+const WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy)]
 struct TradeRecord {
