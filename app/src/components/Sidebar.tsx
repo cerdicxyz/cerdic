@@ -35,15 +35,6 @@ export function Sidebar({
       aria-label="Primary"
       className="flex w-14 flex-shrink-0 flex-col items-center gap-[var(--space-6)] border-r border-border-subtle py-[var(--space-4)]"
     >
-      {/* Same real logo mark as Header.tsx (app/public/logos/), not a
-          unicode glyph or a plain "c" monogram — this used to be two
-          different, unrelated marks between Header and Sidebar. */}
-      <img
-        src="/logos/android-chrome-512x512.png"
-        alt="Cerdic"
-        title="Cerdic"
-        className="h-11 w-11 flex-shrink-0"
-      />
       <div className="flex flex-col gap-[var(--space-2)]">
         <Link
           to="/trade"

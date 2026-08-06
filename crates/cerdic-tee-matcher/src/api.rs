@@ -664,6 +664,14 @@ impl AppState {
         for (market_id, contract) in &self.settlement_contracts {
             let market_hash = keccak256(market_id.as_bytes());
 
+            // The stored index only advances when something checkpoints it
+            // on-chain (see checkpoint_funding_index's own doc) — without
+            // this, load_funding_index below would keep reading the same
+            // frozen value every cycle whenever no trade/position event
+            // happens to trigger one incidentally.
+            crate::settle::checkpoint_funding_index(&self.settlement_signer, market_hash, Some(*contract))
+                .await;
+
             if let Ok(index) = crate::settle::load_funding_index(market_hash, Some(*contract)).await {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

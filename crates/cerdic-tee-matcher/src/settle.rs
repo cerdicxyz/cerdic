@@ -98,6 +98,8 @@ sol! {
 
         function fundingIndex(bytes32 marketId) external view returns (int256);
 
+        function updateFundingIndex(bytes32 marketId) external;
+
         event SealedPositionTouched(bytes32 indexed portfolioKey, bytes32 indexed marketId);
     }
 }
@@ -506,6 +508,32 @@ pub async fn load_funding_index(
     let decoded = ISettlementEngine::fundingIndexCall::abi_decode_returns(&raw, true)
         .map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
     i128::try_from(decoded._0).map_err(|_| LoadSealedError::Rpc("fundingIndex overflowed i128".into()))
+}
+
+/// Checkpoints this market's on-chain `fundingIndex`. The stored value
+/// only advances when something calls `updateFundingIndex` (or a
+/// lifecycle hook like open/close/settle does it implicitly, see
+/// `FxPerpMarket.sol`'s `_updateFundingIndexInternal` doc) — without a
+/// real trade or position event to trigger one of those, the storage
+/// slot `load_funding_index` reads sits frozen even while
+/// `rateDifferentialBps` is genuinely nonzero, which is why
+/// `poll_funding_and_oi` calls this before every sample instead of
+/// relying on incidental settlement traffic to keep it live. A no-op
+/// (not an error) when broadcasting isn't configured, same posture as
+/// `settle_match`.
+pub async fn checkpoint_funding_index(
+    signer: &SettlementSigner,
+    market_id: FixedBytes<32>,
+    contract: Option<Address>,
+) {
+    let Some((rpc_url, contract)) = broadcast_config(contract) else {
+        return;
+    };
+    let call = ISettlementEngine::updateFundingIndexCall { marketId: market_id };
+    let calldata = Bytes::from(call.abi_encode());
+    if let Err(e) = broadcast(signer, &rpc_url, contract, calldata).await {
+        tracing::warn!(error = %e, "funding index checkpoint failed");
+    }
 }
 
 /// Discovers every `portfolioKey` this market's contract has ever

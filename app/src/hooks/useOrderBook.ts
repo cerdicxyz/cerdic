@@ -77,6 +77,18 @@ function toLevels(levels: WirePriceLevel[]): OrderBookLevel[] {
 
 const RECONNECT_DELAY_MS = 2000;
 
+// Module-level, not per-hook-instance: `MarketSearchModal`'s rows only
+// subscribe while the modal is open (see that file's own doc on why —
+// deliberately not 9 permanent background connections), so every reopen
+// used to remount `useOrderBook` from scratch and flash "—" across every
+// row until each fresh socket's first message arrived, even for markets
+// already seen once this session. This cache survives that unmount and
+// lets a new mount start from the last-known real snapshot instead of
+// `EMPTY_BOOK` — a fresh subscription still connects and will overwrite
+// it moments later, this only removes the pointless blank flash in
+// between, not the "always up to date" guarantee.
+const bookCache = new Map<string, LiveOrderBook>();
+
 /**
  * Live order book for `marketId`, streamed over the matcher's real
  * `/ws/orderbook/:marketId` WebSocket: an immediate full snapshot on
@@ -87,10 +99,10 @@ const RECONNECT_DELAY_MS = 2000;
  * distinguish "book is genuinely empty" from "we're not connected").
  */
 export function useOrderBook(marketId: string): LiveOrderBook {
-  const [book, setBook] = useState<LiveOrderBook>(EMPTY_BOOK);
+  const [book, setBook] = useState<LiveOrderBook>(() => bookCache.get(marketId) ?? EMPTY_BOOK);
 
   useEffect(() => {
-    setBook(EMPTY_BOOK);
+    setBook(bookCache.get(marketId) ?? EMPTY_BOOK);
     let socket: WebSocket | null = null;
     let reconnectTimer: number | undefined;
     let cancelled = false;
@@ -102,7 +114,7 @@ export function useOrderBook(marketId: string): LiveOrderBook {
       socket.onmessage = (event) => {
         try {
           const data: WireOrderBookResponse = JSON.parse(event.data);
-          setBook({
+          const next: LiveOrderBook = {
             bids: toLevels(data.bids),
             asks: toLevels(data.asks),
             bestBid: data.best_bid,
@@ -113,7 +125,9 @@ export function useOrderBook(marketId: string): LiveOrderBook {
             high24h: data.high_24h,
             low24h: data.low_24h,
             connected: true,
-          });
+          };
+          bookCache.set(marketId, next);
+          setBook(next);
         } catch {
           // One malformed frame doesn't take the whole feed down — same
           // "fail this message, not the connection" posture as the rest

@@ -29,7 +29,7 @@ export function Header() {
   const location = useLocation();
 
   return (
-    <header className="flex h-24 flex-shrink-0 items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
+    <header className="grid h-16 flex-shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
       <a
         href="/"
         className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline"
@@ -38,14 +38,14 @@ export function Header() {
           src="/logos/android-chrome-512x512.png"
           alt=""
           aria-hidden="true"
-          className="h-20 w-20 flex-shrink-0"
+          className="h-11 w-11 flex-shrink-0"
         />
         <span>Cerdic</span>
       </a>
 
       <nav
         aria-label="Site"
-        className="mx-auto flex items-center gap-[var(--space-7)]"
+        className="flex items-center justify-self-center gap-[var(--space-5)]"
       >
         {NAV_ITEMS.map((item) => {
           const active =
@@ -74,7 +74,7 @@ export function Header() {
         })}
       </nav>
 
-      <div className="flex items-center gap-[var(--space-4)]">
+      <div className="flex items-center justify-self-end gap-[var(--space-4)]">
         <button
           type="button"
           aria-label="Copy referral link"

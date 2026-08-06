@@ -326,5 +326,32 @@ export function PriceChart({
     }
   }, [candles, marketId]);
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  // Not just `loading`: a resolved fetch that came back with zero candles
+  // (a market with no trade history yet, e.g. right after a matcher
+  // restart wipes the in-memory TradeTape) flips `loading` false but
+  // still has nothing to plot — the skeleton belongs on screen for that
+  // case too, not just the in-flight window.
+  // Not just a fetch-in-flight check: a resolved fetch that came back
+  // with zero candles (a market with no trade history yet, e.g. right
+  // after a matcher restart wipes the in-memory TradeTape) still has
+  // nothing to plot — the skeleton belongs on screen for that case too.
+  const showSkeleton = candles.length === 0;
+
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {showSkeleton && (
+        <div className="absolute inset-0 z-10 overflow-hidden bg-[#0a0a0c]">
+          <video
+            src="/loading.mov"
+            autoPlay
+            loop
+            muted
+            playsInline
+            className="absolute inset-0 h-full w-full object-contain [filter:brightness(0.45)_contrast(3.2)]"
+          />
+        </div>
+      )}
+    </div>
+  );
 }

@@ -1,6 +1,6 @@
-import { useMemo, useEffect, useRef } from 'react';
+import { useMemo, useEffect, useRef, useState } from 'react';
 import { useOrderBook } from '../hooks/useOrderBook';
-import { formatMarketPrice } from '../lib/priceScale';
+import { formatMarketPrice, tickToPrice } from '../lib/priceScale';
 
 // Depth-heatmap order book, rendered on a single canvas — matching how
 // tapesurf.com/app actually builds theirs (confirmed directly from the
@@ -118,6 +118,10 @@ const COLORS = {
   border: 'rgba(255, 255, 255, 0.08)',
   spreadFill: 'rgba(255, 255, 255, 0.03)',
   hoverFill: 'rgba(255, 255, 255, 0.06)',
+  // Fainter than hoverFill — marks every row between the spread and the
+  // hovered row (the "you'd sweep through this much" range real order
+  // books highlight), distinct from the hovered row's own stronger fill.
+  sweepFill: 'rgba(255, 255, 255, 0.025)',
   markerLine: '#2ee6d6',
 };
 
@@ -190,6 +194,25 @@ interface HoverState {
   index: number;
 }
 
+/** What the floating hover card (a real DOM element, not canvas text —
+ *  easier to give it a proper card look: border, shadow, rounded corners)
+ *  needs to render. `x`/`y` are container-relative, already clamped so
+ *  the card can't render past the panel edge. */
+interface HoverCardState {
+  x: number;
+  y: number;
+  side: 'ask' | 'bid';
+  price: number;
+  size: number;
+  cumulative: number;
+}
+
+// Just a clamp-math estimate now — the card itself is auto-width (single
+// line, no fixed style width), this only keeps it from overflowing the
+// right edge of the panel.
+const HOVER_CARD_WIDTH = 155;
+const HOVER_CARD_OFFSET = 14;
+
 // `formatMarketPrice` (priceScale.ts) un-scales a raw tick into a real
 // price and formats it at this market's own resolution — replaces an
 // earlier magnitude-based adaptive formatter that applied fake decimal
@@ -199,6 +222,17 @@ interface HoverState {
 
 function formatSize(size: number) {
   return size >= 1000 ? `${(size / 1000).toFixed(2)}K` : size.toFixed(1);
+}
+
+/** Notional value of a cumulative size at a given real price — what the
+ *  hover readout calls out ("Σ size · ≈ $notional"), rounded to whole
+ *  units since this is a rough sweep estimate, not a precise fill quote
+ *  (real fill price would walk the ladder, not sit at one level). */
+function formatNotional(cumulativeSize: number, price: number) {
+  const notional = cumulativeSize * price;
+  if (notional >= 1_000_000) return `${(notional / 1_000_000).toFixed(2)}M`;
+  if (notional >= 1_000) return `${(notional / 1_000).toFixed(1)}K`;
+  return notional.toFixed(0);
 }
 
 /** Every GROUP_INTERVAL-th row from the spread, by position, not by price
@@ -217,6 +251,11 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
   const previousLevelsRef = useRef<{ asks: Level[]; bids: Level[] }>({ asks: [], bids: [] });
   const askFlashRef = useRef<Map<number, number>>(new Map());
   const bidFlashRef = useRef<Map<number, number>>(new Map());
+  // Real React state, unlike `hover` (a plain variable inside the canvas
+  // effect below) — this one drives an actual DOM element, so it has to
+  // go through a render, not just get read back during the next canvas
+  // draw() call.
+  const [hoverCard, setHoverCard] = useState<HoverCardState | null>(null);
 
   // Asks: farthest-from-mid first (top row) down to nearest-mid last row
   // (right above the spread) — the backend's own array is nearest-first
@@ -278,8 +317,18 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       remainingBeyondEdge: number,
       remainingPct: number,
       flashAlphaFor: (price: number) => number,
+      isAskSide: boolean,
     ) {
       if (!ctx || levels.length === 0) return;
+
+      // The range of rows between the spread and the hovered row, i.e.
+      // "how much you'd sweep through to fill at the hovered level" —
+      // asks are drawn farthest-first (spread-adjacent = last index), bids
+      // nearest-first (spread-adjacent = index 0), so which end anchors
+      // the sweep differs by side. `null` when nothing's hovered on this
+      // side at all.
+      const sweepRange: [number, number] | null =
+        hoverIndex === null ? null : isAskSide ? [hoverIndex, levels.length - 1] : [0, hoverIndex];
 
       // Base wash: a faint, flat ask-red / bid-green tint, bounded by
       // each row's own cumulative reach (same edge the curve and haze
@@ -354,6 +403,9 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
 
         if (hoverIndex === i) {
           ctx.fillStyle = COLORS.hoverFill;
+          ctx.fillRect(0, y, width, ROW_HEIGHT);
+        } else if (sweepRange && i >= sweepRange[0] && i <= sweepRange[1]) {
+          ctx.fillStyle = COLORS.sweepFill;
           ctx.fillRect(0, y, width, ROW_HEIGHT);
         }
 
@@ -509,6 +561,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         askRemaining,
         (askRemaining / askTotal) * 100,
         flashAlphaFor(askFlashRef.current),
+        true,
       );
 
       drawSide(
@@ -526,6 +579,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         bidRemaining,
         (bidRemaining / bidTotal) * 100,
         flashAlphaFor(bidFlashRef.current),
+        false,
       );
 
       // Last-price marker: a single thin cyan line at the ask/bid
@@ -593,17 +647,40 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     function handleMove(event: MouseEvent) {
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
-      const next = hoverAt(event.clientY - rect.top);
+      const localX = event.clientX - rect.left;
+      const localY = event.clientY - rect.top;
+      const next = hoverAt(localY);
       const changed = next?.side !== hover?.side || next?.index !== hover?.index;
       hover = next;
       canvas.style.cursor = next ? 'pointer' : 'default';
       if (changed) draw(displayed.asks, displayed.bids);
+
+      if (!next) {
+        setHoverCard(null);
+        return;
+      }
+      const level = (next.side === 'ask' ? displayed.asks : displayed.bids)[next.index];
+      if (!level) {
+        setHoverCard(null);
+        return;
+      }
+      // Clamp so the card renders fully inside the panel regardless of
+      // which edge the cursor is near, rather than letting it overflow.
+      // Vertically it now only needs to clear roughly one row (the card
+      // is a single line, ~ROW_HEIGHT tall) instead of the ~70px three-
+      // line version, which used to sit on top of the neighboring rows
+      // it was meant to be annotating.
+      const x = Math.min(Math.max(localX + HOVER_CARD_OFFSET, 0), rect.width - HOVER_CARD_WIDTH);
+      const y = Math.min(Math.max(localY - ROW_HEIGHT / 2, 0), rect.height - ROW_HEIGHT);
+      setHoverCard({ x, y, side: next.side, price: level.price, size: level.size, cumulative: level.cumulative });
     }
 
     function handleLeave() {
-      if (!hover) return;
-      hover = null;
-      draw(displayed.asks, displayed.bids);
+      if (hover) {
+        hover = null;
+        draw(displayed.asks, displayed.bids);
+      }
+      setHoverCard(null);
     }
 
     // Transition from whatever was last actually drawn to this effect's
@@ -675,6 +752,14 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     };
   }, [asks, bids, midPrice, change24hPct, marketId]);
 
+  // Separate from the canvas effect above deliberately: that one re-runs
+  // on every snapshot (asks/bids change), and clearing the hover card
+  // there would flicker it away on every live update while the cursor
+  // sits still. Only a genuine market switch should drop it.
+  useEffect(() => {
+    setHoverCard(null);
+  }, [marketId]);
+
   // Same skeleton for "not connected yet" and "connected but genuinely
   // empty" — a reconnect blip with stale data already on screen
   // (liveBook.connected can flip false while `asks`/`bids` still hold
@@ -687,6 +772,36 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     <div ref={containerRef} className="relative h-full w-full">
       <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
       {showSkeleton && <OrderBookSkeleton />}
+      {hoverCard && <OrderBookHoverCard state={hoverCard} marketId={marketId} />}
+    </div>
+  );
+}
+
+/** Floating card that follows the cursor while hovering a row — a real
+ *  DOM element (border, shadow, rounded corners) rather than more canvas
+ *  text. Shows price, this row's own size, and the swept notional in $
+ *  through this level — deliberately NOT the cumulative size on its own,
+ *  since that's already communicated by the sweep highlight's
+ *  color/extent in the canvas draw loop above (repeating it here would
+ *  be a second copy of the same signal). The $ total is genuinely new
+ *  information neither the heat color nor the size column carries on
+ *  their own. One line keeps the card short enough to clear the
+ *  neighboring rows it sits near instead of covering them.
+ *  `pointer-events-none` since this must never itself become the hover
+ *  target — the canvas underneath still owns mousemove. */
+function OrderBookHoverCard({ state, marketId }: { state: HoverCardState; marketId: string }) {
+  const tone = state.side === 'ask' ? 'text-short' : 'text-long';
+  return (
+    <div
+      aria-hidden="true"
+      className="pointer-events-none absolute z-10 flex items-center gap-2 whitespace-nowrap rounded-md border border-white/10 bg-black/40 px-2 py-1 text-[10px] shadow-lg backdrop-blur-md"
+      style={{ left: state.x, top: state.y }}
+    >
+      <span className={`font-semibold ${tone}`}>{formatMarketPrice(state.price, marketId)}</span>
+      <span className="text-text-tertiary">·</span>
+      <span className="text-text-primary">{formatSize(state.size)}</span>
+      <span className="text-text-tertiary">·</span>
+      <span className="text-text-primary">${formatNotional(state.cumulative, tickToPrice(state.price, marketId))}</span>
     </div>
   );
 }
