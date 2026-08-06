@@ -1,8 +1,37 @@
+import { useEffect, useState } from 'react';
 import { useFunding } from '../hooks/useFunding';
 import { useOpenInterest } from '../hooks/useOpenInterest';
 import { useOrderBook } from '../hooks/useOrderBook';
 import { formatMarketPrice } from '../lib/priceScale';
 import type { Market } from './MarketDropdown';
+
+// Minutes:seconds until the top of the next hour — not a fabricated
+// number: the matcher's own funding rate is already framed as
+// `rate_1h_bps` (an hourly figure, api.rs's FundingResponse), so showing
+// when the current hour rolls over is real information about that same
+// figure, not an invented settlement event. Genuinely different from a
+// real venue's discrete funding payment (this market keeps accruing
+// continuously straight through this boundary, see `poll_funding_native`'s
+// own doc) — the hint text below says so.
+function useMinutesUntilNextHour(): string {
+  const [label, setLabel] = useState('');
+  useEffect(() => {
+    function tick() {
+      const now = new Date();
+      const msUntilNextHour =
+        new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1, 0, 0, 0).getTime() -
+        now.getTime();
+      const totalSeconds = Math.floor(msUntilNextHour / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      setLabel(`${minutes}m ${seconds.toString().padStart(2, '0')}s`);
+    }
+    tick();
+    const interval = window.setInterval(tick, 1000);
+    return () => window.clearInterval(interval);
+  }, []);
+  return label;
+}
 
 // Expanded market statistics as a card grid — big value under a small
 // label, divided into cells, not a dense row list (style borrowed from a
@@ -47,6 +76,7 @@ export function StatsPanel({ market }: { market: Market }) {
   const book = useOrderBook(market.id);
   const funding = useFunding(market.id);
   const oi = useOpenInterest(market.id);
+  const minutesUntilNextHour = useMinutesUntilNextHour();
 
   const spread = book.bestBid !== null && book.bestAsk !== null ? book.bestAsk - book.bestBid : null;
   const change24hPct = book.change24hBps !== null ? book.change24hBps / 100 : null;
@@ -73,8 +103,8 @@ export function StatsPanel({ market }: { market: Market }) {
     { label: 'Funding (1h)', value: funding.rate1hBps !== null ? `${(funding.rate1hBps / 100).toFixed(4)}%` : '—' },
     {
       label: 'Next Funding',
-      value: '—',
-      hint: 'This market accrues funding continuously by rate differential, not on a discrete schedule, so there is no fixed "next" timestamp to show.',
+      value: funding.rate1hBps !== null ? minutesUntilNextHour : '—',
+      hint: 'This market accrues funding continuously, not as a discrete payment — this is time until the current hour rolls over, matching the "1h" rate above, not a settlement event.',
     },
     { label: 'Margin Mode', value: 'Portfolio' },
     { label: 'Initial Margin', value: `${(imrBps / 100).toFixed(2)}%`, hint: `SettlementEngine.LEVERAGE_CEILING for ${market.id}` },

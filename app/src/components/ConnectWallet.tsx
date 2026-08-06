@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { useWallet } from '../wallet/wallet-context';
+import { useWalletBalances } from '../hooks/useWalletBalances';
+import { activeChain } from '../wallet/privy';
 import { LoginModal } from './LoginModal';
+import { toast } from '../toast/toast-context';
+
+const METHOD_LABEL: Record<string, string> = {
+  email: 'Email',
+  google: 'Google',
+  wallet: 'External wallet',
+  passkey: 'Passkey',
+};
 
 // The Connect button itself: disconnected opens LoginModal.tsx (email/
 // OTP, Google, wallet, or passkey — all through Privy, see that file's
@@ -17,6 +27,7 @@ export function ConnectWallet({
   variant?: 'header' | 'panel';
 }) {
   const wallet = useWallet();
+  const balances = useWalletBalances(wallet.status === 'connected' ? wallet.address : undefined);
   const [loginOpen, setLoginOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -74,22 +85,54 @@ export function ConnectWallet({
 
       {menuOpen && wallet.status === 'connected' && (
         <div
-          className="absolute right-0 top-[calc(100%+var(--space-3))] z-50 w-56 rounded-md border border-border-subtle bg-surface-overlay p-[var(--space-4)]"
+          className="absolute right-0 top-[calc(100%+var(--space-3))] z-50 w-64 rounded-md border border-border-subtle bg-surface-overlay p-[var(--space-4)]"
           style={{
             boxShadow:
               'rgba(255,255,255,0.08) 0 0.4px 0 0 inset, rgb(0,0,0) 0 0 0 0.5px',
           }}
         >
-          <p className="mt-(--space-1) break-all text-xs text-text-primary">
-            {wallet.address}
-          </p>
+          <div className="flex items-center justify-between gap-[var(--space-2)]">
+            <p className="break-all text-xs text-text-primary">{wallet.address}</p>
+            <button
+              type="button"
+              aria-label="Copy address"
+              onClick={() => {
+                navigator.clipboard.writeText(wallet.address ?? '');
+                toast.success('Copied', wallet.address);
+              }}
+              className="shrink-0 text-text-quaternary transition-colors duration-150 hover:text-text-primary"
+            >
+              ⧉
+            </button>
+          </div>
+
+          <div className="mt-[var(--space-2)] flex items-center gap-[var(--space-2)] text-[10px] text-text-quaternary">
+            {wallet.method && (
+              <span className="rounded-sm bg-surface-hover px-[var(--space-2)] py-px">
+                {METHOD_LABEL[wallet.method] ?? wallet.method}
+              </span>
+            )}
+            <span className="rounded-sm bg-surface-hover px-[var(--space-2)] py-px">{activeChain.name}</span>
+          </div>
+
+          <div className="mt-[var(--space-3)] flex flex-col gap-[var(--space-1)] border-t border-border-subtle pt-[var(--space-3)]">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-text-tertiary">ETH</span>
+              <span className="tabular-nums text-text-primary">{balances.eth ?? '—'}</span>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-text-tertiary">USDC</span>
+              <span className="tabular-nums text-text-primary">{balances.usdc ?? '—'}</span>
+            </div>
+          </div>
+
           <button
             type="button"
             onClick={() => {
               wallet.disconnect();
               setMenuOpen(false);
             }}
-            className="mt-(--space-3) w-full rounded-sm border border-border-subtle px-[var(--space-3)] py-(--space-2) text-xs font-medium text-text-secondary transition-colors duration-150 hover:bg-surface-hover"
+            className="mt-[var(--space-3)] w-full rounded-sm border border-border-subtle px-[var(--space-3)] py-[var(--space-2)] text-xs font-medium text-text-secondary transition-colors duration-150 hover:bg-surface-hover"
           >
             Disconnect
           </button>

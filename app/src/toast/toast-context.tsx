@@ -19,6 +19,12 @@ export interface Toast {
   description?: ReactNode;
   progress?: number;
   action?: ToastAction;
+  /// Set on a terminal (non-progress) toast that's still waiting on
+  /// something in the background with no `action` yet to show for it (e.g.
+  /// a settlement tx hash that hasn't confirmed) — renders a pulsing
+  /// "Fetching…" label in place of the action button until either `action`
+  /// arrives (a later `toast.update`) or this is cleared.
+  loadingAction?: boolean;
   duration?: number | null;
 }
 

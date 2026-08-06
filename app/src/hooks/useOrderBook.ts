@@ -97,19 +97,28 @@ const bookCache = new Map<string, LiveOrderBook>();
  * own doc). Reconnects on drop with a fixed delay; `connected` reflects
  * live socket state, not just "have we ever received data" (so a UI can
  * distinguish "book is genuinely empty" from "we're not connected").
+ *
+ * `group` (raw tick-bucket size, default 1 = ungrouped) is sent as a
+ * `?group=` query param on the WS upgrade — the matcher applies it
+ * server-side per connection (see api.rs's `stream_orderbook` doc), so
+ * changing it here reconnects with a new bucket size rather than
+ * re-bucketing an already-thinned client-side array (which would lose
+ * whatever levels the server-side `levels` cap already dropped).
  */
-export function useOrderBook(marketId: string): LiveOrderBook {
-  const [book, setBook] = useState<LiveOrderBook>(() => bookCache.get(marketId) ?? EMPTY_BOOK);
+export function useOrderBook(marketId: string, group: number = 1): LiveOrderBook {
+  const cacheKey = `${marketId}:${group}`;
+  const [book, setBook] = useState<LiveOrderBook>(() => bookCache.get(cacheKey) ?? EMPTY_BOOK);
 
   useEffect(() => {
-    setBook(bookCache.get(marketId) ?? EMPTY_BOOK);
+    setBook(bookCache.get(cacheKey) ?? EMPTY_BOOK);
     let socket: WebSocket | null = null;
     let reconnectTimer: number | undefined;
     let cancelled = false;
 
     function connect() {
       if (cancelled) return;
-      socket = new WebSocket(`${matcherWsUrl}/ws/orderbook/${encodeURIComponent(marketId)}`);
+      const groupParam = group > 1 ? `?group=${group}` : '';
+      socket = new WebSocket(`${matcherWsUrl}/ws/orderbook/${encodeURIComponent(marketId)}${groupParam}`);
 
       socket.onmessage = (event) => {
         try {
@@ -126,7 +135,7 @@ export function useOrderBook(marketId: string): LiveOrderBook {
             low24h: data.low_24h,
             connected: true,
           };
-          bookCache.set(marketId, next);
+          bookCache.set(cacheKey, next);
           setBook(next);
         } catch {
           // One malformed frame doesn't take the whole feed down — same
@@ -153,7 +162,7 @@ export function useOrderBook(marketId: string): LiveOrderBook {
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [marketId]);
+  }, [marketId, group, cacheKey]);
 
   return book;
 }

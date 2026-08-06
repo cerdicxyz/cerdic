@@ -1,6 +1,12 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
 import { useOrderBook } from '../hooks/useOrderBook';
-import { formatMarketPrice, tickToPrice } from '../lib/priceScale';
+import {
+  formatMarketPrice,
+  tickToPrice,
+  groupingOptionsForMarket,
+  decimalsForGroupingOption,
+  groupTicksForOption,
+} from '../lib/priceScale';
 
 // Depth-heatmap order book, rendered on a single canvas — matching how
 // tapesurf.com/app actually builds theirs (confirmed directly from the
@@ -244,7 +250,31 @@ function isMajorLevel(index: number) {
 export function OrderBookDepth({ marketId }: { marketId: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const liveBook = useOrderBook(marketId);
+
+  // Price-grouping selector (real venue convention: coarser buckets
+  // merge nearby resting levels into fewer, bigger rows — see
+  // priceScale.ts's own doc on why the options differ by market). Index
+  // into this market's own options list, not the raw tick bucket size
+  // directly, so switching markets can reset to a sane default without
+  // needing to know the new market's scale up front.
+  //
+  // Defaults to the MIDDLE option, not the finest (index 0): the finest
+  // bucket is one raw tick, which on a real live book packs dozens of
+  // rows into single-unit price gaps — technically correct but far too
+  // dense to read at a glance. A real venue's own default grouping is
+  // never its tightest either, for the same reason.
+  const groupOptions = useMemo(() => groupingOptionsForMarket(marketId), [marketId]);
+  const defaultGroupIndex = Math.floor((groupOptions.length - 1) / 2);
+  const [groupIndex, setGroupIndex] = useState(defaultGroupIndex);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  useEffect(() => {
+    setGroupIndex(Math.floor((groupingOptionsForMarket(marketId).length - 1) / 2));
+    setGroupMenuOpen(false);
+  }, [marketId]);
+  const groupOption = groupOptions[groupIndex] ?? groupOptions[0];
+  const groupTicks = groupTicksForOption(groupOption, marketId);
+
+  const liveBook = useOrderBook(marketId, groupTicks);
   // Persist across effect re-runs (one per snapshot), not per-render
   // state: the last actually-drawn snapshot (transition start point) and
   // per-price flash timestamps, see the TRANSITION_MS/FLASH_MS doc above.
@@ -773,6 +803,69 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
       <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
       {showSkeleton && <OrderBookSkeleton />}
       {hoverCard && <OrderBookHoverCard state={hoverCard} marketId={marketId} />}
+      <GroupingSelector
+        options={groupOptions}
+        selectedIndex={groupIndex}
+        open={groupMenuOpen}
+        onToggle={() => setGroupMenuOpen((v) => !v)}
+        onSelect={(i) => {
+          setGroupIndex(i);
+          setGroupMenuOpen(false);
+        }}
+      />
+    </div>
+  );
+}
+
+/** Price-grouping control, floated over the canvas's top-right corner —
+ *  same placement/shape real venues use (a small "1 ⌄" trigger that
+ *  opens a list of coarser buckets). Picking a wider bucket doesn't
+ *  re-render the existing rows into fewer buckets client-side; it asks
+ *  the matcher for a differently-bucketed book (see useOrderBook.ts's
+ *  own doc on why), so the row count/labels genuinely come from the
+ *  server for whatever bucket is selected. */
+function GroupingSelector({
+  options,
+  selectedIndex,
+  open,
+  onToggle,
+  onSelect,
+}: {
+  options: number[];
+  selectedIndex: number;
+  open: boolean;
+  onToggle: () => void;
+  onSelect: (index: number) => void;
+}) {
+  const selected = options[selectedIndex] ?? options[0];
+  return (
+    <div className="absolute right-2 top-2 z-20">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex items-center gap-1 rounded-sm border border-border-subtle bg-surface-overlay px-2 py-1 text-[11px] text-text-secondary transition-colors duration-150 hover:text-text-primary"
+      >
+        {selected.toFixed(decimalsForGroupingOption(selected))}
+        <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+          <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 min-w-[64px] rounded-md border border-border-subtle bg-surface-overlay py-1 shadow-lg">
+          {options.map((option, index) => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => onSelect(index)}
+              className={`block w-full px-3 py-1 text-right text-[11px] transition-colors duration-150 hover:bg-surface-hover ${
+                index === selectedIndex ? 'text-text-primary' : 'text-text-secondary'
+              }`}
+            >
+              {option.toFixed(decimalsForGroupingOption(option))}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

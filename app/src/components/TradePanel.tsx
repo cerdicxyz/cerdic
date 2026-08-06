@@ -3,9 +3,10 @@ import { LeverageSlider } from './LeverageSlider';
 import { ConnectWallet } from './ConnectWallet';
 import { useWallet } from '../wallet/wallet-context';
 import { useOrderBook } from '../hooks/useOrderBook';
-import { useSubmitOrder, type OrderResult } from '../hooks/useSubmitOrder';
+import { useSubmitOrder, type SubmitOrderStage } from '../hooks/useSubmitOrder';
 import type { Market } from './MarketDropdown';
-import { formatMarketPrice } from '../lib/priceScale';
+import { formatMarketPrice, tickToPrice } from '../lib/priceScale';
+import { toast } from '../toast/toast-context';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -57,7 +58,7 @@ function sanitizeDecimal(value: string): string {
 export function TradePanel({ market }: { market: Market }) {
   const wallet = useWallet();
   const book = useOrderBook(market.id);
-  const { submitOrder } = useSubmitOrder(wallet.address);
+  const { submitOrder, pollSettlementStatus } = useSubmitOrder(wallet.address);
   const [side, setSide] = useState<Side>('long');
   const [orderType, setOrderType] = useState<OrderType>('market');
   const [leverageOpen, setLeverageOpen] = useState(false);
@@ -84,16 +85,6 @@ export function TradePanel({ market }: { market: Market }) {
     setLeverage((current) => Math.min(current, maxLeverage));
   }, [maxLeverage]);
 
-  // Derived from the trader's own Price/Amount, mirroring
-  // SettlementEngine.requiredMargin's formula shape — real arithmetic,
-  // not a placeholder, only ever computed from what's typed in.
-  const marginRequirement = useMemo(() => {
-    const qty = parseNum(amount);
-    const tick = parseNum(price);
-    if (qty === null || tick === null) return null;
-    return (qty * tick * imrBps) / 10_000;
-  }, [amount, price, imrBps]);
-
   const showPrice = orderType === 'limit' || orderType === 'offer';
 
   // A market order still needs an explicit tick — this matcher has no
@@ -106,33 +97,139 @@ export function TradePanel({ market }: { market: Market }) {
   // than guessing one.
   const marketTick = side === 'long' ? book.bestAsk : book.bestBid;
 
+  // Derived from the trader's own Amount and the EFFECTIVE price,
+  // mirroring SettlementEngine.requiredMargin's formula shape — real
+  // arithmetic, not a placeholder. Was reading the limit-price input
+  // directly, which is empty for a Market order (the default order
+  // type — `showPrice` is false, so that field isn't even shown), so
+  // this silently computed null and showed $0.00 for every market
+  // order regardless of amount. `marketTick` (the live opposite-side
+  // book price, same source `handleSubmit`'s own `tick` already uses)
+  // is the real effective price for anything that isn't a limit order.
+  const marginRequirement = useMemo(() => {
+    const qty = parseNum(amount);
+    const tick = orderType === 'limit' ? parseNum(price) : marketTick;
+    if (qty === null || tick === null) return null;
+    // Two real bugs this replaced: (1) `tick` is the matcher's raw,
+    // unscaled book unit (e.g. an EURC/USDC tick of 115000 means
+    // $1.15000 — priceScale.ts's own price_scale, not a dollar figure on
+    // its own), so multiplying it directly inflated every result by that
+    // market's scale factor (777 units @ 45x showed $1.79M, not the real
+    // ~$895 this notional actually requires). (2) `imrBps` is this
+    // MARKET's ceiling (`SettlementEngine.LEVERAGE_CEILING`, e.g. 50x for
+    // EURC), not the leverage the slider above actually has selected —
+    // dividing by the trader's own chosen `leverage` is what a "Margin
+    // Req." figure that responds to the slider actually requires.
+    return (qty * tickToPrice(tick, market.id)) / leverage;
+  }, [amount, price, orderType, marketTick, leverage, market.id]);
+
+  // One progress toast driven through the submission's real stages
+  // (sign -> encrypt -> submit -> settled), matching cer-perp's own
+  // trading-panel.tsx pattern: `toast.progress` once up front, then
+  // `toast.update`d in place as each stage actually completes, ending in
+  // ONE terminal success/error update — not a fresh toast fired only
+  // after everything's already done.
+  const STAGE_COPY: Record<SubmitOrderStage, { progress: number; description: string }> = {
+    signing: { progress: 20, description: 'Sign order…' },
+    encrypting: { progress: 50, description: 'Encrypting order…' },
+    submitting: { progress: 80, description: 'Submitting to matcher…' },
+  };
+
   async function handleSubmit() {
     if (orderType === 'offer') return; // POST /offer isn't wired here yet, a real stated gap
     const qty = Math.round(parseNum(amount) ?? NaN);
     const tick = orderType === 'limit' ? Math.round(parseNum(price) ?? NaN) : marketTick;
     if (!Number.isFinite(qty) || qty <= 0 || tick === null || !Number.isFinite(tick) || tick <= 0) return;
 
+    const actionLabel = side === 'long' ? 'Buy' : 'Sell';
     setSubmitting(true);
     setSubmitStatus(null);
+    const progressId = toast.progress(`${actionLabel} ${market.label}`, 5, 'Preparing order…');
+
     try {
-      const result: OrderResult = await submitOrder({
-        marketId: market.id,
-        side: side === 'long' ? 'Buy' : 'Sell',
-        tick,
-        qty,
-        tif: orderType === 'market' ? 'ImmediateOrCancel' : 'GoodTilCancel',
-        postOnly: false,
-        leverage,
-      });
+      const { result, nonce } = await submitOrder(
+        {
+          marketId: market.id,
+          side: side === 'long' ? 'Buy' : 'Sell',
+          tick,
+          qty,
+          tif: orderType === 'market' ? 'ImmediateOrCancel' : 'GoodTilCancel',
+          postOnly: false,
+          leverage,
+        },
+        (stage) => toast.update(progressId, STAGE_COPY[stage]),
+      );
+
       if (result.status === 'rejected') {
         setSubmitStatus({ kind: 'error', message: result.reason });
+        toast.update(progressId, {
+          type: 'error',
+          title: 'Order rejected',
+          description: result.reason,
+          progress: undefined,
+          duration: 6000,
+        });
       } else if (result.status === 'filled') {
-        setSubmitStatus({ kind: 'ok', message: `Filled (${result.fills} fill${result.fills === 1 ? '' : 's'})` });
+        const message = `Filled (${result.fills} fill${result.fills === 1 ? '' : 's'})`;
+        setSubmitStatus({ kind: 'ok', message });
+        // Terminal, but not "done": the settlement tx itself is still
+        // in flight on the matcher's side (fire-and-forget on that end,
+        // see api.rs's own doc) — `loadingAction` keeps this toast alive
+        // and pulsing "Fetching…" until pollSettlementStatus below either
+        // finds the real hash or gives up.
+        toast.update(progressId, {
+          type: 'success',
+          title: `${actionLabel === 'Buy' ? 'Bought' : 'Sold'} ${qty} ${market.label}`,
+          description: `${result.fills} fill${result.fills === 1 ? '' : 's'} at market`,
+          progress: undefined,
+          duration: 45000,
+          loadingAction: true,
+        });
+        if (wallet.address) {
+          pollSettlementStatus(wallet.address, nonce).then((settlement) => {
+            if (settlement.status === 'confirmed') {
+              toast.update(progressId, {
+                loadingAction: false,
+                duration: 30000,
+                action: {
+                  // No block explorer exists for local anvil to link to
+                  // (this is chain id 31337, not a real network) — a real
+                  // deployment with a real explorer would swap this for an
+                  // `onClick: () => window.open(explorerUrl(tx_hash))`
+                  // instead, same shape cer-perp's own "View TX" does.
+                  label: 'Copy TX hash',
+                  onClick: () => {
+                    navigator.clipboard.writeText(settlement.tx_hash);
+                    toast.success('Copied', settlement.tx_hash);
+                  },
+                },
+              });
+            } else {
+              toast.update(progressId, { loadingAction: false });
+            }
+          });
+        }
       } else {
-        setSubmitStatus({ kind: 'ok', message: `Resting (order #${result.order_id})` });
+        const message = `Resting (order #${result.order_id})`;
+        setSubmitStatus({ kind: 'ok', message });
+        toast.update(progressId, {
+          type: 'info',
+          title: 'Order resting',
+          description: `#${result.order_id} · ${qty} ${market.label} at ${formatMarketPrice(tick, market.id)}`,
+          progress: undefined,
+          duration: 8000,
+        });
       }
     } catch (error) {
-      setSubmitStatus({ kind: 'error', message: error instanceof Error ? error.message : 'submission failed' });
+      const message = error instanceof Error ? error.message : 'submission failed';
+      setSubmitStatus({ kind: 'error', message });
+      toast.update(progressId, {
+        type: 'error',
+        title: 'Order failed',
+        description: message,
+        progress: undefined,
+        duration: 6000,
+      });
     } finally {
       setSubmitting(false);
     }

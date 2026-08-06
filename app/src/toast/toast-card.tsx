@@ -86,18 +86,22 @@ export function ToastCard({ toast, onClose }: { toast: Toast; onClose: (id: stri
         </div>
       )}
 
-      {toast.type !== 'progress' && toast.action && (
+      {toast.type !== 'progress' && (toast.action || toast.loadingAction) && (
         <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={() => {
-              toast.action?.onClick();
-              onClose(toast.id);
-            }}
-            className="rounded-sm bg-accent/10 px-[var(--space-3)] py-[var(--space-1)] text-[11px] font-medium text-accent transition-colors duration-150 hover:bg-accent/20"
-          >
-            {toast.action.label}
-          </button>
+          {toast.action ? (
+            <button
+              type="button"
+              onClick={() => {
+                toast.action?.onClick();
+                onClose(toast.id);
+              }}
+              className="rounded-sm bg-accent/10 px-[var(--space-3)] py-[var(--space-1)] text-[11px] font-medium text-accent transition-colors duration-150 hover:bg-accent/20"
+            >
+              {toast.action.label}
+            </button>
+          ) : (
+            <span className="animate-pulse text-[11px] font-medium text-text-tertiary">Fetching…</span>
+          )}
         </div>
       )}
     </motion.div>

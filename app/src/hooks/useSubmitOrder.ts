@@ -37,6 +37,12 @@ export type OrderResult =
   | { status: 'filled'; order_id: number | null; fills: number }
   | { status: 'rejected'; reason: string };
 
+// The real stages a submission actually passes through, in order — a
+// caller (TradePanel) drives a single progress toast through these via
+// `toast.update`, cer-perp's own trading-panel.tsx pattern, rather than
+// firing a fresh toast only once everything's already finished.
+export type SubmitOrderStage = 'signing' | 'encrypting' | 'submitting';
+
 function tifTag(tif: Tif): string {
   if (typeof tif === 'string') return tif === 'GoodTilCancel' ? 'GTC' : tif === 'ImmediateOrCancel' ? 'IOC' : 'FOK';
   return `GTT${tif.GoodTilTime}`;
@@ -57,7 +63,10 @@ export function useSubmitOrder(address: `0x${string}` | undefined) {
   }, []);
 
   const submitOrder = useCallback(
-    async (args: SubmitOrderArgs): Promise<OrderResult> => {
+    async (
+      args: SubmitOrderArgs,
+      onProgress?: (stage: SubmitOrderStage) => void,
+    ): Promise<{ result: OrderResult; nonce: number }> => {
       if (!address) throw new Error('no wallet connected');
 
       const nonce = nextNonce();
@@ -73,6 +82,7 @@ export function useSubmitOrder(address: `0x${string}` | undefined) {
         args.leverage,
       ].join('|');
 
+      onProgress?.('signing');
       const { signature } = await signMessage({ message: signingBytes });
 
       const payload = {
@@ -87,9 +97,11 @@ export function useSubmitOrder(address: `0x${string}` | undefined) {
         signature: toWireSignature(signature),
       };
 
+      onProgress?.('encrypting');
       const enclavePubkey = await fetchEnclavePubkey();
       const envelope = await encryptEnvelope(payload, enclavePubkey);
 
+      onProgress?.('submitting');
       const res = await fetch(`${matcherHttpUrl}/order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -99,10 +111,38 @@ export function useSubmitOrder(address: `0x${string}` | undefined) {
         const text = await res.text();
         throw new Error(`order submission failed: ${res.status} ${text}`);
       }
-      return (await res.json()) as OrderResult;
+      return { result: (await res.json()) as OrderResult, nonce };
     },
     [address, nextNonce, signMessage],
   );
 
-  return { submitOrder };
+  return { submitOrder, pollSettlementStatus };
+}
+
+type SettlementStatus =
+  | { status: 'pending' }
+  | { status: 'confirmed'; tx_hash: string }
+  | { status: 'failed' };
+
+// Mirrors cer-perp's own `tee.pollPositionTx` pattern: the settlement
+// broadcast for a fill is fire-and-forget on the matcher's side
+// (api.rs's own doc on why `/order` can't just include the tx hash), so
+// the real hash only exists a moment after the trader's response already
+// came back. Short-interval polling with a hard timeout, not a websocket
+// — this is a one-shot "did it land" check per order, not a stream.
+async function pollSettlementStatus(
+  signer: `0x${string}`,
+  nonce: number,
+  { intervalMs = 1000, timeoutMs = 20000 }: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<SettlementStatus> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await fetch(`${matcherHttpUrl}/settlement-status/${signer}/${nonce}`);
+    if (res.ok) {
+      const status = (await res.json()) as SettlementStatus;
+      if (status.status !== 'pending') return status;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return { status: 'pending' };
 }

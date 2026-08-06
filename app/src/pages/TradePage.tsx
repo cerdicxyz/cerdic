@@ -85,7 +85,7 @@ export function TradePage() {
             <TradePanel market={market} />
           </Panel>
           <Panel label="Trades" area="tape" noPadding>
-            <TradesPanel market={market} />
+            <TradesPanel />
           </Panel>
         </div>
       </div>
