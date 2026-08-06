@@ -433,6 +433,12 @@ pub enum ApiError {
     /// engine's arena/ladder invariants.
     #[error("tick {tick} exceeds the maximum sane value ({MAX_SANE_TICK})")]
     InvalidTick { tick: u64 },
+    /// `check_deposited_collateral`'s own doc on what this compares.
+    /// Real dollars, not this crate's raw tick units — the message is
+    /// meant to be directly readable by whoever's trading, not just a
+    /// developer.
+    #[error("insufficient deposited collateral: need ${required_usd}, have ${available_usd} (deposit more via Account.sol)")]
+    InsufficientCollateral { required_usd: String, available_usd: String },
 }
 
 /// Generous headroom over every real market's current tick range (the
@@ -452,6 +458,7 @@ impl IntoResponse for ApiError {
             | ApiError::Decrypt(DecryptError::BadSignature(_)) => StatusCode::UNAUTHORIZED,
             ApiError::NonceReplay { .. } => StatusCode::CONFLICT,
             ApiError::InvalidTick { .. } => StatusCode::BAD_REQUEST,
+            ApiError::InsufficientCollateral { .. } => StatusCode::PAYMENT_REQUIRED,
         };
         // The error's Display text never includes decrypted plaintext or
         // key material, only which check failed, so it's safe to return
@@ -548,6 +555,15 @@ pub struct AppState {
     /// and skips broadcasting rather than guessing, same "honest nothing
     /// to submit to" posture as an unconfigured `SETTLEMENT_RPC_URL`.
     settlement_contracts: HashMap<MarketId, alloy::primitives::Address>,
+    /// `Account.sol`'s own address (a single global contract, unlike
+    /// `settlement_contracts` above) plus the one collateral asset this
+    /// deployment checks against — both `None` until
+    /// `configure_collateral_check` is called. `None` means the
+    /// pre-trade real-collateral gate in `post_order` is a no-op (same
+    /// "opt-in, not opt-out" posture as `debug_seed_enabled`): a
+    /// deployment that never wires this up behaves exactly as it always
+    /// has, not silently broken.
+    collateral_check: Option<(alloy::primitives::Address, alloy::primitives::Address)>,
     /// Cumulative notional volume per trader, priced against `fees::FEE_TIERS`.
     /// See `fees.rs`'s module doc: cumulative-since-inception, not a rolling
     /// window, and the same unbounded-growth caveat as `last_nonce`.
@@ -656,6 +672,7 @@ impl AppState {
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
+            collateral_check: None,
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
             funding_index_native: Mutex::new(HashMap::new()),
@@ -690,6 +707,7 @@ impl AppState {
             backstop_config: BackstopConfig::default(),
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
+            collateral_check: None,
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
             funding_index_native: Mutex::new(HashMap::new()),
@@ -732,6 +750,20 @@ impl AppState {
         contract: alloy::primitives::Address,
     ) {
         self.settlement_contracts.insert(market_id, contract);
+    }
+
+    /// Opts the whole deployment into the real pre-trade collateral gate
+    /// in `post_order`, see `collateral_check`'s own doc. `account` is
+    /// `Account.sol`'s address; `asset` is the one ERC20 checked against
+    /// (this deployment's mock USDC — a genuine future limitation, not
+    /// this pass's job: a trader collateralized only in a DIFFERENT
+    /// registered asset would read as having zero collateral).
+    pub fn configure_collateral_check(
+        &mut self,
+        account: alloy::primitives::Address,
+        asset: alloy::primitives::Address,
+    ) {
+        self.collateral_check = Some((account, asset));
     }
 
     /// Overrides the backstop maker's `notional_cap` (default
@@ -1149,6 +1181,8 @@ async fn post_order(
     if payload.tick > MAX_SANE_TICK {
         return Err(ApiError::InvalidTick { tick: payload.tick });
     }
+
+    check_deposited_collateral(&state, signer, &payload.market_id, payload.tick, payload.qty).await?;
 
     let owner = signer_owner_id(signer);
     state.owner_addresses.lock().expect("owner_addresses mutex poisoned").insert(owner, signer);
@@ -2640,6 +2674,105 @@ pub const BPS_DENOMINATOR: u128 = 10_000;
 /// TEE and the contract; tracked as a follow-up, not invented here.
 fn required_margin(tick: u64, qty: u64) -> u128 {
     (tick as u128) * (qty as u128) * IMR_BPS / BPS_DENOMINATOR
+}
+
+/// The bridge `required_margin`'s own doc calls a follow-up — not for
+/// `SettlementEngine` (that gap is still open, still tracked separately),
+/// but for comparing a margin requirement against `Account.sol`'s real,
+/// 1e18-scaled ERC20 collateral balance (`load_deposited_collateral`),
+/// which is a real dollar figure and has to be compared apples-to-apples.
+///
+/// `tick` is `real_price * price_scale_for_market(market_id)`
+/// (`oracle::price_scale_for_market`'s own doc), so dividing
+/// `required_margin`'s raw result by that same scale recovers the real
+/// USD margin: `tick*qty*IMR_BPS/BPS_DENOMINATOR / price_scale ==
+/// real_price*qty*IMR_BPS/BPS_DENOMINATOR`. Scaled by 1e18 to match
+/// `Account.sol`'s own ERC20 balance convention (every deployed
+/// collateral asset here uses 18 decimals). `saturating_mul`, not a bare
+/// `*`: this is a pre-trade risk check, not a settlement path — a
+/// pathological overflow here must degrade to "looks unaffordable"
+/// (rejecting the order), never panic the request handler.
+fn required_margin_usd(tick: u64, qty: u64, market_id: &str) -> u128 {
+    const USD_SCALE: u128 = 1_000_000_000_000_000_000;
+    let raw = required_margin(tick, qty);
+    let scale = crate::oracle::price_scale_for_market(market_id) as u128;
+    raw.saturating_mul(USD_SCALE) / scale
+}
+
+/// The real, pre-trade collateral gate: before an order can even touch
+/// the book, checks that the signer's REAL deposited collateral
+/// (`Account.sol`, via `settle::load_deposited_collateral`) covers both
+/// what's already locked across their existing sealed positions AND this
+/// new order's own worst-case margin requirement — both converted to
+/// real USD via `required_margin_usd`'s own doc on the tick/price-scale
+/// bridge. `existing.collateral` is itself already in that same raw
+/// tick-scale convention (`required_margin`'s doc, `PositionFold`'s doc
+/// on how it's built up), so the same per-market division applies.
+///
+/// A no-op (`Ok(())`) when `collateral_check` isn't configured
+/// (`AppState::configure_collateral_check`'s own doc) — same "opt-in, not
+/// opt-out" posture every other deployment-config flag in this file has.
+/// A real on-chain RPC failure also degrades to `Ok(())`, same "don't
+/// fail a trader's order over an infrastructure hiccup" posture
+/// `live_mark_prices` already uses for its own oracle read — this is a
+/// risk guard, not the source of truth for whether a trade is valid.
+///
+/// Scoped to `post_order` (taker fills) only, not `post_offer`: resting
+/// maker quotes are documented (`market_maker.rs`'s own module doc, spec
+/// section 2.5) as deliberately NOT pre-locking collateral at placement —
+/// gating them here would be a real design change to that path, not this
+/// fix's job. A maker with insufficient real collateral by the time one
+/// of its offers actually fills is a genuine, separate, still-open gap.
+async fn check_deposited_collateral(
+    state: &AppState,
+    signer: Address,
+    market_id: &str,
+    tick: u64,
+    qty: u64,
+) -> Result<(), ApiError> {
+    let Some((account_contract, asset)) = state.collateral_check else {
+        return Ok(());
+    };
+
+    let key = portfolio_key(&state.portfolio_key_secret, signer);
+    let existing = load_portfolio_state(state, key, &[]).await;
+
+    const USD_SCALE: u128 = 1_000_000_000_000_000_000;
+    let locked_usd: u128 = existing
+        .iter()
+        .map(|m| {
+            let collateral_raw = i128::try_from(m.collateral).unwrap_or(0).max(0) as u128;
+            collateral_raw.saturating_mul(USD_SCALE)
+                / crate::oracle::price_scale_for_market(&m.market_id) as u128
+        })
+        .sum();
+
+    let new_order_usd = required_margin_usd(tick, qty, market_id);
+    let required_usd = locked_usd.saturating_add(new_order_usd);
+
+    let deposited_usd = match crate::settle::load_deposited_collateral(signer, asset, account_contract).await
+    {
+        Ok(balance) => u128::try_from(balance).unwrap_or(u128::MAX),
+        Err(e) => {
+            tracing::warn!(error = %e, signer = %signer, "collateral check RPC failed, allowing order through");
+            return Ok(());
+        }
+    };
+
+    if deposited_usd < required_usd {
+        return Err(ApiError::InsufficientCollateral {
+            required_usd: format_usd(required_usd),
+            available_usd: format_usd(deposited_usd),
+        });
+    }
+    Ok(())
+}
+
+fn format_usd(amount_1e18: u128) -> String {
+    const USD_SCALE: u128 = 1_000_000_000_000_000_000;
+    let whole = amount_1e18 / USD_SCALE;
+    let frac = (amount_1e18 % USD_SCALE) / (USD_SCALE / 100);
+    format!("{whole}.{frac:02}")
 }
 
 /// The `collateral_delta` for closing `close_size` (magnitude, <=

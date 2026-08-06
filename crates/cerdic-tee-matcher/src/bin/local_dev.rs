@@ -71,6 +71,27 @@ sol! {
     interface IMockV3Aggregator {
         function updateAnswer(int256 answer) external;
     }
+
+    /// `LocalStablecoin`'s own `mint` (DeployLocal.s.sol) — unrestricted,
+    /// any caller can mint any amount to any address, see that contract's
+    /// own doc: a real local stand-in for USDC/EURC, not a fabricated
+    /// balance, every unit genuinely minted on this chain.
+    interface ILocalStablecoin {
+        function mint(address to, uint256 amount) external;
+    }
+
+    /// Standard ERC20 `approve` — needed before `IAccountContract.deposit`
+    /// below, which pulls funds via `transferFrom` (Account.sol's own doc).
+    interface IErc20Approve {
+        function approve(address spender, uint256 amount) external returns (bool);
+    }
+
+    /// `Account.sol`'s own `deposit` — real custody, real transferFrom,
+    /// see `deposit_as_trader`'s own doc on why this binary calls it (not
+    /// just mints) for the demo trader specifically.
+    interface IAccountContract {
+        function deposit(address asset, uint256 amount) external;
+    }
 }
 
 const ANVIL_RPC: &str = "http://127.0.0.1:8545";
@@ -235,6 +256,10 @@ async fn cmd_up() {
         .unwrap_or_else(|| die("failed to parse AttestationRouter"));
     let eurc_usdc_market = get_addr(&deploy_local, "FxPerpMarket (EURC/USDC):")
         .unwrap_or_else(|| die("failed to parse EURC/USDC market"));
+    let usdc_token =
+        get_addr(&deploy_local, "USDC (mock):").unwrap_or_else(|| die("failed to parse USDC (mock)"));
+    let account_contract =
+        get_addr(&deploy_local, "Account:").unwrap_or_else(|| die("failed to parse Account"));
 
     log("deploying BTC/USDC market (DeployPerpMarketLocal)");
     let deploy_btc = run_forge_script(
@@ -336,6 +361,8 @@ async fn cmd_up() {
         .env("SETTLEMENT_RPC_URL", ANVIL_RPC)
         .env("CERDIC_SETTLEMENT_CONTRACTS", &settlement_contracts)
         .env("CERDIC_ORACLE_FEEDS", &oracle_feeds)
+        .env("CERDIC_ACCOUNT_CONTRACT", &account_contract)
+        .env("CERDIC_COLLATERAL_ASSET", &usdc_token)
         .env("CERDIC_ENABLE_DEBUG_SEED", "1")
         .env("CERDIC_LOG", "info")
         .stdout(Stdio::from(matcher_log.try_clone().unwrap()))
@@ -362,6 +389,20 @@ async fn cmd_up() {
     fund_and_authorize(deployer_key, &pubkey_resp.settlement_address, &attestation_router)
         .await
         .unwrap_or_else(|e| die(format!("fund/authorize failed: {e}")));
+
+    // --- 4b. optional real test-wallet funding (ETH + mock USDC) ---------
+    // `LOCAL_DEV_FUND_ADDRESS`, if set, gets 10 ETH and 100,000 real
+    // minted USDC — the same manual `cast send`/`cast call` sequence this
+    // repo's own testing kept needing after every redeploy (USDC/Account
+    // addresses regenerate each run), done here once instead of by hand.
+    // Unset by default: this is a convenience for a specific person's own
+    // wallet, not something every `up` should assume.
+    if let Ok(fund_address) = std::env::var("LOCAL_DEV_FUND_ADDRESS") {
+        log(format!("funding test wallet {fund_address} (10 ETH + 100,000 mock USDC)"));
+        fund_test_wallet(deployer_key, &fund_address, &usdc_token)
+            .await
+            .unwrap_or_else(|e| die(format!("test wallet funding failed: {e}")));
+    }
 
     // --- 5. two market makers per market ------------------------------------
     // Wave-a (index 1-9) and wave-b (index 10-18): different identity,
@@ -454,6 +495,27 @@ async fn cmd_up() {
     log("waiting for makers to establish initial depth before seeding trades");
     tokio::time::sleep(Duration::from_secs(5)).await;
     let demo_trader_key = mm_keys[19].clone();
+    // The demo trader submits real TAKER orders (`/order`, via
+    // `demo_client`), which the real collateral gate (`api.rs`'s
+    // `check_deposited_collateral`) now actually enforces — market maker
+    // wallets never needed this (they only ever rest `/offer`s, exempt by
+    // design, see that check's own doc), but this one does, or every
+    // seed trade gets rejected with real $0 collateral. Confirmed live:
+    // this exact failure, before this fund step existed.
+    let demo_trader_address = demo_trader_key
+        .parse::<PrivateKeySigner>()
+        .unwrap_or_else(|e| die(format!("bad demo trader key: {e}")))
+        .address()
+        .to_string();
+    fund_test_wallet(deployer_key, &demo_trader_address, &usdc_token)
+        .await
+        .unwrap_or_else(|e| die(format!("demo trader funding failed: {e}")));
+    // Mint alone leaves `Account.collateralBalanceOf` at zero — see
+    // `deposit_as_trader`'s own doc, this is the step that actually makes
+    // the demo trader's own seed orders pass the real collateral gate.
+    deposit_as_trader(&demo_trader_key, &usdc_token, &account_contract)
+        .await
+        .unwrap_or_else(|e| die(format!("demo trader deposit failed: {e}")));
     let client = reqwest::Client::new();
     let mut rng = rand::thread_rng();
     let mut mid_refs: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
@@ -1001,6 +1063,92 @@ async fn fund_and_authorize(
     let auth_tx = TransactionRequest::default().with_to(router).with_input(calldata);
     provider
         .send_transaction(auth_tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .get_receipt()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Sends `LOCAL_DEV_FUND_ADDRESS` 10 ETH plus 100,000 real minted mock
+/// USDC — see `LOCAL_DEV_FUND_ADDRESS`'s own doc at its call site on why
+/// this exists (repeat manual `cast` calls after every redeploy).
+async fn fund_test_wallet(deployer_key: &str, fund_address: &str, usdc_token: &str) -> Result<(), String> {
+    let signer: PrivateKeySigner = deployer_key.parse().map_err(|e| format!("{e}"))?;
+    let wallet = EthereumWallet::from(signer);
+    let provider =
+        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(ANVIL_RPC.parse().unwrap());
+
+    let to: Address = fund_address.parse().map_err(|e| format!("{e}"))?;
+    let fund_tx =
+        TransactionRequest::default().with_to(to).with_value(U256::from(10_000_000_000_000_000_000u128));
+    provider
+        .send_transaction(fund_tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .get_receipt()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let usdc: Address = usdc_token.parse().map_err(|e| format!("{e}"))?;
+    // 100,000 USDC at 18 decimals (LocalStablecoin's own ERC20 default).
+    let call = ILocalStablecoin::mintCall { to, amount: U256::from(100_000_000_000_000_000_000_000u128) };
+    let calldata = alloy::sol_types::SolCall::abi_encode(&call);
+    let mint_tx = TransactionRequest::default().with_to(usdc).with_input(calldata);
+    provider
+        .send_transaction(mint_tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .get_receipt()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Approves and deposits `amount` of `usdc_token` into `Account.sol`,
+/// signed by `trader_key` itself — not the deployer. Minting real USDC
+/// into a wallet (`fund_test_wallet`) is NOT the same as depositing it:
+/// `Account.collateralBalanceOf` (what `check_deposited_collateral`
+/// actually reads) stays zero until someone calls `approve` then
+/// `deposit` FROM that wallet. Confirmed live: the demo trader had a
+/// real 100,000 USDC wallet balance and every one of its own seed trades
+/// still got rejected with real $0 collateral, because minting alone
+/// never did this second step. For a real human's wallet
+/// (`LOCAL_DEV_FUND_ADDRESS`), this binary deliberately does NOT do this
+/// — it doesn't have that private key, and shouldn't: the real
+/// approve/deposit there has to go through their own signature, which is
+/// exactly what `DepositModal.tsx` now does. This function is only for
+/// wallets this binary already controls the key for (anvil's own dev
+/// accounts), like the demo/seed trader.
+async fn deposit_as_trader(trader_key: &str, usdc_token: &str, account_contract: &str) -> Result<(), String> {
+    let signer: PrivateKeySigner = trader_key.parse().map_err(|e| format!("{e}"))?;
+    let wallet = EthereumWallet::from(signer);
+    let provider =
+        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(ANVIL_RPC.parse().unwrap());
+
+    let usdc: Address = usdc_token.parse().map_err(|e| format!("{e}"))?;
+    let account: Address = account_contract.parse().map_err(|e| format!("{e}"))?;
+    let amount = U256::from(100_000_000_000_000_000_000_000u128); // 100,000 USDC, 18 decimals
+
+    let approve_call = IErc20Approve::approveCall { spender: account, amount };
+    let approve_calldata = alloy::sol_types::SolCall::abi_encode(&approve_call);
+    let approve_tx = TransactionRequest::default().with_to(usdc).with_input(approve_calldata);
+    provider
+        .send_transaction(approve_tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .get_receipt()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let deposit_call = IAccountContract::depositCall { asset: usdc, amount };
+    let deposit_calldata = alloy::sol_types::SolCall::abi_encode(&deposit_call);
+    let deposit_tx = TransactionRequest::default().with_to(account).with_input(deposit_calldata);
+    provider
+        .send_transaction(deposit_tx)
         .await
         .map_err(|e| e.to_string())?
         .get_receipt()

@@ -28,6 +28,7 @@ async fn main() {
     let mut app_state = api::AppState::from_secrets(secrets);
     configure_oracle_feeds(&mut app_state);
     configure_settlement_contracts(&mut app_state);
+    configure_collateral_check(&mut app_state);
     configure_backstop_notional_cap(&mut app_state);
     configure_debug_seed(&mut app_state);
     let state = Arc::new(app_state);
@@ -121,6 +122,33 @@ fn configure_settlement_contracts(state: &mut api::AppState) {
                 "malformed CERDIC_SETTLEMENT_CONTRACTS entry, expected marketId=contractAddress, skipping"
             ),
         }
+    }
+}
+
+/// Reads `CERDIC_ACCOUNT_CONTRACT`/`CERDIC_COLLATERAL_ASSET` (both plain
+/// addresses) and wires the real pre-trade collateral gate, see
+/// `api::AppState::configure_collateral_check`'s own doc. Either unset,
+/// or either malformed, leaves the gate off — same "opt-in, not opt-out"
+/// posture as `configure_settlement_contracts` above, not fatal.
+fn configure_collateral_check(state: &mut api::AppState) {
+    let (Ok(account_raw), Ok(asset_raw)) =
+        (std::env::var("CERDIC_ACCOUNT_CONTRACT"), std::env::var("CERDIC_COLLATERAL_ASSET"))
+    else {
+        tracing::info!(
+            "CERDIC_ACCOUNT_CONTRACT/CERDIC_COLLATERAL_ASSET not both set, no pre-trade collateral check"
+        );
+        return;
+    };
+    match (account_raw.parse(), asset_raw.parse()) {
+        (Ok(account), Ok(asset)) => {
+            tracing::info!(account = %account_raw, asset = %asset_raw, "real collateral gate configured");
+            state.configure_collateral_check(account, asset);
+        }
+        _ => tracing::warn!(
+            account = account_raw,
+            asset = asset_raw,
+            "malformed CERDIC_ACCOUNT_CONTRACT/CERDIC_COLLATERAL_ASSET, no pre-trade collateral check"
+        ),
     }
 }
 
