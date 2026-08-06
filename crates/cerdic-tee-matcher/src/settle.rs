@@ -102,6 +102,16 @@ sol! {
 
         event SealedPositionTouched(bytes32 indexed portfolioKey, bytes32 indexed marketId);
     }
+
+    /// The one real-collateral-custody read this crate needs —
+    /// `packages/contracts/src/clearing/Account.sol`'s own view function,
+    /// a single global contract (not per-market like SettlementEngine).
+    /// See `load_deposited_collateral`'s own doc on why the sealed
+    /// settlement path needs this at all despite never touching
+    /// `Account.sol` for anything else.
+    interface IAccount {
+        function collateralBalanceOf(address trader, address asset) external view returns (uint256);
+    }
 }
 
 /// The TEE's own settlement-signing identity, the address
@@ -475,6 +485,45 @@ pub async fn load_sealed(
     Ok(SealedPosition { sealed_params: decoded.sealedParams, collateral: decoded.collateral })
 }
 
+/// Reads a trader's REAL deposited collateral for one asset from
+/// `Account.sol` (`packages/contracts/src/clearing/Account.sol`'s own
+/// `collateralBalanceOf`) — the one point where this crate's otherwise
+/// fully TEE-sealed settlement path touches real, on-chain, plaintext
+/// custody. Necessary specifically BECAUSE the path is sealed: unlike
+/// the separate, unused `settleTrade`/`LiquidationEntry` plaintext
+/// system (which can check real collateral on-chain itself, since the
+/// contract there sees plaintext size/price), `SettlementEngine` never
+/// sees a sealed position's real exposure, so it structurally cannot
+/// verify a trader has enough real collateral for what they're opening —
+/// only the TEE can, before it seals anything, which is what calls this.
+/// `contract` here is `Account.sol`'s own address, a single global
+/// contract, not per-market like `SettlementEngine`.
+pub async fn load_deposited_collateral(
+    trader: Address,
+    asset: Address,
+    contract: Address,
+) -> Result<alloy::primitives::U256, LoadSealedError> {
+    use alloy::{
+        network::TransactionBuilder,
+        providers::{Provider, ProviderBuilder},
+        rpc::types::TransactionRequest,
+    };
+
+    let rpc_url = env::var("SETTLEMENT_RPC_URL").map_err(|_| LoadSealedError::NotConfigured)?;
+    let provider =
+        ProviderBuilder::new().on_http(rpc_url.parse().map_err(|e| LoadSealedError::Rpc(format!("{e}")))?);
+
+    let call = IAccount::collateralBalanceOfCall { trader, asset };
+    let calldata = Bytes::from(call.abi_encode());
+
+    let tx = TransactionRequest::default().with_to(contract).with_input(calldata);
+    let raw = provider.call(&tx).await.map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+
+    let decoded = IAccount::collateralBalanceOfCall::abi_decode_returns(&raw, true)
+        .map_err(|e| LoadSealedError::Rpc(e.to_string()))?;
+    Ok(decoded._0)
+}
+
 /// Reads this market's current cumulative funding index (a plaintext,
 /// public contract value — not sealed, unlike position size/side).
 /// Same plain-`eth_call` shape as `load_sealed`. The index is a running
@@ -658,6 +707,7 @@ mod tests {
             leverage: 5,
             take_profit: None,
             stop_loss: Some(90),
+            entry_funding_index: -7,
         };
         let mut settlement = sample_settlement();
         settlement.sealed_params_a = Bytes::from(key.seal(&params));

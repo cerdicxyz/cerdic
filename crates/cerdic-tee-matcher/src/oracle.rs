@@ -129,6 +129,75 @@ where
     s.parse().map_err(serde::de::Error::custom)
 }
 
+/// `reqwest` (rustls) has been observed, repeatedly and reproducibly in
+/// this sandbox, failing outright ("error sending request") against
+/// hermes.pyth.network specifically, while a bare `curl` subprocess
+/// against the exact same URL usually succeeds — the same gap this crate
+/// already hit and worked around for FRED/BoE/RBA (see `local_dev.rs`'s
+/// git history). Left unhandled, one of these episodes freezes
+/// `oracle_ticks` dry: `AppState::poll_funding_native` early-returns on
+/// an empty result, so funding just stops accruing (and reads as
+/// suspiciously identical across every market — confirmed live, this
+/// exact failure mode, not a bug in the funding math itself) instead of
+/// erroring loudly.
+///
+/// Both `reqwest` and `curl` were confirmed live to sometimes fail on the
+/// SAME call (`curl`'s own exit 28 is a timeout, not a permanent
+/// rejection) — this sandbox's egress to Hermes is genuinely flaky, not
+/// just reqwest-specific, so one reqwest-then-curl attempt isn't always
+/// enough. Retried up to `MAX_ATTEMPTS` times with a short fixed backoff
+/// before giving up, since the downstream consequence of giving up too
+/// early is real: `local_dev.rs`'s oracle-push-loop needs a fresh Pyth
+/// price roughly every cycle to keep Chainlink's own aggregator inside
+/// `ChainlinkConsumer.MAX_STALENESS_SECONDS = 60` — one skipped push from
+/// a single failed attempt can be enough to trip `StalePrice` on the next
+/// settlement, confirmed live. `curl` is tried second within each
+/// attempt, not first: `reqwest` succeeds the overwhelming majority of
+/// the time, and shelling out unconditionally would be real, unnecessary
+/// overhead on the hot path (this feeds `poll_funding_native`, called
+/// every `ORACLE_POLL_INTERVAL`).
+async fn fetch_hermes_body(url: &str) -> Result<String, OracleError> {
+    // Bounded so a total-outage worst case (every attempt exhausts both
+    // timeouts) still finishes well inside the 20s cadence this feeds
+    // (`local_dev.rs`'s oracle-push-loop) rather than becoming the
+    // bottleneck itself: 3 attempts * (5s reqwest + 5s curl) + 2 * 1s
+    // backoff = 32s worst case, versus a typical real failure (confirmed
+    // live) resolving on attempt 1 in a second or two.
+    const MAX_ATTEMPTS: u32 = 3;
+    const CURL_TIMEOUT_SECS: &str = "5";
+    const BACKOFF: Duration = Duration::from_secs(1);
+
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+        match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(response.text().await?),
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), attempt, "Hermes reqwest returned non-success, falling back to curl");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "Hermes reqwest failed, falling back to curl");
+            }
+        }
+
+        let output = tokio::process::Command::new("curl")
+            .args(["-sf", "-m", CURL_TIMEOUT_SECS, "-A", "cerdic-tee-matcher/oracle.rs", url])
+            .output()
+            .await
+            .map_err(|e| OracleError::BadResponse(format!("curl fallback failed to run: {e}")))?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        last_err =
+            format!("curl fallback exited {} ({})", output.status, String::from_utf8_lossy(&output.stderr));
+        tracing::warn!(error = %last_err, attempt, "curl fallback also failed");
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(BACKOFF).await;
+        }
+    }
+    Err(OracleError::BadResponse(format!("all {MAX_ATTEMPTS} attempts failed, last error: {last_err}")))
+}
+
 /// Fetches the latest price for every feed in `feed_ids` from Hermes.
 /// Returns a map keyed by feed id (no `0x` prefix, matching Hermes's own
 /// convention). A feed Hermes doesn't recognize simply doesn't appear in
@@ -136,7 +205,6 @@ where
 /// SPECIFIC feed should check the map, not assume every requested id
 /// came back.
 pub async fn fetch_latest_prices(feed_ids: &[&str]) -> Result<HashMap<String, PythPrice>, OracleError> {
-    let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let mut url = format!("{HERMES_BASE_URL}/v2/updates/price/latest?");
     for id in feed_ids {
         url.push_str("ids[]=");
@@ -144,11 +212,7 @@ pub async fn fetch_latest_prices(feed_ids: &[&str]) -> Result<HashMap<String, Py
         url.push('&');
     }
 
-    let response = client.get(&url).send().await?;
-    if !response.status().is_success() {
-        return Err(OracleError::BadResponse(format!("Hermes returned HTTP {}", response.status())));
-    }
-    let body = response.text().await?;
+    let body = fetch_hermes_body(&url).await?;
     parse_hermes_response(&body)
 }
 
@@ -165,7 +229,6 @@ pub async fn fetch_price(feed_id: &str) -> Result<PythPrice, OracleError> {
 /// provide (see this module's own doc on that gap) — `keeper_price_pusher.rs`
 /// is the real consumer.
 pub async fn fetch_update_data(feed_ids: &[&str]) -> Result<Vec<Vec<u8>>, OracleError> {
-    let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let mut url = format!("{HERMES_BASE_URL}/v2/updates/price/latest?");
     for id in feed_ids {
         url.push_str("ids[]=");
@@ -173,11 +236,7 @@ pub async fn fetch_update_data(feed_ids: &[&str]) -> Result<Vec<Vec<u8>>, Oracle
         url.push('&');
     }
 
-    let response = client.get(&url).send().await?;
-    if !response.status().is_success() {
-        return Err(OracleError::BadResponse(format!("Hermes returned HTTP {}", response.status())));
-    }
-    let body = response.text().await?;
+    let body = fetch_hermes_body(&url).await?;
     let parsed: HermesResponse =
         serde_json::from_str(&body).map_err(|e| OracleError::BadResponse(e.to_string()))?;
     let binary = parsed

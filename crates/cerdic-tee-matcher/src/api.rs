@@ -335,6 +335,44 @@ const DEFAULT_DEPTH_LEVELS: usize = 50;
 #[derive(Debug, Deserialize)]
 pub struct DepthQuery {
     pub levels: Option<usize>,
+    /// Price-grouping bucket size, in this market's own raw tick units
+    /// (same "no universal decimals-per-market convention" scale
+    /// `OrderBookResponse`'s own doc already notes — a caller converts
+    /// its own real-currency grouping, e.g. "$1" or "0.0001", into tick
+    /// units using the same scale it used to interpret `tick` in the
+    /// first place). `None`/`0`/`1` all mean "no grouping," the raw
+    /// per-tick ladder, unchanged from before this field existed.
+    pub group: Option<u64>,
+}
+
+/// Merges consecutive raw price levels into coarser buckets of `group`
+/// ticks, summing quantity per bucket and recomputing cumulative depth —
+/// a view transform, not a matching-engine concern, which is why this
+/// lives here rather than in `book.rs`: `depth()`'s raw per-tick ladder
+/// stays the single source of truth, this only ever runs on its output.
+/// `levels` is assumed already sorted nearest-to-worst (both `depth()`'s
+/// two possible orderings — descending for bids, ascending for asks —
+/// bucket monotonically the same direction, so a single linear merge
+/// handles both without needing to know which side it's grouping).
+fn group_levels(levels: &[crate::book::PriceLevel], group: u64) -> Vec<crate::book::PriceLevel> {
+    if group <= 1 {
+        return levels.to_vec();
+    }
+    let mut out: Vec<crate::book::PriceLevel> = Vec::with_capacity(levels.len());
+    let mut cumulative: u64 = 0;
+    for level in levels {
+        let bucket = (level.tick / group) * group;
+        cumulative += level.qty;
+        if let Some(last) = out.last_mut() {
+            if last.tick == bucket {
+                last.qty += level.qty;
+                last.cumulative = cumulative;
+                continue;
+            }
+        }
+        out.push(crate::book::PriceLevel { tick: bucket, qty: level.qty, cumulative });
+    }
+    out
 }
 
 /// The most bars a `/candles` query will ever return, same
@@ -382,7 +420,27 @@ pub enum ApiError {
     Decrypt(#[from] DecryptError),
     #[error("nonce {got} is not greater than the last accepted nonce {last} for this signer")]
     NonceReplay { got: u64, last: u64 },
+    /// A real, confirmed-live vulnerability, not a theoretical one:
+    /// `book::Ladder::ensure` grows a DENSE array to cover
+    /// `[base_tick, tick]` for a market — nothing validated `tick`
+    /// before it reached there, so a single validly-signed order (any
+    /// trader can submit one, no special role needed) with an
+    /// implausible tick crashed the whole matcher process with a
+    /// multi-terabyte allocation request (confirmed live: `memory
+    /// allocation of 71254345824112 bytes failed`, an unrecoverable
+    /// process abort, not a graceful error). Rejected here, before any
+    /// book mutation, rather than patched deep inside the matching
+    /// engine's arena/ladder invariants.
+    #[error("tick {tick} exceeds the maximum sane value ({MAX_SANE_TICK})")]
+    InvalidTick { tick: u64 },
 }
+
+/// Generous headroom over every real market's current tick range (the
+/// widest today, USD/JPY, sits around 15.8 million) — this exists to
+/// catch a garbage/corrupted/malicious value before it reaches the
+/// matching engine's dense per-tick array, not to enforce a realistic
+/// trading band (that's a separate, business-logic concern).
+const MAX_SANE_TICK: u64 = 100_000_000_000;
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -393,6 +451,7 @@ impl IntoResponse for ApiError {
             ApiError::Decrypt(DecryptError::AuthenticationFailed)
             | ApiError::Decrypt(DecryptError::BadSignature(_)) => StatusCode::UNAUTHORIZED,
             ApiError::NonceReplay { .. } => StatusCode::CONFLICT,
+            ApiError::InvalidTick { .. } => StatusCode::BAD_REQUEST,
         };
         // The error's Display text never includes decrypted plaintext or
         // key material, only which check failed, so it's safe to return
@@ -400,6 +459,10 @@ impl IntoResponse for ApiError {
         (status, self.to_string()).into_response()
     }
 }
+
+/// `(portfolioKey, marketId)` — the key every per-position map in
+/// `AppState` (cache, lock table) is keyed by.
+type PositionKey = (FixedBytes<32>, MarketId);
 
 pub struct AppState {
     pub keystore: Keystore,
@@ -495,16 +558,78 @@ pub struct AppState {
     /// exposure to it, same "opt-in, not opt-out" posture as every other
     /// deployment-config flag in this file.
     debug_seed_enabled: bool,
-    /// Trailing (timestamp, funding_index) samples per market, refreshed
-    /// by `poll_funding_and_oi`, capped so this never grows unbounded —
-    /// only enough history to compute a rate from the oldest-vs-newest
-    /// sample (see `get_funding`'s own doc), not a full time series.
-    funding_samples: Mutex<HashMap<MarketId, VecDeque<(u64, i128)>>>,
+    /// This crate's own funding accrual per market: `(index, last_update_unix_secs,
+    /// last_rate_bps)`, refreshed by `poll_funding_native`. `index` is tick-scale,
+    /// the same raw units `required_margin`/every `collateral_delta` already use —
+    /// see that function's own doc on why the contract's separate, 1e18-scaled
+    /// on-chain `fundingIndex` is never mixed with this. Replaces what used to be
+    /// a trailing window of on-chain-read samples: that value was real but
+    /// economically inert (nothing ever charged it against a trader), so this
+    /// crate now computes and charges its own instead.
+    ///
+    /// `index`/`last_rate_bps` are `f64`, not integers: a realistic rate
+    /// (real venues run well under 1 whole bps/hour) truncates to exactly 0
+    /// under integer math EVERY single poll — not just cosmetically on
+    /// display, but for real: the tiny fractional accrual each 5-second
+    /// cycle would be discarded before ever compounding into anything a
+    /// position could actually feel at close. Confirmed live, a genuine bug
+    /// this crate shipped once already, not a hypothetical one. Readers
+    /// that need a whole-number `i128` (a position's `entry_funding_index`
+    /// stamp, external API responses) round at the point of reading —
+    /// `funding_index_for`/`funding_indices_snapshot`/`get_funding`.
+    funding_index_native: Mutex<HashMap<MarketId, (f64, u64, f64)>>,
+    /// Trailing raw (unclamped) book-vs-oracle premium samples per market,
+    /// one per `poll_funding_native` cycle, capped at
+    /// `AppState::FUNDING_PREMIUM_WINDOW` — averaged before being clamped
+    /// and applied, see that function's own doc on why an instantaneous
+    /// top-of-book snapshot alone is too noisy to charge directly.
+    funding_premium_history: Mutex<HashMap<MarketId, VecDeque<i64>>>,
     /// `portfolioKey`s discovered so far per market (via the public
     /// `SealedPositionTouched` event, see `settle::index_open_interest`'s
     /// own doc) plus the next block to resume scanning from, so a
     /// refresh cycle never rescans the whole chain.
     oi_index: Mutex<HashMap<MarketId, (std::collections::HashSet<FixedBytes<32>>, u64)>>,
+    /// This process's own write-through record of every position it has
+    /// folded at least one fill into, keyed by `(portfolioKey, marketId)` —
+    /// consulted ahead of a fresh on-chain read once populated, see
+    /// `load_and_fold`'s own doc on why: this matcher is the sole writer of
+    /// these positions, but settlement broadcasts are async and never
+    /// awaited (`post_order`'s own doc on why), so two fills against the
+    /// same position landing before the first's settlement tx confirms
+    /// would otherwise both read the same stale on-chain collateral and
+    /// could double-release margin/PnL on a close. A key this process has
+    /// never folded before still falls back to the real on-chain read.
+    position_cache: Mutex<HashMap<PositionKey, PortfolioMarketState>>,
+    /// One `tokio::sync::Mutex` per `(portfolioKey, marketId)` a fold has
+    /// ever touched, held for the ENTIRE read-fold-write sequence in
+    /// `load_and_fold`/`post_liquidate` — see `lock_position`'s own doc on
+    /// why `position_cache` alone (a plain `std::sync::Mutex`, only ever
+    /// held for one lock-and-copy or one lock-and-insert at a time) isn't
+    /// sufficient by itself: two concurrent `/order` calls racing on the
+    /// SAME maker can each read the cache before either writes back,
+    /// lose-updating one fold's result. Confirmed live: this exact race
+    /// produced a real `InsufficientSealedCollateral` revert even after
+    /// `position_cache` existed, since the cache closed the stale-CHAIN-read
+    /// gap but not the stale-in-process-read gap.
+    position_locks: Mutex<HashMap<PositionKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Outcome of a taker's settlement broadcast, keyed by `(signer,
+    /// nonce)` — both already known to the client synchronously (the nonce
+    /// is client-generated), so this is what `GET
+    /// /settlement-status/:signer/:nonce` polls. `post_order`'s own
+    /// settlement `tokio::spawn` is genuinely fire-and-forget from the
+    /// trader's response (never awaited, see that spawn's own doc on why),
+    /// so the tx hash isn't available yet when `/order` itself responds —
+    /// this is what lets the frontend learn it a moment later instead of
+    /// never at all. `None` means the broadcast came back with no tx hash
+    /// (unconfigured RPC, or a real revert); absence from the map means
+    /// "still pending, or nothing ever crossed for this order" — the
+    /// caller can't tell those apart from this map alone, and doesn't need
+    /// to: `OrderResponse` already told it whether anything filled.
+    ///
+    /// Same unbounded-growth caveat as `last_nonce`'s own doc: nothing
+    /// prunes this map, an entry per settled order accumulates for the
+    /// life of the process.
+    settlement_tx_hashes: Mutex<HashMap<(Address, u64), Option<String>>>,
 }
 
 impl AppState {
@@ -533,8 +658,12 @@ impl AppState {
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
-            funding_samples: Mutex::new(HashMap::new()),
+            funding_index_native: Mutex::new(HashMap::new()),
+            funding_premium_history: Mutex::new(HashMap::new()),
             oi_index: Mutex::new(HashMap::new()),
+            position_cache: Mutex::new(HashMap::new()),
+            position_locks: Mutex::new(HashMap::new()),
+            settlement_tx_hashes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -563,8 +692,12 @@ impl AppState {
             settlement_contracts: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
-            funding_samples: Mutex::new(HashMap::new()),
+            funding_index_native: Mutex::new(HashMap::new()),
+            funding_premium_history: Mutex::new(HashMap::new()),
             oi_index: Mutex::new(HashMap::new()),
+            position_cache: Mutex::new(HashMap::new()),
+            position_locks: Mutex::new(HashMap::new()),
+            settlement_tx_hashes: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -651,39 +784,276 @@ impl AppState {
         }
     }
 
-    /// Refreshes both `funding_samples` and `oi_index` for every market
-    /// with a configured settlement contract — real on-chain reads
-    /// (`settle::load_funding_index`/`settle::index_open_interest`), not
-    /// derived from anything the matcher already tracks itself, so this
-    /// is meant to be called on a fixed interval (main.rs) same as
-    /// `poll_oracle_prices`, not per-request. A market whose RPC call
-    /// fails this cycle just keeps its last good sample/index rather
-    /// than losing history over one bad poll.
-    pub async fn poll_funding_and_oi(&self) {
-        const MAX_SAMPLES: usize = 30;
+    /// Basis-point clamp on the SMOOTHED (rolling-average, see
+    /// `poll_funding_native`) funding rate — a safety ceiling for tail
+    /// conditions, not the expected typical value. Sized against real
+    /// venues' actual operating range (Hyperliquid's realized funding runs
+    /// around 0.0004%, ~0.04bps, per hour) rather than the ±50bps this
+    /// crate started with, which was carried over unchanged from
+    /// `keeper-fx-rate.sh`'s differential-vs-EFFR use case and turned out
+    /// to be a real, ~1000x-oversized ceiling once actually applied
+    /// continuously to a live book premium: confirmed live in local dev,
+    /// where an unsmoothed, unclamped-enough reading was landing in the
+    /// tens of bps every poll, orders of magnitude past what any real
+    /// venue would ever charge.
+    const FUNDING_RATE_CLAMP_BPS: f64 = 5.0;
+
+    /// How many `poll_funding_native` cycles (`ORACLE_POLL_INTERVAL` apart,
+    /// `main.rs`) the rolling premium average spans — 1 hour's worth,
+    /// matching the funding-interval TWAP horizon real venues (Hyperliquid,
+    /// Binance-style) average their own premium over, for the same reason:
+    /// smooths out a single noisy snapshot instead of charging it directly.
+    const FUNDING_PREMIUM_WINDOW: usize = 720;
+
+    /// Accrues this crate's own `funding_index_native` for every market that
+    /// has both a live two-sided book (`self.books`) and a configured oracle
+    /// feed (`self.oracle_feed_mapping`) — the book-premium term
+    /// `local_dev.rs` used to approximate from outside this process over
+    /// HTTP before that was replaced by this, the real thing, computed where
+    /// the settlement decision (`realized_close_delta`) actually happens.
+    /// Fully self-sufficient: no external central-bank rate source needed.
+    ///
+    /// The raw top-of-book-vs-oracle premium is noisy on its own —
+    /// `market_maker.rs` deliberately quotes a real spread and inventory
+    /// skew, which alone can move the book mid several bps away from the
+    /// oracle with no real price divergence behind it. Real venues don't
+    /// charge an instantaneous snapshot either, for exactly this reason:
+    /// they average the premium over the whole funding interval first. This
+    /// keeps a trailing `funding_premium_history` window (unclamped, so a
+    /// deliberately volatile earlier price doesn't distort the average of
+    /// what actually happened around it) and charges the CLAMPED AVERAGE,
+    /// not the clamped instantaneous reading.
+    ///
+    /// The index accrues in this crate's own raw tick-scale units —
+    /// `required_margin`'s own doc explains why those are NOT the
+    /// contract's separate 1e18-scaled units, and funding here never
+    /// touches that on-chain value at all, so no conversion between the two
+    /// is ever needed.
+    ///
+    /// A market missing either ingredient this cycle just keeps its last
+    /// index unchanged — genuine "no signal," never an interpolated or
+    /// fabricated rate, same posture every other oracle-dependent path in
+    /// this crate already takes.
+    pub async fn poll_funding_native(&self) {
+        if self.oracle_feed_mapping.is_empty() {
+            return;
+        }
+        let market_ids: Vec<MarketId> = self.oracle_feed_mapping.keys().cloned().collect();
+        let oracle_ticks = live_mark_prices(self, &market_ids).await;
+        if oracle_ticks.is_empty() {
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the Unix epoch")
+            .as_secs();
+
+        for (market_id, oracle_tick) in oracle_ticks {
+            if oracle_tick == 0 {
+                continue;
+            }
+            let mid_tick = {
+                let books = self.books.lock().expect("books mutex poisoned");
+                match books.get(&market_id).map(|b| (b.best_bid(), b.best_ask())) {
+                    Some((Some(bid), Some(ask))) => (bid as u128 + ask as u128) / 2,
+                    _ => continue,
+                }
+            };
+
+            let raw_premium_bps = ((mid_tick as i128 - oracle_tick as i128) * 10_000) / oracle_tick as i128;
+            let raw_premium_bps = raw_premium_bps.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+
+            let rate_bps = {
+                let mut history =
+                    self.funding_premium_history.lock().expect("funding_premium_history mutex poisoned");
+                let samples = history.entry(market_id.clone()).or_default();
+                samples.push_back(raw_premium_bps);
+                while samples.len() > Self::FUNDING_PREMIUM_WINDOW {
+                    samples.pop_front();
+                }
+                // f64, not integer bps: a realistic average (real venues run
+                // well under 1 whole bps/hour) would floor to exactly 0
+                // under integer division, cosmetically indistinguishable
+                // from funding never having been wired up — see
+                // `funding_index_native`'s own doc on why that's a real bug
+                // this crate shipped once already.
+                let average = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
+                average.clamp(-Self::FUNDING_RATE_CLAMP_BPS, Self::FUNDING_RATE_CLAMP_BPS)
+            };
+
+            let mut index_map =
+                self.funding_index_native.lock().expect("funding_index_native mutex poisoned");
+            let entry = index_map.entry(market_id).or_insert((0.0, now, rate_bps));
+            let elapsed = now.saturating_sub(entry.1);
+            if elapsed > 0 {
+                // rate_bps is a per-hour rate; accrue continuously against
+                // however long actually elapsed since the last poll, same
+                // shape as `PerpMarket.sol`'s own deltaF * blocksElapsed.
+                let delta = entry.2 * (mid_tick as f64) * (elapsed as f64) / (10_000.0 * 3600.0);
+                entry.0 += delta;
+            }
+            entry.1 = now;
+            entry.2 = rate_bps;
+        }
+    }
+
+    /// One market's current native funding index (`funding_index_native`'s
+    /// doc), `0` if `poll_funding_native` hasn't produced one yet — the
+    /// same "no signal yet" default a freshly-opened position's own
+    /// `entry_funding_index` gets, so a fill on a market with no funding
+    /// history yet simply charges no funding rather than erroring.
+    pub fn funding_index_for(&self, market_id: &str) -> i128 {
+        self.funding_index_native
+            .lock()
+            .expect("funding_index_native mutex poisoned")
+            .get(market_id)
+            .map(|(index, ..)| index.round() as i128)
+            .unwrap_or(0)
+    }
+
+    /// Point-in-time snapshot of every market's current native funding
+    /// index (`funding_index_native`'s doc), for callers (liquidation
+    /// leg-sizing, the voluntary-close path) that need a consistent read
+    /// across several markets without holding the lock across `.await`
+    /// points.
+    pub fn funding_indices_snapshot(&self) -> HashMap<MarketId, i128> {
+        self.funding_index_native
+            .lock()
+            .expect("funding_index_native mutex poisoned")
+            .iter()
+            .map(|(market_id, (index, ..))| (market_id.clone(), index.round() as i128))
+            .collect()
+    }
+
+    /// Locks, reads (cache-first, falling back to a real on-chain read only
+    /// for a key this process has never folded before), folds `fill` into
+    /// the result, and writes the outcome back to `position_cache` — all
+    /// under one critical section, so two fills against the SAME position
+    /// (two different `/order` calls racing on the same maker, or one
+    /// taker sweep crossing that maker at more than one price level) can
+    /// never both compute their `collateral_delta` off the same stale
+    /// starting state. Returns the fill's own `collateral_delta`
+    /// contribution plus `extra_delta` (the taker's own per-fill fee,
+    /// `I256::ZERO` for a maker leg) — `realized_close_delta`'s
+    /// doc/`PositionFold`'s doc for what the fold itself covers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_and_fold(
+        &self,
+        portfolio_key: FixedBytes<32>,
+        market_id: &str,
+        fill_is_buy: bool,
+        fill_price: u64,
+        fill_qty: u64,
+        current_funding_index: i128,
+        default_leverage: u64,
+        extra_delta: I256,
+    ) -> I256 {
+        let cache_key = (portfolio_key, market_id.to_string());
+        // Held for this whole function: `lock_position`'s own doc on why
+        // locking `position_cache` alone, twice, separately, isn't enough.
+        let _guard = self.lock_position(portfolio_key, market_id).await;
+
+        let existing = load_single_market_state_cached(self, portfolio_key, market_id).await;
+
+        let mut fold = PositionFold::from_existing(existing.as_ref(), default_leverage);
+        let delta = fold.apply_fill(fill_is_buy, fill_price, fill_qty, current_funding_index) + extra_delta;
+        fold.collateral += extra_delta;
+
+        let mut cache = self.position_cache.lock().expect("position_cache mutex poisoned");
+        if fold.signed_size == 0 {
+            cache.remove(&cache_key);
+        } else {
+            cache.insert(
+                cache_key,
+                PortfolioMarketState {
+                    market_id: market_id.to_string(),
+                    signed_size: fold.signed_size,
+                    entry_price: fold.entry_price,
+                    collateral: fold.collateral,
+                    leverage: fold.leverage,
+                    take_profit: fold.take_profit,
+                    stop_loss: fold.stop_loss,
+                    entry_funding_index: fold.entry_funding_index,
+                },
+            );
+        }
+        delta
+    }
+
+    /// Returns (creating on first use) the one `tokio::sync::Mutex` for a
+    /// `(portfolioKey, marketId)` key, and locks it — `position_locks`'s
+    /// own doc on why this exists: `position_cache` is a plain
+    /// `std::sync::Mutex`, never held across an `.await`, so a
+    /// read-then-later-write sequence built only from separate lock/unlock
+    /// pairs (what `load_and_fold` used to be) can still interleave two
+    /// concurrent callers on the same key. This lock is what actually
+    /// makes that whole sequence atomic.
+    async fn lock_position(
+        &self,
+        portfolio_key: FixedBytes<32>,
+        market_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = (portfolio_key, market_id.to_string());
+        let mutex = {
+            let mut locks = self.position_locks.lock().expect("position_locks mutex poisoned");
+            locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        mutex.lock_owned().await
+    }
+
+    /// Evicts one `(portfolioKey, marketId)` from `position_cache` — call
+    /// this whenever a settlement broadcast for that key comes back known
+    /// to have failed (`post_order`'s own doc on why broadcasts can fail
+    /// and nothing rolls back the in-memory match today). Without this, the
+    /// cache stays confidently wrong forever after one dropped
+    /// transaction: every later fold on that key computes off a collateral
+    /// figure that was never actually written on-chain, which is exactly
+    /// what produced a real `InsufficientSealedCollateral` revert live
+    /// (two different markets under one portfolio, both several minutes
+    /// after an earlier concurrent settlement had silently failed to land).
+    /// This doesn't fix WHY a broadcast can fail (the underlying same-signer
+    /// nonce race `settle.rs` already documents, still open, still tracked
+    /// as its own follow-up) — it just stops one failure from permanently
+    /// poisoning every fold after it, by falling back to a real on-chain
+    /// read next time instead.
+    pub fn invalidate_position(&self, portfolio_key: FixedBytes<32>, market_id: &str) {
+        let mut cache = self.position_cache.lock().expect("position_cache mutex poisoned");
+        cache.remove(&(portfolio_key, market_id.to_string()));
+    }
+
+    /// The `SealedParams` `load_and_fold` would currently write for one
+    /// `(portfolioKey, marketId)`, or `None` if that key isn't cached (never
+    /// folded, or folded down to flat) — the final read after a sweep of
+    /// `load_and_fold` calls that produces the ONE `SealedParams` blob
+    /// actually sealed and submitted (`settleTakerSweep`'s own doc: only the
+    /// last write matters).
+    pub fn cached_sealed_params(
+        &self,
+        portfolio_key: FixedBytes<32>,
+        market_id: &str,
+    ) -> Option<SealedParams> {
+        let cache = self.position_cache.lock().expect("position_cache mutex poisoned");
+        cache.get(&(portfolio_key, market_id.to_string())).map(|m| SealedParams {
+            side_is_buy: m.signed_size > 0,
+            entry_price: m.entry_price,
+            size: m.signed_size.unsigned_abs() as u64,
+            leverage: m.leverage,
+            take_profit: m.take_profit,
+            stop_loss: m.stop_loss,
+            entry_funding_index: m.entry_funding_index,
+        })
+    }
+
+    /// Refreshes `oi_index` for every market with a configured settlement
+    /// contract — a real on-chain read (`settle::index_open_interest`), not
+    /// derived from anything the matcher already tracks itself, so this is
+    /// meant to be called on a fixed interval (main.rs), not per-request. A
+    /// market whose RPC call fails this cycle just keeps its last good
+    /// index rather than losing history over one bad poll.
+    pub async fn poll_open_interest(&self) {
         for (market_id, contract) in &self.settlement_contracts {
             let market_hash = keccak256(market_id.as_bytes());
-
-            // The stored index only advances when something checkpoints it
-            // on-chain (see checkpoint_funding_index's own doc) — without
-            // this, load_funding_index below would keep reading the same
-            // frozen value every cycle whenever no trade/position event
-            // happens to trigger one incidentally.
-            crate::settle::checkpoint_funding_index(&self.settlement_signer, market_hash, Some(*contract))
-                .await;
-
-            if let Ok(index) = crate::settle::load_funding_index(market_hash, Some(*contract)).await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before the Unix epoch")
-                    .as_secs();
-                let mut samples = self.funding_samples.lock().expect("funding_samples mutex poisoned");
-                let series = samples.entry(market_id.clone()).or_default();
-                series.push_back((now, index));
-                while series.len() > MAX_SAMPLES {
-                    series.pop_front();
-                }
-            }
 
             let from_block = {
                 let oi = self.oi_index.lock().expect("oi_index mutex poisoned");
@@ -716,6 +1086,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/trades/:market_id", get(get_trades))
         .route("/funding/:market_id", get(get_funding))
         .route("/oi/:market_id", get(get_open_interest))
+        .route("/settlement-status/:signer/:nonce", get(get_settlement_status))
         .route("/debug/seed-history", post(post_debug_seed_history))
         .with_state(state)
 }
@@ -775,6 +1146,10 @@ async fn post_order(
         last_nonce.insert(signer, payload.nonce);
     }
 
+    if payload.tick > MAX_SANE_TICK {
+        return Err(ApiError::InvalidTick { tick: payload.tick });
+    }
+
     let owner = signer_owner_id(signer);
     state.owner_addresses.lock().expect("owner_addresses mutex poisoned").insert(owner, signer);
 
@@ -792,10 +1167,16 @@ async fn post_order(
         .expect("system clock before the Unix epoch")
         .as_secs();
 
-    let mut books = state.books.lock().expect("books mutex poisoned");
-    let book = books.entry(payload.market_id.clone()).or_default();
-    let mut result = book.submit(order, now);
-    drop(books);
+    // Scoped in its own block, not just `drop()`'d: this function's fill
+    // loop below has a real `.await` in it now (the voluntary-close path's
+    // position reads), and a lexical block is what reliably ends a
+    // `MutexGuard`'s live range for the async-fn Send analysis — a bare
+    // `drop()` call has been seen not to, in exactly this shape.
+    let mut result = {
+        let mut books = state.books.lock().expect("books mutex poisoned");
+        let book = books.entry(payload.market_id.clone()).or_default();
+        book.submit(order, now)
+    };
 
     // Backstop maker: consulted for demand that would otherwise go
     // PERMANENTLY unserved -- an IOC leftover (book.rs silently drops it,
@@ -921,10 +1302,15 @@ async fn post_order(
     broadcast_orderbook_update(&state, &payload.market_id);
 
     let taker_is_buy = matches!(payload.side, OrderSide::Buy);
+    // Derived up front (not just inside the `!maker_legs.is_empty()` guard
+    // below, where it used to live): every fill below folds into the
+    // taker's own position via `state.load_and_fold`, keyed by this.
+    let taker_portfolio_key = portfolio_key(&state.portfolio_key_secret, signer);
+    let current_funding_index = state.funding_index_for(&payload.market_id);
+    let mut taker_collateral_delta = I256::ZERO;
+
     let mut maker_legs = Vec::with_capacity(result.fills.len());
-    let mut taker_total_qty: u128 = 0;
     let mut taker_weighted_price: u128 = 0;
-    let mut taker_total_margin: u128 = 0;
     // Priced once against volume BEFORE this sweep (fees.rs's own doc: a
     // trader can't buy a better rate on the same trade that earns it), then
     // applied per-fill below at that one fixed tier for the whole sweep.
@@ -945,9 +1331,18 @@ async fn post_order(
             });
         }
 
-        let Some(&maker_address) =
-            state.owner_addresses.lock().expect("owner_addresses mutex poisoned").get(&fill.maker_owner)
-        else {
+        // The lock is taken in its own block, not directly in the
+        // `let-else` scrutinee below: a `let-else`'s scrutinee temporaries
+        // are extended to the end of the enclosing block (not just this
+        // statement), which would otherwise hold this `MutexGuard` live
+        // across `build_maker_leg`'s `.await` further down and make this
+        // whole handler's future non-`Send` (axum requires `Send` futures,
+        // this doesn't just fail silently — the router itself won't compile).
+        let maker_address = {
+            let owners = state.owner_addresses.lock().expect("owner_addresses mutex poisoned");
+            owners.get(&fill.maker_owner).copied()
+        };
+        let Some(maker_address) = maker_address else {
             // Can't happen in practice: a resting order's owner is always
             // registered before it can rest. Settling nothing is safer
             // than settling against a wrong/zero address.
@@ -956,8 +1351,7 @@ async fn post_order(
         };
 
         let maker_leg = build_maker_leg(
-            &state.sealed_key,
-            &state.portfolio_key_secret,
+            &state,
             signer,
             payload.nonce,
             fill_index,
@@ -967,7 +1361,9 @@ async fn post_order(
             taker_is_buy,
             fill.maker_owner,
             maker_address,
-        );
+            current_funding_index,
+        )
+        .await;
 
         {
             let mut index = state.portfolio_markets.lock().expect("portfolio_markets mutex poisoned");
@@ -975,10 +1371,26 @@ async fn post_order(
         }
 
         let notional = fill.tick as u128 * fill.qty as u128;
-        taker_total_qty += fill.qty as u128;
         taker_weighted_price += notional;
-        taker_total_margin +=
-            required_margin(fill.tick, fill.qty) + crate::fees::taker_fee(notional, taker_prior_volume);
+        // Fee always raises `collateral_delta` (matches the pre-fold
+        // convention: `required_margin + fee` both raised
+        // `collateral_delta_taker` on an open) — on an open that means
+        // more locked, on a close it means less released back, but never
+        // flips which direction the delta points.
+        let fee =
+            I256::try_from(crate::fees::taker_fee(notional, taker_prior_volume)).expect("fee fits in I256");
+        taker_collateral_delta += state
+            .load_and_fold(
+                taker_portfolio_key,
+                &payload.market_id,
+                taker_is_buy,
+                fill.tick,
+                fill.qty,
+                current_funding_index,
+                payload.leverage,
+                fee,
+            )
+            .await;
         maker_legs.push(maker_leg);
     }
 
@@ -1018,18 +1430,9 @@ async fn post_order(
     }
 
     if !maker_legs.is_empty() {
-        // VWAP entry price across every fill in this sweep, since the taker's
-        // one sealed leg must represent the whole order, not just one fill.
-        let taker_entry_price = (taker_weighted_price / taker_total_qty) as u64;
-        let taker_params = SealedParams {
-            side_is_buy: taker_is_buy,
-            entry_price: taker_entry_price,
-            size: taker_total_qty as u64,
-            leverage: payload.leverage,
-            take_profit: None,
-            stop_loss: None,
-        };
-        let taker_portfolio_key = portfolio_key(&state.portfolio_key_secret, signer);
+        // taker_portfolio_key was derived above, before this loop, and each
+        // fill folded into it via state.load_and_fold — this reads back
+        // whatever that sweep of folds left in the cache.
         // Debug-only, deliberately not info!: logging the signer/portfolioKey
         // link at a level anyone running with default settings sees would
         // undercut the exact unlinkability `portfolio_key`'s own doc
@@ -1039,11 +1442,18 @@ async fn post_order(
         // boundary). Useful for exactly this kind of local operator-side
         // debugging/testing, not meant for a production log stream.
         tracing::debug!(signer = %signer, portfolio_key = %taker_portfolio_key, "derived taker portfolio_key");
+        let sealed_params_taker = match state.cached_sealed_params(taker_portfolio_key, &payload.market_id) {
+            Some(params) => Bytes::from(state.sealed_key.seal(&params)),
+            // The sweep closed the taker's position flat (or the taker had
+            // none and this fold never opened one) — same "empty means no
+            // position" convention `load_single_market_state` reads back.
+            None => Bytes::new(),
+        };
         let sweep = crate::settle::TakerSweep {
             market_id: keccak256(payload.market_id.as_bytes()),
             portfolio_key_taker: taker_portfolio_key,
-            collateral_delta_taker: I256::try_from(taker_total_margin).expect("margin fits in I256"),
-            sealed_params_taker: Bytes::from(state.sealed_key.seal(&taker_params)),
+            collateral_delta_taker: taker_collateral_delta,
+            sealed_params_taker,
             maker_legs,
         };
 
@@ -1054,6 +1464,9 @@ async fn post_order(
 
         let contract = state.settlement_contracts.get(&payload.market_id).copied();
         let state_for_settlement = state.clone();
+        let market_id_for_settlement = payload.market_id.clone();
+        let signer_for_settlement = signer;
+        let nonce_for_settlement = payload.nonce;
         // Never awaited: settlement is async network I/O (or a no-op
         // when unconfigured, see settle.rs), not something the trader's
         // response should wait on.
@@ -1080,9 +1493,29 @@ async fn post_order(
             let result =
                 crate::settle::settle_taker_sweep(&state_for_settlement.settlement_signer, &sweep, contract)
                     .await;
-            if let Some(tx_hash) = result.broadcast_tx_hash {
-                tracing::info!(tx_hash = %tx_hash, market_id = %sweep.market_id, "taker sweep settled on-chain");
-            }
+            let tx_hash_string = match &result.broadcast_tx_hash {
+                Some(tx_hash) => {
+                    tracing::info!(tx_hash = %tx_hash, market_id = %sweep.market_id, "taker sweep settled on-chain");
+                    Some(tx_hash.to_string())
+                }
+                // See `invalidate_position`'s own doc: a failed broadcast
+                // means every leg below never actually landed, so the cache
+                // must forget them too, not keep asserting they did.
+                None => {
+                    state_for_settlement
+                        .invalidate_position(sweep.portfolio_key_taker, &market_id_for_settlement);
+                    for leg in &sweep.maker_legs {
+                        state_for_settlement
+                            .invalidate_position(leg.portfolio_key, &market_id_for_settlement);
+                    }
+                    None
+                }
+            };
+            state_for_settlement
+                .settlement_tx_hashes
+                .lock()
+                .expect("settlement_tx_hashes mutex poisoned")
+                .insert((signer_for_settlement, nonce_for_settlement), tx_hash_string);
         });
     }
 
@@ -1115,6 +1548,10 @@ async fn post_offer(
             }
         }
         last_nonce.insert(signer, payload.nonce);
+    }
+
+    if payload.tick > MAX_SANE_TICK {
+        return Err(ApiError::InvalidTick { tick: payload.tick });
     }
 
     let owner = signer_owner_id(signer);
@@ -1187,6 +1624,15 @@ async fn post_portfolio_key(
 /// WebSocket push. A market that has never seen an order isn't an error,
 /// it just yields an empty snapshot (see `OrderBookResponse`'s doc).
 fn build_orderbook_response(state: &AppState, market_id: &MarketId, levels: usize) -> OrderBookResponse {
+    build_orderbook_response_grouped(state, market_id, levels, 1)
+}
+
+fn build_orderbook_response_grouped(
+    state: &AppState,
+    market_id: &MarketId,
+    levels: usize,
+    group: u64,
+) -> OrderBookResponse {
     let snapshot: BookSnapshot = {
         let books = state.books.lock().expect("books mutex poisoned");
         books.get(market_id).map(|book| book.snapshot(levels)).unwrap_or_default()
@@ -1199,8 +1645,8 @@ fn build_orderbook_response(state: &AppState, market_id: &MarketId, levels: usiz
         market_id: market_id.clone(),
         best_bid: snapshot.best_bid,
         best_ask: snapshot.best_ask,
-        bids: snapshot.bids,
-        asks: snapshot.asks,
+        bids: group_levels(&snapshot.bids, group),
+        asks: group_levels(&snapshot.asks, group),
         market,
     }
 }
@@ -1225,7 +1671,8 @@ async fn get_orderbook(
     Query(query): Query<DepthQuery>,
 ) -> Json<OrderBookResponse> {
     let levels = query.levels.unwrap_or(DEFAULT_DEPTH_LEVELS).clamp(1, MAX_DEPTH_LEVELS);
-    Json(build_orderbook_response(&state, &market_id, levels))
+    let group = query.group.unwrap_or(1).max(1);
+    Json(build_orderbook_response_grouped(&state, &market_id, levels, group))
 }
 
 /// Real server-side indexing, not client-side mock generation: buckets
@@ -1289,18 +1736,17 @@ async fn get_trades(
 #[derive(Debug, Serialize)]
 struct FundingResponse {
     market_id: MarketId,
-    /// The raw cumulative index this market's contract is currently at
-    /// (1e18-scaled, `PerpMarket.sol`/`FxPerpMarket.sol`'s own
-    /// convention) — `None` if no settlement contract is configured for
-    /// this market_id (`configure_settlement_contract` never called).
+    /// This crate's own tick-scale cumulative funding index (see
+    /// `AppState::funding_index_native`'s doc) — the actual number
+    /// `realized_close_delta` charges against a closing position, not a
+    /// display-only mirror of anything on-chain. `None` until
+    /// `poll_funding_native` has run at least one successful cycle for
+    /// this market (needs a live two-sided book and a configured oracle
+    /// feed).
     funding_index: Option<i128>,
-    /// Basis points per hour, derived from the oldest-vs-newest sample
-    /// in the trailing window (`AppState::poll_funding_and_oi`) — `None`
-    /// until at least two samples exist. Exact for FxPerpMarket (its
-    /// index accrues by real wall-clock seconds); a stated
-    /// approximation for PerpMarket-family markets, which accrue by
-    /// BLOCK count, not seconds — see `settle::load_funding_index`'s own
-    /// doc.
+    /// The most recently computed funding rate, basis points per hour,
+    /// clamped +-50bps — the real rate driving `funding_index` above, not
+    /// derived after the fact from a trailing sample window.
     rate_1h_bps: Option<f64>,
 }
 
@@ -1308,28 +1754,58 @@ async fn get_funding(
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<MarketId>,
 ) -> Json<FundingResponse> {
-    if !state.settlement_contracts.contains_key(&market_id) {
-        return Json(FundingResponse { market_id, funding_index: None, rate_1h_bps: None });
-    }
+    let index_map = state.funding_index_native.lock().expect("funding_index_native mutex poisoned");
+    let entry = index_map.get(&market_id);
+    Json(FundingResponse {
+        market_id,
+        funding_index: entry.map(|(index, ..)| index.round() as i128),
+        // Rounded to 1/100th of a bp on the wire: full f64 precision is
+        // kept internally (`funding_index_native`'s doc on why that
+        // matters for real accrual), but nothing downstream needs more
+        // than that for display, and an un-rounded division like
+        // AUD/USD's 1/7 here would otherwise ship 15 raw decimal digits.
+        rate_1h_bps: entry.map(|(_, _, rate_bps)| (*rate_bps * 100.0).round() / 100.0),
+    })
+}
 
-    let samples = state.funding_samples.lock().expect("funding_samples mutex poisoned");
-    let series = samples.get(&market_id);
-    let funding_index = series.and_then(|s| s.back()).map(|(_, index)| *index);
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SettlementStatusResponse {
+    /// The taker sweep's own `tokio::spawn` (`post_order`'s doc on why it's
+    /// never awaited) hasn't resolved yet, or this signer/nonce pair never
+    /// triggered a fill at all (a purely-resting order settles nothing).
+    /// The client can't tell those two apart from this alone — same
+    /// "keep polling a bit, then give up" posture that's fine either way.
+    Pending,
+    Confirmed {
+        tx_hash: String,
+    },
+    /// The broadcast came back with no tx hash — a real revert, or no
+    /// `SETTLEMENT_RPC_URL`/contract configured for this market (see
+    /// `settle::settle_taker_sweep`'s own doc on both cases).
+    Failed,
+}
 
-    let rate_1h_bps = series.and_then(|s| {
-        let (t0, i0) = *s.front()?;
-        let (t1, i1) = *s.back()?;
-        if t1 <= t0 {
-            return None;
-        }
-        let elapsed = (t1 - t0) as f64;
-        let delta = (i1 - i0) as f64;
-        // delta is 1e18-scaled per `elapsed` seconds; per-hour bps:
-        // (delta / elapsed) * 3600 seconds/hour * 10_000 bps / 1e18 scale.
-        Some((delta / elapsed) * 3600.0 * 10_000.0 / 1e18)
-    });
-
-    Json(FundingResponse { market_id, funding_index, rate_1h_bps })
+/// Polled by the frontend after a `filled` `/order` response to learn the
+/// real settlement tx hash once it exists (`settlement_tx_hashes`'s own
+/// doc on why this can't just be part of `/order`'s own response — the
+/// broadcast hasn't happened yet when that response is sent). `signer`/
+/// `nonce` are both already known to the client synchronously: `signer` is
+/// its own connected address, `nonce` is the one it generated for this
+/// exact order.
+async fn get_settlement_status(
+    State(state): State<Arc<AppState>>,
+    Path((signer, nonce)): Path<(String, u64)>,
+) -> Result<Json<SettlementStatusResponse>, (StatusCode, String)> {
+    let signer: Address =
+        signer.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad signer: {e}")))?;
+    let hashes = state.settlement_tx_hashes.lock().expect("settlement_tx_hashes mutex poisoned");
+    let response = match hashes.get(&(signer, nonce)) {
+        Some(Some(tx_hash)) => SettlementStatusResponse::Confirmed { tx_hash: tx_hash.clone() },
+        Some(None) => SettlementStatusResponse::Failed,
+        None => SettlementStatusResponse::Pending,
+    };
+    Ok(Json(response))
 }
 
 #[derive(Debug, Serialize)]
@@ -1485,21 +1961,28 @@ async fn ws_orderbook(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<MarketId>,
+    Query(query): Query<DepthQuery>,
 ) -> Response {
-    ws.on_upgrade(move |socket| stream_orderbook(socket, state, market_id))
+    let group = query.group.unwrap_or(1).max(1);
+    ws.on_upgrade(move |socket| stream_orderbook(socket, state, market_id, group))
 }
 
 /// Sends an immediate snapshot on connect (a fresh subscriber shouldn't
 /// have to wait for the next mutation to see the current book), then
 /// forwards every subsequent `broadcast_orderbook_update` for this market
-/// until the client disconnects or the channel closes.
-async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id: MarketId) {
+/// until the client disconnects or the channel closes. `group` (from the
+/// upgrade request's own `?group=` query param, fixed for this socket's
+/// lifetime) is applied here, per-connection, on top of the shared
+/// per-market broadcast channel — the channel itself always carries the
+/// raw ungrouped ladder, so two subscribers picking different grouping
+/// each see their own bucketing without needing separate channels.
+async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id: MarketId, group: u64) {
     let mut updates = {
         let mut senders = state.book_updates.lock().expect("book_updates mutex poisoned");
         senders.entry(market_id.clone()).or_insert_with(|| broadcast::channel(64).0).subscribe()
     };
 
-    let initial = build_orderbook_response(&state, &market_id, DEFAULT_DEPTH_LEVELS);
+    let initial = build_orderbook_response_grouped(&state, &market_id, DEFAULT_DEPTH_LEVELS, group);
     let Ok(initial_text) = serde_json::to_string(&initial) else { return };
     if socket.send(Message::Text(initial_text)).await.is_err() {
         return;
@@ -1509,7 +1992,9 @@ async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id
         tokio::select! {
             update = updates.recv() => {
                 match update {
-                    Ok(response) => {
+                    Ok(mut response) => {
+                        response.bids = group_levels(&response.bids, group);
+                        response.asks = group_levels(&response.asks, group);
                         let Ok(text) = serde_json::to_string(&response) else { continue };
                         if socket.send(Message::Text(text)).await.is_err() {
                             break;
@@ -1535,6 +2020,7 @@ async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id
 /// both `/liquidation-check` (read-only) and `/liquidate` (which also
 /// needs each market's own raw collateral to build closing legs) require
 /// from a single load-and-unseal pass.
+#[derive(Clone)]
 struct PortfolioMarketState {
     market_id: MarketId,
     signed_size: i128,
@@ -1556,6 +2042,10 @@ struct PortfolioMarketState {
     leverage: u64,
     take_profit: Option<u64>,
     stop_loss: Option<u64>,
+    /// This position's own `SealedParams.entry_funding_index` stamp, see
+    /// that field's doc — the baseline `realized_close_delta` measures
+    /// `AppState::funding_index_native`'s current value against.
+    entry_funding_index: i128,
 }
 
 /// Loads, reads, and unseals every market a `portfolioKey` is known to
@@ -1586,38 +2076,80 @@ async fn load_portfolio_state(
 
     let mut result = Vec::with_capacity(markets.len());
     for market_id in &markets {
-        let market_hash = keccak256(market_id.as_bytes());
-        let contract = state.settlement_contracts.get(market_id).copied();
-        let sealed = match crate::settle::load_sealed(portfolio_key, market_hash, contract).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, market_id, "failed to read sealed position, skipping");
-                continue;
-            }
-        };
-        if sealed.sealed_params.is_empty() {
-            continue;
+        if let Some(state_for_market) = load_single_market_state_cached(state, portfolio_key, market_id).await
+        {
+            result.push(state_for_market);
         }
-        let params = match state.sealed_key.unseal(&sealed.sealed_params) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(error = %e, market_id, "failed to unseal position, skipping");
-                continue;
-            }
-        };
-
-        let signed_size: i128 = if params.side_is_buy { params.size as i128 } else { -(params.size as i128) };
-        result.push(PortfolioMarketState {
-            market_id: market_id.clone(),
-            signed_size,
-            entry_price: params.entry_price,
-            collateral: sealed.collateral,
-            leverage: params.leverage,
-            take_profit: params.take_profit,
-            stop_loss: params.stop_loss,
-        });
     }
     result
+}
+
+/// One market's read-and-unseal for one `portfolioKey`, the single-market
+/// building block `load_portfolio_state` folds over every known market —
+/// used directly by the voluntary-close path (`post_order`'s fill loop),
+/// which only ever needs to know about the ONE market a fill just traded,
+/// not a trader's whole portfolio. `None` for a market this process never
+/// settled a fill for, or whose sealed read/unseal fails — same "skip, don't
+/// fail the caller" posture as `load_portfolio_state`'s own loop.
+/// Cache-first version of `load_single_market_state`: consults
+/// `AppState::position_cache` before falling back to the real on-chain
+/// read, same posture `load_and_fold` already uses. Needed so
+/// `/liquidation-check`/`/liquidate` (via `load_portfolio_state`, which
+/// calls this per market) see a position this process just folded a fill
+/// into but whose settlement transaction hasn't confirmed on-chain yet —
+/// without this, a liquidation check right after a real open/add could
+/// read stale chain state and wrongly conclude there's nothing to check.
+async fn load_single_market_state_cached(
+    state: &AppState,
+    portfolio_key: FixedBytes<32>,
+    market_id: &str,
+) -> Option<PortfolioMarketState> {
+    let cached = {
+        let cache = state.position_cache.lock().expect("position_cache mutex poisoned");
+        cache.get(&(portfolio_key, market_id.to_string())).cloned()
+    };
+    match cached {
+        Some(cached_state) => Some(cached_state),
+        None => load_single_market_state(state, portfolio_key, market_id).await,
+    }
+}
+
+async fn load_single_market_state(
+    state: &AppState,
+    portfolio_key: FixedBytes<32>,
+    market_id: &str,
+) -> Option<PortfolioMarketState> {
+    let market_hash = keccak256(market_id.as_bytes());
+    let contract = state.settlement_contracts.get(market_id).copied();
+    let sealed = match crate::settle::load_sealed(portfolio_key, market_hash, contract).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, market_id, "failed to read sealed position, skipping");
+            return None;
+        }
+    };
+    if sealed.sealed_params.is_empty() {
+        return None;
+    }
+    let params = match state.sealed_key.unseal(&sealed.sealed_params) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, market_id, "failed to unseal position, skipping");
+            return None;
+        }
+    };
+
+    let signed_size: i128 = if params.side_is_buy { params.size as i128 } else { -(params.size as i128) };
+    Some(PortfolioMarketState {
+        market_id: market_id.to_string(),
+        signed_size,
+        entry_price: params.entry_price,
+        collateral: sealed.collateral,
+        leverage: params.leverage,
+        take_profit: params.take_profit,
+        stop_loss: params.stop_loss,
+        entry_funding_index: params.entry_funding_index,
+    })
 }
 
 /// Fetches a live Pyth price (`oracle.rs`) for every market in
@@ -1789,10 +2321,21 @@ const LIQUIDATION_SAFETY_BUFFER_BPS: u128 = 1_000; // 10%
 /// whenever a partial close wouldn't leave anything meaningful open: `f`
 /// resolves to >=100%, or a leg's own size is too small to split without
 /// rounding its "remaining" side to zero anyway.
+/// `live_prices`/`funding_indices` are point-in-time snapshots
+/// (`live_mark_prices`/`AppState::funding_indices_snapshot`) — a market
+/// missing from either falls back to this position's own sealed entry
+/// price / entry funding index, i.e. exactly zero spot/funding PnL for
+/// that one leg, same "degrade to no signal, never fabricate" posture
+/// `compute_margin` already uses for its own live-price lookup.
+#[allow(clippy::too_many_arguments)]
 fn size_liquidation_legs(
+    state: &AppState,
+    portfolio_key: FixedBytes<32>,
     market_states: &[PortfolioMarketState],
     margin: &risk::MarginResult,
     sealed_key: &crate::sealed::SealedKey,
+    live_prices: &HashMap<MarketId, u128>,
+    funding_indices: &HashMap<MarketId, i128>,
 ) -> (Vec<crate::settle::LiquidationLegDelta>, u128) {
     let margin_requirement = margin.margin_requirement;
     let effective_collateral = margin.effective_collateral;
@@ -1810,13 +2353,35 @@ fn size_liquidation_legs(
         .iter()
         .map(|m| {
             let market_hash = keccak256(m.market_id.as_bytes());
-            let collateral_u128 = i128::try_from(m.collateral).unwrap_or(0).max(0) as u128;
             let size_abs = m.signed_size.unsigned_abs();
+            let current_tick = live_prices.get(&m.market_id).copied().unwrap_or(m.entry_price as u128) as u64;
+            let current_funding_index =
+                funding_indices.get(&m.market_id).copied().unwrap_or(m.entry_funding_index);
+
+            // Every branch below writes its outcome into `position_cache`
+            // too (remove on a full close, replace on a partial one) —
+            // without this, a fold shortly after this liquidation (e.g. the
+            // trader immediately reopening) would read the cache's
+            // pre-liquidation state instead of what this leg actually left
+            // behind, same staleness problem `load_and_fold`'s own doc
+            // describes for concurrent fills.
+            let cache_key = (portfolio_key, m.market_id.clone());
 
             if close_bps >= 10_000 || size_abs == 0 {
+                let close_size = size_abs.min(u64::MAX as u128) as u64;
+                let delta = realized_close_delta(
+                    m.signed_size,
+                    m.entry_price,
+                    m.collateral,
+                    m.entry_funding_index,
+                    close_size,
+                    current_tick,
+                    current_funding_index,
+                );
+                state.position_cache.lock().expect("position_cache mutex poisoned").remove(&cache_key);
                 return crate::settle::LiquidationLegDelta {
                     market_id: market_hash,
-                    collateral_delta: -m.collateral,
+                    collateral_delta: delta,
                     sealed_params: Bytes::new(),
                 };
             }
@@ -1824,27 +2389,67 @@ fn size_liquidation_legs(
             let close_size = size_abs * close_bps / 10_000;
             let remaining_size = size_abs - close_size;
             if close_size == 0 || remaining_size == 0 {
+                let close_size = size_abs.min(u64::MAX as u128) as u64;
+                let delta = realized_close_delta(
+                    m.signed_size,
+                    m.entry_price,
+                    m.collateral,
+                    m.entry_funding_index,
+                    close_size,
+                    current_tick,
+                    current_funding_index,
+                );
+                state.position_cache.lock().expect("position_cache mutex poisoned").remove(&cache_key);
                 return crate::settle::LiquidationLegDelta {
                     market_id: market_hash,
-                    collateral_delta: -m.collateral,
+                    collateral_delta: delta,
                     sealed_params: Bytes::new(),
                 };
             }
 
-            let freed_collateral = collateral_u128 * close_size / size_abs;
+            // forge-lint style cast note: close_size/remaining_size < size_abs <= u64::MAX by construction.
+            let delta = realized_close_delta(
+                m.signed_size,
+                m.entry_price,
+                m.collateral,
+                m.entry_funding_index,
+                close_size as u64,
+                current_tick,
+                current_funding_index,
+            );
+            let remaining_signed_size: i128 =
+                if m.signed_size >= 0 { remaining_size as i128 } else { -(remaining_size as i128) };
+            let remaining_collateral = m.collateral + delta;
             let remaining_params = crate::sealed::SealedParams {
                 side_is_buy: m.signed_size > 0,
                 entry_price: m.entry_price,
-                // forge-lint style cast note: remaining_size < size_abs <= u64::MAX by construction.
                 size: remaining_size as u64,
                 leverage: m.leverage,
                 take_profit: m.take_profit,
                 stop_loss: m.stop_loss,
+                // The remaining, still-open portion keeps its own original
+                // entry stamp: only the closed portion above realized PnL,
+                // the remainder's unrealized funding keeps accruing from
+                // where it always was.
+                entry_funding_index: m.entry_funding_index,
             };
+            state.position_cache.lock().expect("position_cache mutex poisoned").insert(
+                cache_key,
+                PortfolioMarketState {
+                    market_id: m.market_id.clone(),
+                    signed_size: remaining_signed_size,
+                    entry_price: m.entry_price,
+                    collateral: remaining_collateral,
+                    leverage: m.leverage,
+                    take_profit: m.take_profit,
+                    stop_loss: m.stop_loss,
+                    entry_funding_index: m.entry_funding_index,
+                },
+            );
 
             crate::settle::LiquidationLegDelta {
                 market_id: market_hash,
-                collateral_delta: -I256::try_from(freed_collateral).unwrap_or(I256::ZERO),
+                collateral_delta: delta,
                 sealed_params: Bytes::from(sealed_key.seal(&remaining_params)),
             }
         })
@@ -1869,12 +2474,33 @@ async fn post_liquidate(
     let liquidator: Address =
         request.liquidator.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad liquidator: {e}")))?;
 
-    let market_states = load_portfolio_state(&state, portfolio_key, &request.market_ids).await;
+    let discovered = load_portfolio_state(&state, portfolio_key, &request.market_ids).await;
+    if discovered.is_empty() {
+        return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
+    }
+
+    // Locks every discovered market before re-reading any of them, then
+    // re-reads each one under its own lock — `lock_position`'s own doc on
+    // why: `discovered`, above, was read without holding any lock, so by
+    // the time we'd otherwise act on it, a concurrent fill's `load_and_fold`
+    // could already have changed it. Sorted so two liquidations touching an
+    // overlapping market set always acquire in the same order.
+    let mut market_ids: Vec<MarketId> = discovered.iter().map(|m| m.market_id.clone()).collect();
+    market_ids.sort();
+    let mut _guards = Vec::with_capacity(market_ids.len());
+    for market_id in &market_ids {
+        _guards.push(state.lock_position(portfolio_key, market_id).await);
+    }
+    let mut market_states = Vec::with_capacity(market_ids.len());
+    for market_id in &market_ids {
+        if let Some(fresh) = load_single_market_state_cached(&state, portfolio_key, market_id).await {
+            market_states.push(fresh);
+        }
+    }
     if market_states.is_empty() {
         return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
 
-    let market_ids: Vec<MarketId> = market_states.iter().map(|m| m.market_id.clone()).collect();
     let live_prices = live_mark_prices(&state, &market_ids).await;
 
     let margin = compute_margin(&market_states, &live_prices)
@@ -1884,7 +2510,16 @@ async fn post_liquidate(
         return Ok(Json(LiquidateResponse { executed: false, tx_hashes: Vec::new() }));
     }
 
-    let (legs, close_bps) = size_liquidation_legs(&market_states, &margin, &state.sealed_key);
+    let funding_indices = state.funding_indices_snapshot();
+    let (legs, close_bps) = size_liquidation_legs(
+        &state,
+        portfolio_key,
+        &market_states,
+        &margin,
+        &state.sealed_key,
+        &live_prices,
+        &funding_indices,
+    );
 
     // Reward scales with what's actually being closed this call (close_bps,
     // an approximation shared across every leg — see size_liquidation_legs'
@@ -1914,9 +2549,25 @@ async fn post_liquidate(
         .collect();
 
     let results = crate::settle::liquidate_sealed(&state.settlement_signer, &sweep, &market_contracts).await;
+    let mut any_failed = false;
     for result in &results {
-        if let Some(tx_hash) = &result.broadcast_tx_hash {
-            tracing::info!(tx_hash = %tx_hash, portfolio_key = %request.portfolio_key, "portfolio liquidated");
+        match &result.broadcast_tx_hash {
+            Some(tx_hash) => {
+                tracing::info!(tx_hash = %tx_hash, portfolio_key = %request.portfolio_key, "portfolio liquidated")
+            }
+            None => any_failed = true,
+        }
+    }
+    if any_failed {
+        // `invalidate_position`'s own doc: results are grouped by contract
+        // (one call can cover several legs/markets), so a failed group
+        // doesn't cleanly map back to which specific leg(s) it covered from
+        // here. Invalidating every market this liquidation touched is the
+        // safe direction to round that ambiguity — worst case, a leg that
+        // actually DID land just costs its next fold one redundant
+        // on-chain read instead of trusting a cache that's now suspect.
+        for market_id in &market_ids {
+            state.invalidate_position(portfolio_key, market_id);
         }
     }
     let tx_hashes: Vec<String> =
@@ -1991,6 +2642,181 @@ fn required_margin(tick: u64, qty: u64) -> u128 {
     (tick as u128) * (qty as u128) * IMR_BPS / BPS_DENOMINATOR
 }
 
+/// The `collateral_delta` for closing `close_size` (magnitude, <=
+/// `existing.signed_size.unsigned_abs()`) of an already-open position:
+/// proportional margin release plus realized spot + funding PnL on the
+/// closed portion, all in this crate's own raw tick-scale units.
+///
+/// Deliberately does NOT go through `SettlementEngine.sol`'s separate
+/// 1e18-scaled `fundingIndex`/`getPnL` — `required_margin`'s own doc
+/// explains why no TEE/contract fixed-point convention exists to bridge
+/// the two, and this crate's `collateral_delta` has always been
+/// tick-scale end to end (same note on `compute_margin`, above). Both
+/// `entry_price`/`current_tick` and `entry_funding_index`/
+/// `current_funding_index` are already in that same convention
+/// (`AppState::funding_index_native`'s doc), so `signed_close * (delta)`
+/// lands directly in the units `collateral_delta` already uses — no
+/// scaling step needed.
+///
+/// Before this existed, every close (voluntary or liquidation) just
+/// released a straight proportional share of locked margin with no PnL
+/// at all — this is the one place that behavior changes into something
+/// that actually reflects the market having moved.
+#[allow(clippy::too_many_arguments)]
+fn realized_close_delta(
+    signed_size: i128,
+    entry_price: u64,
+    collateral: I256,
+    entry_funding_index: i128,
+    close_size: u64,
+    current_tick: u64,
+    current_funding_index: i128,
+) -> I256 {
+    let size_abs = signed_size.unsigned_abs();
+    if size_abs == 0 || close_size == 0 {
+        return I256::ZERO;
+    }
+    let close_size = close_size.min(size_abs as u64);
+
+    let collateral_u128 = i128::try_from(collateral).unwrap_or(0).max(0) as u128;
+    let freed_collateral = collateral_u128 * close_size as u128 / size_abs;
+
+    let signed_close: i128 = if signed_size >= 0 { close_size as i128 } else { -(close_size as i128) };
+    let spot_pnl = signed_close * (current_tick as i128 - entry_price as i128);
+    let funding_pnl = signed_close * (current_funding_index - entry_funding_index);
+    let pnl = spot_pnl + funding_pnl;
+
+    let pnl_i256 = I256::try_from(pnl).unwrap_or(if pnl < 0 { I256::MIN } else { I256::MAX });
+    let freed_i256 = I256::try_from(freed_collateral).unwrap_or(I256::MAX);
+    pnl_i256 - freed_i256
+}
+
+/// A running position in one market, folded fill-by-fill across a sweep —
+/// the taker applies every fill in its own sweep to one of these and writes
+/// ONE final `SealedParams` at the end (`settleTakerSweep`'s own doc: only
+/// the last write matters), a maker leg folds exactly one fill since each
+/// fill can be against a different maker's own existing position.
+///
+/// Handles the three shapes a fill against an existing position can take:
+/// adding to it (same direction: cost basis and funding-index entry are
+/// blended, weighted by size, so a later close realizes PnL against the
+/// true weighted-average entry, not just the latest fill's price); closing
+/// it (opposite direction, up to the existing size: realizes spot + funding
+/// PnL via `realized_close_delta`); or flipping through it (an
+/// opposite-direction fill larger than the existing size: closes it fully,
+/// realizing PnL, then opens the remainder fresh on the new side, entry
+/// stamped at this fill's own price/funding index).
+///
+/// Before this existed, `post_order`'s fill loop treated every fill as a
+/// fresh open regardless of any existing position — no PnL was ever
+/// realized on a voluntary close, and adding to a position silently
+/// discarded its prior cost basis.
+struct PositionFold {
+    signed_size: i128,
+    entry_price: u64,
+    entry_funding_index: i128,
+    collateral: I256,
+    leverage: u64,
+    take_profit: Option<u64>,
+    stop_loss: Option<u64>,
+}
+
+impl PositionFold {
+    fn from_existing(existing: Option<&PortfolioMarketState>, default_leverage: u64) -> Self {
+        match existing {
+            Some(m) => PositionFold {
+                signed_size: m.signed_size,
+                entry_price: m.entry_price,
+                entry_funding_index: m.entry_funding_index,
+                collateral: m.collateral,
+                leverage: m.leverage,
+                take_profit: m.take_profit,
+                stop_loss: m.stop_loss,
+            },
+            None => PositionFold {
+                signed_size: 0,
+                entry_price: 0,
+                entry_funding_index: 0,
+                collateral: I256::ZERO,
+                leverage: default_leverage,
+                take_profit: None,
+                stop_loss: None,
+            },
+        }
+    }
+
+    /// Applies one fill, mutating this fold to the resulting position and
+    /// returning that fill's own `collateral_delta` contribution: margin
+    /// locked on an add, or a PnL-adjusted release on a close/flip.
+    ///
+    /// `self.collateral` is kept as a running mirror of what the on-chain
+    /// `SealedPosition.collateral` will become once every delta returned so
+    /// far actually lands — i.e. always incremented by exactly the delta
+    /// this call returns, in every branch. That invariant is what makes a
+    /// SECOND close within the same fold (a taker sweep crossing the same
+    /// opposite-side position at more than one price level) correct: its
+    /// proportional `freed` share is computed against the REAL remaining
+    /// collateral after the first close's realized PnL, not against a
+    /// stale pre-PnL figure.
+    fn apply_fill(
+        &mut self,
+        fill_is_buy: bool,
+        fill_price: u64,
+        fill_qty: u64,
+        current_funding_index: i128,
+    ) -> I256 {
+        let fill_signed: i128 = if fill_is_buy { fill_qty as i128 } else { -(fill_qty as i128) };
+        let same_direction = self.signed_size == 0 || (self.signed_size > 0) == (fill_signed > 0);
+
+        let delta = if same_direction {
+            let old_abs = self.signed_size.unsigned_abs();
+            let new_abs = old_abs + fill_qty as u128;
+            self.entry_price = ((old_abs * self.entry_price as u128 + fill_qty as u128 * fill_price as u128)
+                / new_abs) as u64;
+            self.entry_funding_index = (self.entry_funding_index * old_abs as i128
+                + current_funding_index * fill_qty as i128)
+                / new_abs as i128;
+            self.signed_size += fill_signed;
+            I256::try_from(required_margin(fill_price, fill_qty)).expect("margin fits in I256")
+        } else {
+            let existing_abs = self.signed_size.unsigned_abs();
+            let close_size = (fill_qty as u128).min(existing_abs) as u64;
+
+            let close_delta = realized_close_delta(
+                self.signed_size,
+                self.entry_price,
+                self.collateral,
+                self.entry_funding_index,
+                close_size,
+                fill_price,
+                current_funding_index,
+            );
+
+            self.signed_size +=
+                if self.signed_size >= 0 { -(close_size as i128) } else { close_size as i128 };
+
+            let flip_qty = fill_qty - close_size;
+            if flip_qty == 0 {
+                close_delta
+            } else {
+                // The close above fully unwound the old side (close_size ==
+                // existing_abs); open the remainder fresh on the fill's side.
+                self.signed_size = if fill_is_buy { flip_qty as i128 } else { -(flip_qty as i128) };
+                self.entry_price = fill_price;
+                self.entry_funding_index = current_funding_index;
+                self.take_profit = None;
+                self.stop_loss = None;
+                let open_delta =
+                    I256::try_from(required_margin(fill_price, flip_qty)).expect("margin fits in I256");
+                close_delta + open_delta
+            }
+        };
+
+        self.collateral += delta;
+        delta
+    }
+}
+
 /// Deterministic, unique per fill: combines the taker's identity and
 /// nonce (already required strictly increasing per signer) with the
 /// maker and the fill's position within this submit call, so a single
@@ -2016,10 +2842,18 @@ fn match_id_for(
 
 /// Builds one fill's maker-side leg for a `settleTakerSweep` batch. The taker's own leg
 /// is built once for the whole sweep, not per fill, see `post_order`'s fill loop.
+///
+/// Reads the maker's own existing position in this market first (a real,
+/// possibly on-chain, read — hence `async` now, unlike before this
+/// function handled anything but a fresh open) and folds this one fill
+/// onto it via `PositionFold`: an add if the maker was already on this
+/// side, a close/flip (realizing PnL) if this fill trades against the
+/// maker's own existing opposite-side position. Before this, every maker
+/// fill was unconditionally treated as opening a brand new position,
+/// discarding whatever the maker already held in this market.
 #[allow(clippy::too_many_arguments)]
-fn build_maker_leg(
-    sealed_key: &crate::sealed::SealedKey,
-    portfolio_key_secret: &[u8; 32],
+async fn build_maker_leg(
+    state: &AppState,
     taker: Address,
     taker_nonce: u64,
     fill_index: usize,
@@ -2029,24 +2863,36 @@ fn build_maker_leg(
     taker_is_buy: bool,
     maker_owner: OwnerId,
     maker_address: Address,
+    current_funding_index: i128,
 ) -> crate::settle::MakerFill {
-    let margin = I256::try_from(required_margin(tick, qty)).expect("margin fits in I256");
-    let maker_params = SealedParams {
-        side_is_buy: !taker_is_buy,
-        entry_price: tick,
-        size: qty,
-        // Makers rest via `OfferPayload`, which (unlike `OrderPayload`) has
-        // no leverage field yet — a real, stated gap, not an oversight.
-        leverage: 1,
-        take_profit: None,
-        stop_loss: None,
+    let maker_portfolio_key = portfolio_key(&state.portfolio_key_secret, maker_address);
+    // Makers rest via `OfferPayload`, which (unlike `OrderPayload`) has no
+    // leverage field yet — a real, stated gap, not an oversight — so a
+    // fresh open defaults to 1x; an add to an existing position keeps that
+    // position's own leverage instead (`PositionFold::from_existing`).
+    // Makers never pay a fee (`taker_fee`'s own naming), hence `I256::ZERO`.
+    let collateral_delta = state
+        .load_and_fold(
+            maker_portfolio_key,
+            market_id,
+            !taker_is_buy,
+            tick,
+            qty,
+            current_funding_index,
+            1,
+            I256::ZERO,
+        )
+        .await;
+    let sealed_params = match state.cached_sealed_params(maker_portfolio_key, market_id) {
+        Some(params) => Bytes::from(state.sealed_key.seal(&params)),
+        None => Bytes::new(),
     };
 
     crate::settle::MakerFill {
         match_id: match_id_for(taker, maker_owner, market_id, tick, fill_index, taker_nonce),
-        portfolio_key: portfolio_key(portfolio_key_secret, maker_address),
-        collateral_delta: margin,
-        sealed_params: Bytes::from(sealed_key.seal(&maker_params)),
+        portfolio_key: maker_portfolio_key,
+        collateral_delta,
+        sealed_params,
     }
 }
 
@@ -2060,6 +2906,28 @@ mod tests {
 
     fn wallet() -> PrivateKeySigner {
         PrivateKeySigner::random()
+    }
+
+    /// Compile-time regression check, not a runtime assertion: axum's
+    /// `post()` route registration requires `post_order`'s future to be
+    /// `Send`, and this crate has hit that exact bound break once already
+    /// (a `MutexGuard` from `state.books.lock()` that outlived a `drop()`
+    /// call, from the async-fn generator transform's point of view, once a
+    /// real `.await` existed earlier in the function). If this stops
+    /// compiling, something reintroduced a non-`Send` value held across an
+    /// `.await` inside `post_order` (or a function it calls) — the fix is
+    /// almost always narrowing that value's lock to its own block instead
+    /// of relying on an explicit `drop()`.
+    fn _post_order_future_is_send() {
+        fn is_send<T: Send>(_: T) {}
+        is_send(post_order(
+            State(Arc::new(AppState::new())),
+            Json(decrypt::Envelope {
+                ephemeral_pubkey_b64: String::new(),
+                nonce_b64: String::new(),
+                ciphertext_b64: String::new(),
+            }),
+        ));
     }
 
     /// Regression test for the leak `keccak256(address)` used to have: given only an
@@ -2925,6 +3793,7 @@ mod tests {
             leverage: 1,
             take_profit: None,
             stop_loss: None,
+            entry_funding_index: 0,
         }];
         let with_entry_price = compute_margin(&states, &HashMap::new()).unwrap();
         assert_eq!(with_entry_price.margin_requirement, 30);
@@ -2946,6 +3815,7 @@ mod tests {
             leverage: 1,
             take_profit: None,
             stop_loss: None,
+            entry_funding_index: 0,
         }];
         let at_entry_price = compute_margin(&states, &HashMap::new()).unwrap().margin_requirement;
         assert_eq!(at_entry_price, 30);
@@ -2966,6 +3836,7 @@ mod tests {
                 leverage: 1,
                 take_profit: None,
                 stop_loss: None,
+                entry_funding_index: 0,
             },
             PortfolioMarketState {
                 market_id: "0xBTCUSDC".to_string(),
@@ -2975,6 +3846,7 @@ mod tests {
                 leverage: 1,
                 take_profit: None,
                 stop_loss: None,
+                entry_funding_index: 0,
             },
         ];
         // Only EURC/USDC has a live price (double its entry price); BTC/USDC
@@ -2992,6 +3864,7 @@ mod tests {
             leverage: 1,
             take_profit: None,
             stop_loss: None,
+            entry_funding_index: 0,
         }];
         let eurc_leg_at_entry =
             compute_margin(&eurc_only_states, &HashMap::new()).unwrap().margin_requirement;
@@ -3027,10 +3900,19 @@ mod tests {
             leverage: 1,
             take_profit: Some(150),
             stop_loss: Some(50),
+            entry_funding_index: 0,
         }];
         let margin = margin_result(100, 80);
         let sealed_key = crate::sealed::SealedKey::generate();
-        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+        let (legs, close_bps) = size_liquidation_legs(
+            &AppState::new(),
+            FixedBytes::<32>::ZERO,
+            &states,
+            &margin,
+            &sealed_key,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(close_bps, 3_000);
         assert_eq!(legs.len(), 1);
@@ -3062,10 +3944,19 @@ mod tests {
             leverage: 1,
             take_profit: None,
             stop_loss: None,
+            entry_funding_index: 0,
         }];
         let margin = margin_result(100, 0);
         let sealed_key = crate::sealed::SealedKey::generate();
-        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+        let (legs, close_bps) = size_liquidation_legs(
+            &AppState::new(),
+            FixedBytes::<32>::ZERO,
+            &states,
+            &margin,
+            &sealed_key,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(close_bps, 10_000);
         assert_eq!(legs.len(), 1);
@@ -3084,6 +3975,7 @@ mod tests {
                 leverage: 1,
                 take_profit: None,
                 stop_loss: None,
+                entry_funding_index: 0,
             },
             PortfolioMarketState {
                 market_id: "0xEURCUSDC".to_string(),
@@ -3093,11 +3985,20 @@ mod tests {
                 leverage: 3,
                 take_profit: None,
                 stop_loss: None,
+                entry_funding_index: 0,
             },
         ];
         let margin = margin_result(100, 80); // same 30% close as the single-leg test above
         let sealed_key = crate::sealed::SealedKey::generate();
-        let (legs, close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+        let (legs, close_bps) = size_liquidation_legs(
+            &AppState::new(),
+            FixedBytes::<32>::ZERO,
+            &states,
+            &margin,
+            &sealed_key,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(close_bps, 3_000);
         assert_eq!(legs.len(), 2);
@@ -3124,10 +4025,19 @@ mod tests {
             leverage: 1,
             take_profit: None,
             stop_loss: None,
+            entry_funding_index: 0,
         }];
         let margin = margin_result(100, 80);
         let sealed_key = crate::sealed::SealedKey::generate();
-        let (legs, _close_bps) = size_liquidation_legs(&states, &margin, &sealed_key);
+        let (legs, _close_bps) = size_liquidation_legs(
+            &AppState::new(),
+            FixedBytes::<32>::ZERO,
+            &states,
+            &margin,
+            &sealed_key,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(legs.len(), 1);
         assert!(legs[0].sealed_params.is_empty());

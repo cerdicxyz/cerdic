@@ -38,6 +38,15 @@ pub struct SealedParams {
     pub leverage: u64,
     pub take_profit: Option<u64>,
     pub stop_loss: Option<u64>,
+    /// The TEE's own native funding index (`api::AppState::funding_index_native`,
+    /// tick-scale, same convention as `entry_price`/`required_margin` throughout
+    /// this crate) at the moment this position was opened or last added to.
+    /// Funding PnL realized at close/liquidation is this position's size times
+    /// the index's movement since this stamp — see `api::realized_close_delta`.
+    /// `#[serde(default)]` so a position sealed before this field existed still
+    /// unseals (defaulting to 0, i.e. no funding charged retroactively).
+    #[serde(default)]
+    pub entry_funding_index: i128,
 }
 
 /// The enclave's symmetric sealing key, generated fresh in-enclave on
@@ -76,12 +85,11 @@ impl SealedKey {
         out
     }
 
-    /// Inverse of `seal`. Not called from the settlement path today (the
-    /// contract stores sealedParams opaquely and never asks the TEE to
-    /// reopen them); exists so a future TP/SL-trigger or liquidation
-    /// check (which the spec says DOES need to reopen them) has a
-    /// tested implementation to call, and so `seal` is verified
-    /// round-trip rather than trusted on read.
+    /// Inverse of `seal`. The contract itself stores sealedParams opaquely
+    /// and never reopens them; the TEE does, whenever it needs a
+    /// position's own prior state back: `api::load_portfolio_state` (used
+    /// by `/liquidation-check`, `/liquidate`, and the voluntary-close path
+    /// in `post_order`'s fill loop) is the current caller.
     pub fn unseal(&self, sealed: &[u8]) -> Result<SealedParams, SealError> {
         if sealed.len() < 12 {
             return Err(SealError::Truncated);
@@ -107,6 +115,7 @@ mod tests {
             leverage: 5,
             take_profit: Some(120),
             stop_loss: None,
+            entry_funding_index: 42,
         }
     }
 

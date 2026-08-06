@@ -58,11 +58,49 @@
 //!   PYTH_FEED_ID             - Hermes feed id for this market's live mid
 //!   MM_PRIVATE_KEY           - the maker's own trading key (signs orders,
 //!                              never touches the chain directly)
-//!   MM_SPREAD_BPS            - optional, default 20 (half-spread each side)
-//!   MM_QUOTE_SIZE            - optional, default 10 (units per side)
+//!   MM_SPREAD_BPS            - optional, default 20 (FLOOR half-spread each
+//!                              side, before the volatility term below —
+//!                              not the spread actually quoted)
+//!   MM_QUOTE_SIZE            - optional, default 10 (CENTER of the size
+//!                              range each side draws from, see
+//!                              MM_SIZE_JITTER_PCT)
 //!   MM_SKEW_BPS_PER_UNIT     - optional, default 2 (how hard inventory
 //!                              pushes the quote center per unit long/short)
 //!   MM_REQUOTE_INTERVAL_SECS - optional, default 15
+//!   MM_VOL_SPREAD_MULT       - optional, default 40 (Avellaneda-Stoikov-
+//!                              style: how much realized volatility of the
+//!                              last MM_VOL_WINDOW mids widens the spread
+//!                              beyond MM_SPREAD_BPS's floor, same shape
+//!                              real market makers use — a quiet market
+//!                              quotes tight, a choppy one quotes wide —
+//!                              instead of one flat constant spread every
+//!                              cycle regardless of what the market is
+//!                              actually doing)
+//!   MM_VOL_WINDOW            - optional, default 20 (how many past mids
+//!                              the volatility estimate looks back over)
+//!   MM_JITTER_BPS_PCT        - optional, default 20 (± this percent of
+//!                              the computed spread, applied independently
+//!                              to bid and ask each cycle)
+//!   MM_SIZE_JITTER_PCT       - optional, default 35 (± this percent of
+//!                              MM_QUOTE_SIZE, applied independently to bid
+//!                              and ask each cycle)
+//!   MM_LADDER_LEVELS         - optional, default 4 (resting levels quoted
+//!                              per side per cycle, each 2x/3x/4x... the
+//!                              base spread out from mid with 60% less
+//!                              size than the level before it — real
+//!                              price-RANGE coverage, not one tick per
+//!                              side; see the ladder loop's own doc)
+//!
+//! The jitter/volatility terms exist for one reason: a bot that quotes
+//! the exact same bps offset and exact same size every single cycle
+//! produces a book where every resting level sits at a suspiciously
+//! round, perfectly-spaced tick and every size is a multiple of the same
+//! constant — real order books never look like that, because real
+//! participants aren't one deterministic function. This does NOT touch
+//! `infer_fill_side`'s correctness: that function already recomputes its
+//! expected margin from whatever `(tick, qty)` was ACTUALLY posted last
+//! cycle (`last_bid`/`last_ask`), not from `MM_QUOTE_SIZE` itself, so a
+//! different size each cycle is exactly as attributable as a constant one.
 
 use alloy::{
     primitives::{Address, FixedBytes, I256},
@@ -74,6 +112,8 @@ use cerdic_tee_matcher::{
     oracle, settle,
 };
 use crypto_box::PublicKey;
+use rand::Rng;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 #[tokio::main]
@@ -99,6 +139,15 @@ async fn main() {
     let requote_interval = Duration::from_secs(
         std::env::var("MM_REQUOTE_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
     );
+    let vol_spread_mult: f64 =
+        std::env::var("MM_VOL_SPREAD_MULT").ok().and_then(|s| s.parse().ok()).unwrap_or(40.0);
+    let vol_window: usize = std::env::var("MM_VOL_WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let jitter_bps_pct: f64 =
+        std::env::var("MM_JITTER_BPS_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(20.0);
+    let size_jitter_pct: f64 =
+        std::env::var("MM_SIZE_JITTER_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(35.0);
+    let ladder_levels: u64 =
+        std::env::var("MM_LADDER_LEVELS").ok().and_then(|s| s.parse().ok()).unwrap_or(4).max(1);
 
     let wallet: PrivateKeySigner = private_key.parse().expect("invalid MM_PRIVATE_KEY");
     let http = reqwest::Client::new();
@@ -129,6 +178,14 @@ async fn main() {
     let mut nonce: u64 =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
 
+    // Rolling window of recent live mids, oldest first — feeds the
+    // realized-volatility spread term below. Empty at startup, same as
+    // any real strategy's warm-up: the first MM_VOL_WINDOW cycles just
+    // quote at the MM_SPREAD_BPS floor until there's enough history to
+    // estimate volatility from.
+    let mut mid_history: VecDeque<f64> = VecDeque::with_capacity(vol_window);
+    let mut rng = rand::thread_rng();
+
     let mut interval = tokio::time::interval(requote_interval);
     loop {
         interval.tick().await;
@@ -144,6 +201,29 @@ async fn main() {
             tracing::warn!("live mid price came back zero, skipping this cycle");
             continue;
         }
+
+        // Realized volatility of log returns over the trailing window,
+        // in bps — the Avellaneda-Stoikov spread term: a quiet market
+        // (small/zero recent moves) quotes near the MM_SPREAD_BPS floor,
+        // a choppy one quotes wider automatically. `mid_history` holds
+        // real fetched prices only, never a synthetic one.
+        if mid_history.len() == vol_window {
+            mid_history.pop_front();
+        }
+        mid_history.push_back(mid as f64);
+        let realized_vol_bps = if mid_history.len() >= 3 {
+            let log_returns: Vec<f64> = mid_history
+                .iter()
+                .zip(mid_history.iter().skip(1))
+                .map(|(prev, next)| (next / prev).ln())
+                .collect();
+            let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
+            let variance =
+                log_returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / log_returns.len() as f64;
+            variance.sqrt() * 10_000.0
+        } else {
+            0.0
+        };
 
         // Update the inventory estimate from a fresh public collateral
         // read before deciding the next quote, so skew reflects reality,
@@ -175,50 +255,103 @@ async fn main() {
             }
         }
 
+        // Base half-spread: the configured floor plus a volatility term
+        // (Avellaneda-Stoikov shape), then independent random jitter per
+        // side so bid/ask offsets aren't a perfectly symmetric, perfectly
+        // repeatable function of mid alone.
+        let base_spread_bps = spread_bps as f64 + realized_vol_bps * vol_spread_mult;
         let skew = inventory_estimate * skew_bps_per_unit; // bps, positive = long, pushes quotes down
-        let bid_bps = (spread_bps as i64 + skew).max(1) as u64;
-        let ask_bps = (spread_bps as i64 - skew).max(1) as u64;
-        let bid_tick = mid.saturating_sub(mid * bid_bps / 10_000);
-        let ask_tick = mid.saturating_add(mid * ask_bps / 10_000);
 
-        nonce += 1;
-        let bid_ok = post_offer(
-            &http,
-            &matcher_url,
-            &enclave_pubkey,
-            &wallet,
-            &market_id,
-            OrderSide::Buy,
-            bid_tick,
-            quote_size,
-            nonce,
-            requote_interval,
-        )
-        .await;
-        nonce += 1;
-        let ask_ok = post_offer(
-            &http,
-            &matcher_url,
-            &enclave_pubkey,
-            &wallet,
-            &market_id,
-            OrderSide::Sell,
-            ask_tick,
-            quote_size,
-            nonce,
-            requote_interval,
-        )
-        .await;
+        // A real ladder, not one tick per side: a single level near mid
+        // is exactly what made a coarse order-book grouping (e.g. "$1"
+        // on a market that only ever quoted within a few cents of mid)
+        // show almost nothing — real venues have resting size spread
+        // across a real price RANGE, not clustered on one tick. Each
+        // level doubles its distance from mid and decays its size by
+        // ~40%, both real, honest properties of an actual multi-level
+        // maker (a real participant quotes tighter/bigger near the
+        // touch, wider/smaller further out), not fabricated filler.
+        for level in 0..ladder_levels {
+            let level_mult = (level + 1) as f64;
+            let bid_jitter = 1.0 + rng.gen_range(-jitter_bps_pct..=jitter_bps_pct) / 100.0;
+            let ask_jitter = 1.0 + rng.gen_range(-jitter_bps_pct..=jitter_bps_pct) / 100.0;
+            // Clamped at 5000bps (50%) — an already-unrealistic spread
+            // for any real market, kept purely as a safety ceiling: a
+            // single corrupted/outlier Hermes sample spiking
+            // `realized_vol_bps` (nothing upstream bounds that) could
+            // otherwise drive an outer ladder level's tick far enough
+            // from the book's current range to crash the matcher, since
+            // its dense per-tick array has no bound of its own on the
+            // resize a wildly-out-of-range tick would trigger (see
+            // api.rs's `MAX_SANE_TICK`, the other, independent half of
+            // this same fix).
+            let bid_bps =
+                (((base_spread_bps * level_mult * bid_jitter) as i64 + skew).max(1) as u64).min(5000);
+            let ask_bps =
+                (((base_spread_bps * level_mult * ask_jitter) as i64 - skew).max(1) as u64).min(5000);
+            let bid_tick = mid.saturating_sub(mid * bid_bps / 10_000);
+            let ask_tick = mid.saturating_add(mid * ask_bps / 10_000);
 
-        if bid_ok {
-            last_bid = Some((bid_tick, quote_size));
+            let level_size = ((quote_size as f64) * 0.6f64.powi(level as i32)).round().max(1.0) as u64;
+            let bid_size = jittered_size(level_size, size_jitter_pct, &mut rng);
+            let ask_size = jittered_size(level_size, size_jitter_pct, &mut rng);
+
+            nonce += 1;
+            let bid_ok = post_offer(
+                &http,
+                &matcher_url,
+                &enclave_pubkey,
+                &wallet,
+                &market_id,
+                OrderSide::Buy,
+                bid_tick,
+                bid_size,
+                nonce,
+                requote_interval,
+            )
+            .await;
+            nonce += 1;
+            let ask_ok = post_offer(
+                &http,
+                &matcher_url,
+                &enclave_pubkey,
+                &wallet,
+                &market_id,
+                OrderSide::Sell,
+                ask_tick,
+                ask_size,
+                nonce,
+                requote_interval,
+            )
+            .await;
+
+            // Only the innermost level (level 0, nearest the touch and
+            // most likely to fill first) feeds inventory attribution —
+            // see the module doc's "one outstanding bid/ask" assumption.
+            // Outer levels are real resting depth but degrade that
+            // tracking to "unknown" if they're what actually fills,
+            // exactly the documented, safe fallback (symmetric quoting,
+            // never a wrong skew).
+            if level == 0 {
+                if bid_ok {
+                    last_bid = Some((bid_tick, bid_size));
+                }
+                if ask_ok {
+                    last_ask = Some((ask_tick, ask_size));
+                }
+            }
         }
-        if ask_ok {
-            last_ask = Some((ask_tick, quote_size));
-        }
 
-        tracing::info!(mid, bid_tick, ask_tick, inventory_estimate, "requoted");
+        tracing::info!(mid, ladder_levels, realized_vol_bps, inventory_estimate, "requoted");
     }
+}
+
+/// `center` +/- `pct` percent, floored at 1 unit (a resting order of size
+/// 0 is meaningless). Each call draws independently, so a bid and an ask
+/// from the same cycle don't end up identical either.
+fn jittered_size(center: u64, pct: f64, rng: &mut impl Rng) -> u64 {
+    let factor = 1.0 + rng.gen_range(-pct..=pct) / 100.0;
+    ((center as f64 * factor).round() as i64).max(1) as u64
 }
 
 fn market_hash(market_id: &str) -> FixedBytes<32> {
@@ -358,7 +491,23 @@ async fn post_offer(
     };
 
     match http.post(format!("{matcher_url}/offer")).json(&envelope).send().await {
-        Ok(resp) => resp.status().is_success(),
+        Ok(resp) if resp.status().is_success() => true,
+        // A real, previously-silent bug: this used to be
+        // `resp.status().is_success()` with no else branch at all, so a
+        // non-2xx response (e.g. the matcher rejecting every offer because
+        // it restarted with a fresh `Keystore` and this process is still
+        // encrypting to the OLD, now-defunct enclave pubkey cached at
+        // startup) just made every single requote a silent no-op forever —
+        // "requoted" kept logging every cycle with no error anywhere, book
+        // stayed permanently empty, and the only way to find out why was
+        // reading raw HTTP responses by hand. Confirmed live: this exact
+        // scenario, after a matcher-only restart during this session.
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::error!(status = %status, body = %body, side = ?side, tick, "offer rejected");
+            false
+        }
         Err(e) => {
             tracing::error!(error = %e, side = ?side, tick, "offer submission failed");
             false
