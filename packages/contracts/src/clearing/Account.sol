@@ -34,6 +34,7 @@ contract Account is AccessControl, ICollateralBalanceSource {
     event CollateralDeposited(address indexed trader, address indexed asset, uint256 amount);
     event CollateralWithdrawn(address indexed trader, address indexed asset, uint256 amount);
     event AccountFrozen(address indexed trader);
+    event AccountUnfrozen(address indexed trader);
     event CollateralSeized(address indexed trader, address indexed asset, uint256 amount, address indexed recipient);
     event RiskMonitorUpdated(address indexed monitor);
 
@@ -120,6 +121,19 @@ contract Account is AccessControl, ICollateralBalanceSource {
         accounts[trader].frozen = true;
 
         emit AccountFrozen(trader);
+    }
+
+    /// @notice `security-audit-tee-contracts.md` finding C1: `freezeAccount` previously had
+    ///         no inverse at all, so a freeze (permissionless-triggerable pre-fix, via
+    ///         `CapabilityRegistry.checkAndFreezeOnBreach`) was permanent by construction.
+    ///         Admin-gated like `freezeAccount` itself, not a trader self-service unfreeze.
+    function unfreezeAccount(address trader) external onlyRole(CLEARING_ADMIN_ROLE) {
+        if (trader == address(0)) revert ZeroAddress();
+        if (!accounts[trader].frozen) revert AccountNotFrozen(trader);
+
+        accounts[trader].frozen = false;
+
+        emit AccountUnfrozen(trader);
     }
 
     function getPosition(bytes32 marketId) external view returns (bytes memory) {

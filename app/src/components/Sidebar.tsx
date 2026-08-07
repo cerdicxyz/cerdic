@@ -1,0 +1,87 @@
+import { Link, useLocation } from 'react-router';
+import { IconBriefcase, IconChartCandle, IconHelpCircle, IconReceipt2 } from '@tabler/icons-react';
+
+// Icon rail, ported layout-only from cer-perp's sidebar.tsx (56px
+// collapsed width). Real SVG icons (@tabler/icons-react, the same set
+// cer-perp's own sidebar uses), not the unicode glyphs (⌗▤≡?) this had
+// before.
+//
+// Trade is a real route (react-router, see App.tsx). Portfolio opens a
+// modal instead (PortfolioModal.tsx) rather than navigating — it's an
+// account overview reachable from wherever you are, not its own screen.
+// Docs links out to the real protocol docs site (cerdicxyz.github.io,
+// VitePress, source: cerdicxyz/cerdicxyz.github.io) — a new tab, not a
+// route in this app. Orders stays disabled with a "Coming soon" title —
+// there's no page/modal behind it yet, same honesty convention as the
+// chart's TradingView/Depth tabs rather than a link to nowhere.
+//
+// The TradingView attribution link that used to live here moved to
+// SettingsDropdown.tsx's footer — see that file for why it can't just be
+// deleted outright.
+
+const ICON_SIZE = 18;
+const ICON_STROKE = 1.75;
+
+export function Sidebar({
+  onOpenPortfolio,
+  portfolioOpen,
+}: {
+  onOpenPortfolio: () => void;
+  portfolioOpen: boolean;
+}) {
+  const location = useLocation();
+  const tradeActive = location.pathname.startsWith('/trade');
+
+  return (
+    <nav
+      aria-label="Primary"
+      className="flex w-14 flex-shrink-0 flex-col items-center gap-[var(--space-6)] border-r border-border-subtle py-[var(--space-4)]"
+    >
+      <div className="flex flex-col gap-[var(--space-2)]">
+        <Link
+          to="/trade"
+          title="Trade"
+          aria-label="Trade"
+          className={
+            tradeActive
+              ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
+              : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
+          }
+        >
+          <IconChartCandle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </Link>
+        <button
+          type="button"
+          onClick={onOpenPortfolio}
+          title="Portfolio"
+          aria-label="Portfolio"
+          aria-expanded={portfolioOpen}
+          className={
+            portfolioOpen
+              ? 'grid h-9 w-9 place-items-center rounded-sm bg-surface-hover text-accent transition-colors duration-150'
+              : 'grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary'
+          }
+        >
+          <IconBriefcase size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </button>
+        <span
+          title="Orders — coming soon"
+          aria-label="Orders"
+          className="grid h-9 w-9 cursor-not-allowed place-items-center rounded-sm text-text-quaternary/50 transition-colors duration-150"
+        >
+          <IconReceipt2 size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </span>
+        <a
+          href="https://cerdicxyz.github.io"
+          target="_blank"
+          rel="noreferrer"
+          title="Docs"
+          aria-label="Docs"
+          className="grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary"
+        >
+          <IconHelpCircle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
+        </a>
+      </div>
+    </nav>
+  );
+}

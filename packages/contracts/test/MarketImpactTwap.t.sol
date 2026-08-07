@@ -479,7 +479,7 @@ contract MarketImpactTwapTest is Test {
     ///         engine via `setSettlementEngine`, the engine learns the
     ///         TWAP via `setImpactTwap`.
     function test_SettlementEngineFeedsTwapOnSettle() public {
-        SettlementEngine settlement = new SettlementEngine(admin);
+        SettlementEngine settlement = new SettlementEngine(admin, 20);
         MockMarket market = new MockMarket();
 
         vm.startPrank(admin);
@@ -509,7 +509,7 @@ contract MarketImpactTwapTest is Test {
     ///         without a feed while unwired (zero address restores the
     ///         bootstrap state).
     function test_SettlementEngineImpactTwapSetter() public {
-        SettlementEngine settlement = new SettlementEngine(admin);
+        SettlementEngine settlement = new SettlementEngine(admin, 20);
         MockMarket market = new MockMarket();
 
         vm.startPrank(admin);

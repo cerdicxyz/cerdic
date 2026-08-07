@@ -57,9 +57,11 @@
 //! resting orders; this implementation notes the tradeoff rather than
 //! solving a problem this venue's realistic tick ranges don't create.
 
-// Not wired into main.rs yet. The API layer (POST /order) that will call
-// OrderBook::submit lands in a later milestone. Fully exercised by the
-// tests below in the meantime.
+// `cancel` and `depth_at` aren't called from `api.rs` today, there's no
+// cancel-order or single-tick-depth endpoint yet, so both are only
+// exercised by this module's own tests. Real, needed functionality
+// (order cancellation; a narrower depth query than `OrderBook::snapshot`
+// gives), not speculative cruft, hence `allow` rather than delete.
 #![allow(dead_code)]
 
 use common::types::Side;
@@ -381,6 +383,27 @@ impl Ladder {
     }
 }
 
+/// One aggregated price level in a depth snapshot: resting size at that
+/// tick, plus the running sum of every better-or-equal level on the same
+/// side (nearest the touch first). Serializable — this is public,
+/// aggregate market data, not anything from the FIFO/arena internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PriceLevel {
+    pub tick: Tick,
+    pub qty: Qty,
+    pub cumulative: Qty,
+}
+
+/// A read-only snapshot of both sides of one market's book, see
+/// `OrderBook::snapshot`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BookSnapshot {
+    pub best_bid: Option<Tick>,
+    pub best_ask: Option<Tick>,
+    pub bids: Vec<PriceLevel>,
+    pub asks: Vec<PriceLevel>,
+}
+
 /// A single fill produced by matching an incoming order against resting
 /// liquidity. `maker_id` is the resting order that got hit; `taker`
 /// quantity crossed is `qty`.
@@ -477,6 +500,46 @@ impl OrderBook {
     pub fn depth_at(&self, side: Side, tick: Tick) -> Qty {
         let ladder = self.ladder(side);
         ladder.index_of(tick).map(|i| ladder.level(i).qty).unwrap_or(0)
+    }
+
+    /// A read-only depth view for one side, nearest-to-touch first,
+    /// capped at `max_levels` occupied price levels, with a running
+    /// cumulative sum per level. Walks the ladder via the occupancy
+    /// bitmap the same way `available_to_match` does, but without its
+    /// expiry/self-trade filtering — a depth view intentionally shows
+    /// everything currently resting (expiry is only ever enforced lazily
+    /// at match time, not proactively swept out of the book).
+    pub fn depth(&self, side: Side, max_levels: usize) -> Vec<PriceLevel> {
+        let ladder = self.ladder(side);
+        let mut out = Vec::with_capacity(max_levels.min(64));
+        let mut cumulative: Qty = 0;
+        let mut cursor = match side {
+            Side::Long => self.best_bid,
+            Side::Short => self.best_ask,
+        };
+        while out.len() < max_levels {
+            let Some(tick) = cursor else { break };
+            let Some(idx) = ladder.index_of(tick) else { break };
+            let qty = ladder.level(idx).qty;
+            cumulative += qty;
+            out.push(PriceLevel { tick, qty, cumulative });
+            cursor = ladder.next_worse_level(side, idx).map(|i| ladder.tick_at(i));
+        }
+        out
+    }
+
+    /// Both sides' depth plus the current touch, in one call — what a
+    /// read-only order-book snapshot endpoint hands back. Only ever
+    /// aggregate price/size per level, never `OwnerId` or order identity:
+    /// this is public market data, not the private per-order state
+    /// `ARCHITECTURE.md`'s privacy model keeps hidden.
+    pub fn snapshot(&self, max_levels: usize) -> BookSnapshot {
+        BookSnapshot {
+            best_bid: self.best_bid,
+            best_ask: self.best_ask,
+            bids: self.depth(Side::Long, max_levels),
+            asks: self.depth(Side::Short, max_levels),
+        }
     }
 
     fn ladder(&self, side: Side) -> &Ladder {
@@ -609,6 +672,38 @@ impl OrderBook {
         node
     }
 
+    /// Unlinks every expired head at the touch of `side`, repeatedly,
+    /// until the best remaining head is live or the side runs empty —
+    /// the same lazy-expiry cleanup the matching loop in `submit`
+    /// already does while it walks a side to fill against it, just
+    /// runnable standalone for a caller (the `post_only` guard) that
+    /// needs an honest best price WITHOUT actually matching anything.
+    /// Appends every id it drops to `expired_out`, same bookkeeping
+    /// `submit`'s own matching loop does for its `SubmitResult::expired`.
+    fn prune_expired_head(&mut self, side: Side, now: Timestamp, expired_out: &mut Vec<OrderId>) {
+        loop {
+            let best = match side {
+                Side::Long => self.best_bid,
+                Side::Short => self.best_ask,
+            };
+            let Some(level_tick) = best else { break };
+            let level_idx = self
+                .ladder(side)
+                .index_of(level_tick)
+                .expect("cached best price must always reference an allocated level");
+            let head = self.ladder(side).level(level_idx).head;
+            let expired = self.slot(head).expiry.is_some_and(|e| now >= e);
+            if !expired {
+                break;
+            }
+            self.unlink(head);
+            expired_out.push(head);
+            if self.ladder(side).level(level_idx).is_empty() {
+                self.advance_best_from(side, level_tick);
+            }
+        }
+    }
+
     /// Cancels a live resting order in O(1). Returns its remaining
     /// quantity and price if it was still live.
     pub fn cancel(&mut self, id: OrderId) -> Option<(Tick, Qty)> {
@@ -699,6 +794,22 @@ impl OrderBook {
         let opposite = opposite_side(side);
 
         if order.post_only {
+            // The matching loop below already prunes expired heads lazily
+            // as it walks the opposite side, but this guard runs BEFORE
+            // that loop and was reading `best_bid`/`best_ask` raw — an
+            // expired-but-not-yet-swept order at the touch (nothing has
+            // crossed it since it expired, since expiry is only enforced
+            // lazily, "on touch") made `would_cross` true forever against
+            // a price nothing live actually occupies anymore, silently
+            // rejecting every real requote on this side until some
+            // unrelated taker order happened to sweep it. A market maker
+            // with no cancel endpoint (post_offer's own module doc) hits
+            // this constantly: one side's quotes go stale, its own next
+            // cycle's fresh quote gets rejected by its own expired
+            // leftover, and that side never refreshes until the stale
+            // order finally gets swept — read from outside as "this side
+            // got eaten" / "only the last cycle's few levels are left."
+            self.prune_expired_head(opposite, now, &mut result.expired);
             let would_cross = match opposite {
                 Side::Long => self.best_bid.is_some_and(|bid| tick <= bid),
                 Side::Short => self.best_ask.is_some_and(|ask| tick >= ask),
@@ -1112,6 +1223,77 @@ mod tests {
         assert!(r.fills.is_empty());
         assert_eq!(r.resting_id, None, "a rejected post-only order rests nothing, not even its own quantity");
         assert_eq!(book.depth_at(Side::Short, 100), 5, "the resting maker order must be untouched");
+    }
+
+    #[test]
+    fn post_only_prunes_a_stale_expired_touch_instead_of_rejecting_against_it() {
+        // A maker with no cancel endpoint (market_maker.rs's own posture)
+        // leaves last cycle's ask resting past its GTT expiry until
+        // something touches it. A later cycle's post-only bid technically
+        // "crosses" that price, but the order sitting there is already
+        // dead — rejecting the new bid against a price nothing live
+        // occupies anymore is exactly the "this side won't refresh" bug
+        // this test locks in the fix for.
+        let mut book = OrderBook::new();
+        let stale = NewOrder { tif: TimeInForce::GoodTilTime(100), ..gtc(Side::Short, 100, 5, MAKER) };
+        book.submit(stale, 0);
+        let fresh_bid = NewOrder { post_only: true, ..gtc(Side::Long, 100, 5, MAKER) };
+        let r = book.submit(fresh_bid, 200); // now (200) is well past the stale order's expiry (100)
+        assert!(!r.post_only_rejected, "an expired resting order must not block a fresh post-only quote");
+        assert!(r.fills.is_empty(), "the stale order is pruned, not traded against");
+        assert_eq!(
+            r.expired,
+            vec![0],
+            "the stale order must be reported as expired, same as the matching loop would"
+        );
+        assert_eq!(r.resting_qty, 5);
+        assert_eq!(book.depth_at(Side::Short, 100), 0, "the stale ask must be gone from depth too");
+    }
+
+    #[test]
+    fn depth_reports_nearest_first_with_running_cumulative() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Short, 102, 4, MAKER), 0);
+        book.submit(gtc(Side::Short, 100, 5, MAKER), 0); // best ask
+        book.submit(gtc(Side::Short, 101, 3, MAKER), 0);
+
+        let asks = book.depth(Side::Short, 10);
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[0], PriceLevel { tick: 100, qty: 5, cumulative: 5 });
+        assert_eq!(asks[1], PriceLevel { tick: 101, qty: 3, cumulative: 8 });
+        assert_eq!(asks[2], PriceLevel { tick: 102, qty: 4, cumulative: 12 });
+    }
+
+    #[test]
+    fn depth_is_capped_at_max_levels() {
+        let mut book = OrderBook::new();
+        for tick in 100..110 {
+            book.submit(gtc(Side::Long, tick, 1, MAKER), 0);
+        }
+        assert_eq!(book.depth(Side::Long, 3).len(), 3);
+        assert_eq!(book.depth(Side::Long, 3)[0].tick, 109, "highest bid (best) must come first");
+    }
+
+    #[test]
+    fn snapshot_combines_both_sides_and_the_touch() {
+        let mut book = OrderBook::new();
+        book.submit(gtc(Side::Long, 99, 2, MAKER), 0);
+        book.submit(gtc(Side::Short, 101, 3, MAKER), 0);
+
+        let snapshot = book.snapshot(10);
+        assert_eq!(snapshot.best_bid, Some(99));
+        assert_eq!(snapshot.best_ask, Some(101));
+        assert_eq!(snapshot.bids, vec![PriceLevel { tick: 99, qty: 2, cumulative: 2 }]);
+        assert_eq!(snapshot.asks, vec![PriceLevel { tick: 101, qty: 3, cumulative: 3 }]);
+    }
+
+    #[test]
+    fn empty_book_snapshot_is_empty_not_a_panic() {
+        let book = OrderBook::new();
+        let snapshot = book.snapshot(10);
+        assert_eq!(snapshot.best_bid, None);
+        assert!(snapshot.bids.is_empty());
+        assert!(snapshot.asks.is_empty());
     }
 
     #[test]

@@ -19,8 +19,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 alloy = { workspace = true, features = ["k256", "serde", "signer-local", "provider-http", "rpc-types-eth", "reqwest", "sol-types"] }
+redb = "4"
 
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "time"] }
 nu-ansi-term = "0.50"
@@ -34,7 +35,7 @@ httparse = "1.9"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["limit", "timeout", "trace"] }
+tower-http = { version = "0.5", features = ["limit", "timeout", "trace", "cors"] }
 
 zk-circuits = { path = "../zk-circuits" }
 ark-bn254 = "0.5"

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+        <defs>
+          <linearGradient id="koreaRedGrad" x1="32" y1="16" x2="32" y2="48" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#ff4d5e" />
+            <stop offset="100%" stop-color="#cd2e3a" />
+          </linearGradient>
+          <linearGradient id="koreaBlueGrad" x1="32" y1="16" x2="32" y2="48" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#0066cc" />
+            <stop offset="100%" stop-color="#003d7a" />
+          </linearGradient>
+          <linearGradient id="koreaBgGrad" x1="32" y1="2" x2="32" y2="62" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#ffffff" />
+            <stop offset="100%" stop-color="#e8e8e8" />
+          </linearGradient>
+          <filter id="koreaInnerShadow">
+            <feOffset dx="1" dy="1" />
+            <feGaussianBlur stdDeviation="1" result="offset-blur" />
+            <feComposite operator="out" in="SourceGraphic" in2="offset-blur" result="inverse" />
+            <feFlood flood-color="#000" flood-opacity="0.4" result="color" />
+            <feComposite operator="in" in="color" in2="inverse" result="shadow" />
+            <feComposite operator="over" in="shadow" in2="SourceGraphic" />
+          </filter>
+        </defs>
+        <circle cx="32" cy="32" r="30" fill="url(#koreaBgGrad)" />
+        <g transform="translate(32,32) scale(0.45)" stroke="#000" stroke-width="4">
+          <path transform="rotate(33.69)" d="M-50-12v24m6 0v-24m6 0v24m76 0V1m0-2v-11m6 0v11m0 2v11m6 0V1m0-2v-11"/>
+          <path transform="rotate(-33.69)" d="M-50-12v24m6 0V1m0-2v-11m6 0v24m76 0V1m0-2v-11m6 0v24m6 0V1m0-2v-11"/>
+        </g>
+        <g transform="translate(32,32) scale(0.45) rotate(33.69)" filter="url(#koreaInnerShadow)">
+          <path fill="url(#koreaRedGrad)" d="M12 0a18 18 0 11-36 0 24 24 0 1148 0"/>
+          <path fill="url(#koreaBlueGrad)" d="M0 0a12 12 0 1124 0 24 24 0 11-48 0 12 12 0 1024 0"/>
+        </g>
+      </svg>

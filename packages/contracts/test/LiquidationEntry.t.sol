@@ -40,6 +40,46 @@ contract MockMarkPriceOracle {
     }
 }
 
+/// @dev Stand-in mark-price oracle that also implements the optional
+///      IDiscoveryBoundsOracle surface, so tests can flip `live` to simulate
+///      OracleHub's discovery-bounds fallback engaging (docs/trade-xyz-research.md
+///      section 2). Existing tests keep using the plain MockMarkPriceOracle above,
+///      which does NOT implement this surface, to prove the gate fails open for
+///      any oracle that doesn't support it.
+contract MockDiscoveryBoundsOracle {
+    uint256 public price;
+    bool public boundsEnabled;
+    bool public live = true;
+
+    constructor(uint256 initialPrice) {
+        price = initialPrice;
+    }
+
+    function setPrice(uint256 newPrice) external {
+        price = newPrice;
+    }
+
+    function setBoundsEnabled(bool enabled) external {
+        boundsEnabled = enabled;
+    }
+
+    function setLive(bool isLive) external {
+        live = isLive;
+    }
+
+    function markPrice(bytes32) external view returns (uint256) {
+        return price;
+    }
+
+    function discoveryBoundsEnabled(bytes32) external view returns (bool) {
+        return boundsEnabled;
+    }
+
+    function isPriceLive(bytes32) external view returns (bool) {
+        return live;
+    }
+}
+
 /// @dev Stand-in market extension (todo #14): permissive validator, no-op
 ///      lifecycle hooks with an `onLiquidation` invocation record, and the
 ///      canonical `MarketPosition` decoder (absolute size, matching the
@@ -129,16 +169,20 @@ contract LiquidationEntryTest is Test {
     /// @dev Canonical price: $100.00 per unit (1e18-scaled).
     uint256 internal constant PRICE = 100e18;
 
-    /// @dev Canonical breach setup: 10 units at $100 = $1,000 notional
-    ///      against $1,000 of USDC collateral = 100% utilisation.
+    /// @dev Canonical breach setup: 10 units at $100 = $1,000 notional.
+    ///      `checkAndFlag` now compares equity to maintenance margin
+    ///      (notional × MMR_BPS(300) = $30), not the old notional-vs-collateral
+    ///      formula (security-audit-tee-contracts.md finding C2) — $20 of
+    ///      collateral against $30 maintenance is a genuine breach with
+    ///      zero PnL (entry == mark in every test here unless stated).
     int256 internal constant SIZE = 10e18;
-    uint256 internal constant DEPOSIT = 1_000e18;
+    uint256 internal constant DEPOSIT = 20e18;
 
     function setUp() public {
         account = new ClearingAccount(admin);
         usdc = new MockERC20("USD Coin", "USDC");
         collateralEngine = new CollateralEngine(admin, address(usdc));
-        settlementEngine = new SettlementEngine(admin);
+        settlementEngine = new SettlementEngine(admin, 20);
         market = new MockMarket();
         oracle = new MockMarkPriceOracle(PRICE);
         entry = new LiquidationEntry(
@@ -244,31 +288,41 @@ contract LiquidationEntryTest is Test {
         assertTrue(account.accounts(trader), "breached account must be frozen");
     }
 
-    /// @notice Utilisation exactly AT the 85% gamma flags; one step below
-    ///         does not — and the entry's gamma has not drifted from
-    ///         `ProtocolConstants` (the drift-guard pattern).
+    /// @notice Drift guard: entry's local MMR_BPS mirrors ProtocolConstants.MMR_BPS,
+    ///         the real predicate `checkAndFlag` now uses (equity vs maintenance
+    ///         margin, security-audit-tee-contracts.md finding C2) — the old
+    ///         `LIQUIDATION_GAMMA_PERCENT`-based notional-vs-collateral comparison
+    ///         is no longer what gates a flag.
     function test_UtilisationBoundaryAtGamma() public view {
-        // Drift guard: entry constant mirrors ProtocolConstants.
-        assertEq(constants.liquidationGammaPercent(), 85, "MVP gamma is 85%");
+        assertEq(constants.mmrBps(), 300, "MVP maintenance margin rate is 3%");
 
-        // Boundary arithmetic in the cross-multiplied form the entry uses:
-        // flagged  <=>  notional * 100 >= collateral * 85.
-        uint256 collateral = 200e18;
-        uint256 atGammaNotional = 170e18; // exactly 85% of collateral
-        uint256 belowGammaNotional = 169e18; // 84.5% of collateral
-        assertTrue(atGammaNotional * 100 >= collateral * 85, "exactly 85% flags");
-        assertFalse(belowGammaNotional * 100 >= collateral * 85, "84.5% stays healthy");
+        // Boundary arithmetic checkAndFlag actually runs: flagged <=> equity <
+        // notional * MMR_BPS / 10_000. With zero PnL (entry == mark), equity ==
+        // collateral, so this reduces to collateral < notional * 300 / 10_000.
+        uint256 notional = 1_000e18;
+        uint256 maintenance = notional * 300 / 10_000; // $30
+        assertFalse(maintenance < maintenance, "collateral exactly at maintenance stays healthy (strict <)");
+        assertTrue(maintenance - 1 < maintenance, "one wei below maintenance breaches");
     }
 
-    /// @notice End-to-end boundary: 85.0% utilisation freezes the account.
+    /// @notice End-to-end boundary: equity exactly at maintenance margin stays
+    ///         healthy (checkAndFlag's `<` is strict); one wei below flags.
     function test_UtilisationExactlyGammaFreezes() public {
-        _fund(trader, 200e18);
-        _openLong(trader, 17e17); // 1.7 units at $100 = $170 = 85% of $200
+        // 10 units at $100 = $1,000 notional; maintenance = $30.
+        _fund(trader, 30e18);
+        _openLong(trader, SIZE);
+        assertFalse(entry.checkAndFlag(trader, MARKET_ID), "equity exactly at maintenance must stay healthy");
+        assertFalse(account.accounts(trader));
 
-        bool flagged = entry.checkAndFlag(trader, MARKET_ID);
+        // A fresh trader one wei under maintenance does flag.
+        address trader2 = makeAddr("trader2");
+        _fund(trader2, 30e18 - 1);
+        vm.prank(admin);
+        settlementEngine.settleTrade(MARKET_ID, trader2, counterparty, SIZE, PRICE, 0);
 
-        assertTrue(flagged, "utilisation at exactly gamma must flag");
-        assertTrue(account.accounts(trader));
+        bool flagged = entry.checkAndFlag(trader2, MARKET_ID);
+        assertTrue(flagged, "one wei below maintenance must flag");
+        assertTrue(account.accounts(trader2));
     }
 
     /// @notice A position with ZERO effective collateral is bankrupt by
@@ -429,18 +483,19 @@ contract LiquidationEntryTest is Test {
     ///         reverting on the zero-amount guard.
     function test_DustPenaltyRoutesToInsuranceSide() public {
         // 1 wei of size at $100 = $100 wei of notional (1e-16 dollars);
-        // penalty = 100 / 100 = 1 wei. Collateral of 100 wei breaches
-        // utilisation (100*100 >= 100*85).
-        _fund(trader, 100);
+        // maintenance = 100 * 300 / 10_000 = 3 wei. 1 wei of collateral is
+        // strictly below that, a genuine breach; penalty = 100 / 100 = 1 wei.
+        _fund(trader, 1);
         _openLong(trader, 1);
-        entry.checkAndFlag(trader, MARKET_ID);
+        bool flagged = entry.checkAndFlag(trader, MARKET_ID);
+        assertTrue(flagged, "setup: 1 wei collateral must breach 3 wei maintenance");
 
         vm.prank(liquidator);
         entry.executeStandardLiquidation(trader, MARKET_ID, type(uint256).max);
 
         assertEq(account.collateralBalanceOf(liquidator, address(usdc)), 0, "dust share rounds to zero");
         assertEq(account.collateralBalanceOf(insuranceFund, address(usdc)), 1, "whole dust chunk to insurance");
-        assertEq(account.collateralBalanceOf(trader, address(usdc)), 99);
+        assertEq(account.collateralBalanceOf(trader, address(usdc)), 0);
     }
 
     // ---------------------------------------------------------------------
@@ -515,6 +570,83 @@ contract LiquidationEntryTest is Test {
         entry.executeStandardLiquidation(trader, MARKET_ID, type(uint256).max);
     }
 
+    // ---------------------------------------------------------------------
+    // Discovery-bounds gating (docs/trade-xyz-research.md section 2).
+    // ---------------------------------------------------------------------
+
+    /// @notice A plain oracle that doesn't implement IDiscoveryBoundsOracle at all
+    ///         (MockMarkPriceOracle, same as every other test in this file) never
+    ///         gates — liquidation flags exactly as before this feature existed.
+    function test_LiquidationStillFlagsWhenOracleDoesNotSupportDiscoveryBounds() public {
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice A discovery-bounds oracle with bounds DISABLED for this market
+    ///         behaves exactly like a plain oracle — the gate only ever engages
+    ///         for a market that opted in.
+    function test_LiquidationFlagsWhenBoundsSupportedButDisabled() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice Bounds enabled but the live feed unavailable: checkAndFlag refuses
+    ///         to flag off the fallback price rather than triggering a liquidation
+    ///         nobody could have defended against during a price gap.
+    function test_CheckAndFlagRefusesToFlagOnUnreliableFallback() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertFalse(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice Once the feed is live again, the exact same account flags normally.
+    function test_CheckAndFlagResumesOnceFeedIsLiveAgain() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertFalse(entry.checkAndFlag(trader, MARKET_ID));
+
+        boundsOracle.setLive(true);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+    }
+
+    /// @notice executeStandardLiquidation reverts (rather than silently no-op'ing)
+    ///         when the fallback is unreliable, since a caller reaching execute
+    ///         already believes the account was validly flagged.
+    function test_ExecuteStandardLiquidationRevertsOnUnreliableFallback() public {
+        MockDiscoveryBoundsOracle boundsOracle = new MockDiscoveryBoundsOracle(PRICE);
+        vm.prank(admin);
+        entry.setMarkPriceOracle(address(boundsOracle));
+
+        _fund(trader, DEPOSIT);
+        _openLong(trader, SIZE);
+        assertTrue(entry.checkAndFlag(trader, MARKET_ID));
+
+        boundsOracle.setBoundsEnabled(true);
+        boundsOracle.setLive(false);
+
+        vm.expectRevert(abi.encodeWithSelector(LiquidationEntry.PriceUnreliable.selector, MARKET_ID));
+        vm.prank(liquidator);
+        entry.executeStandardLiquidation(trader, MARKET_ID, type(uint256).max);
+    }
+
     /// @notice Admin setters are gated; a stranger cannot rewire the
     ///         oracle or the insurance fund.
     function test_NonAdminReverts() public {
@@ -544,16 +676,18 @@ contract LiquidationEntryTest is Test {
         int256 size = int256(bound(sizeSeed, 1e15, 100e18)); // 0.001 - 100 units
         uint256 notional = uint256(size) * PRICE / 1e18;
 
-        // Deposit bounded so utilisation >= 85% (the account always
-        // breaches): deposit <= notional * 100 / 85.
-        uint256 maxBreachDeposit = notional * 100 / 85;
-        uint256 deposit = bound(depositSeed, 1, maxBreachDeposit);
+        // Deposit bounded strictly below maintenance margin (notional * MMR_BPS /
+        // 10_000): checkAndFlag's predicate is a strict `<`, so equity exactly at
+        // maintenance stays healthy — the account must always breach here.
+        uint256 maintenance = notional * 300 / 10_000;
+        vm.assume(maintenance >= 2);
+        uint256 deposit = bound(depositSeed, 1, maintenance - 1);
 
         _fund(trader, deposit);
         _openLong(trader, size);
 
         bool flagged = entry.checkAndFlag(trader, MARKET_ID);
-        assertTrue(flagged, "bounded deposit always breaches gamma");
+        assertTrue(flagged, "bounded deposit always breaches maintenance margin");
 
         uint256 custodyBefore = usdc.balanceOf(address(account));
 

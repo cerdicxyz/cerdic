@@ -1,4 +1,5 @@
 node_modules/
+*.redb
 target/
 out/
 cache/
@@ -14,3 +15,7 @@ app/package-lock.json
 app/vite.config.d.ts
 app/vite.config.js
 .DS_Store
+*.aux
+*.out
+*.toc
+__pycache__/

@@ -4,6 +4,32 @@ Date: 2026-07-30
 Project: `cer-perp-tee`
 Tester: Claude Code, on request
 
+## Update 2026-08-04: real cerdic-tee-matcher image, project cerdic-504518
+
+Everything below this section used a purpose-built dummy container, not the
+real matcher. Retested against the actual `cerdic-tee-matcher` image
+(`us-central1-docker.pkg.dev/cerdic-504518/tee-match-repo/cerdic-tee-matcher@sha256:ae99264165a47f2da973487b6a3c7110fd5d7d1dac4aaac858d54d5eeb06069e`,
+built natively on Cloud Build since QEMU-emulated `docker build --platform=linux/amd64`
+segfaulted compiling rustc on this Apple Silicon host) on a fresh project,
+`cerdic-504518` (`cer-perp-tee` is no longer the active project).
+
+Same `c3-standard-4` / TDX / no-external-IP recipe as below, minus a fresh
+service account setup (Private Google Access, IAP SSH firewall rule,
+`confidentialcomputing.workloadUser` + `artifactregistry.reader` +
+`logging.logWriter` on the default compute SA, none of which existed yet on
+this project). The matcher's own `/pubkey` endpoint returned a real,
+non-null attestation token, `attestation.rs`'s `launcher_present()` check
+found the real socket, no "running in local dev mode, unattested" log line.
+
+Decoded claims matched exactly: `iss=https://confidentialcomputing.googleapis.com`,
+`aud=cerdic-tee-matcher`, `hwmodel=GCP_INTEL_TDX`, `secboot=true`,
+`tdx.gcp_attester_tcb_status=UpToDate`, and critically
+`submods.container.image_digest=sha256:ae99264165a47f2da973487b6a3c7110fd5d7d1dac4aaac858d54d5eeb06069e`,
+byte-for-byte the digest actually pushed. This is the first time the real
+deployed image (not a stand-in) has been verified end to end under genuine
+TDX hardware attestation. VM deleted immediately after the token was
+captured.
+
 ## Update: Intel TDX succeeds where AMD SEV-SNP failed
 
 The AMD SEV-SNP test below found working hardware but a hard rejection from Google's own OIDC attestation service (`UNSUPPORTED_CC_TECHNOLOGY`). Retested the same workload on Intel TDX instead, same day, same project.

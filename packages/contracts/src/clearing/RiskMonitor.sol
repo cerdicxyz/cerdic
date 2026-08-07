@@ -10,10 +10,26 @@ interface IRiskMonitor {
     function isWithdrawSafe(address trader, address asset, uint256 amount) external view returns (bool);
 }
 
+/// @title IAttestationRouter
+/// @notice Subset of AttestationRouter this contract needs: which addresses
+///         are authorized TEE attesters.
+interface IAttestationRouter {
+    function isAuthorizedTEE(address tee) external view returns (bool);
+}
+
 /// @title  RiskMonitor
-/// @notice Isolated (not cross-market) maintenance-margin engine and liquidation trigger.
+/// @notice Isolated (not cross-market) maintenance-margin engine and liquidation trigger,
+///         plus a TEE-attested full portfolio margin (M(P) = f_S + f_C + f_L + f_K,
+///         paper/cerdic.tex sec:margin) enforcement path.
 /// @dev    MMR_BPS = 300 (3%, 60% of the 5% initial-margin requirement). Every read reverts
 ///         while its dependency is unwired (fail-closed).
+///
+///         Full portfolio margin (scenario/concentration/liquidity/correlation terms) is
+///         computed off-chain (crates/risk) since scenario sets and correlation matrices
+///         are not gas-shaped work. An authorized TEE (AttestationRouter) submits the
+///         result here; `effectiveMarginRequirement` uses it while it is fresh and falls
+///         back to the isolated on-chain sum otherwise, so a stale or missing attestation
+///         can never leave a trader under-margined, only conservatively over-margined.
 contract RiskMonitor is IRiskMonitor {
     uint256 internal constant SCALE = 1e18;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
@@ -29,15 +45,52 @@ contract RiskMonitor is IRiskMonitor {
     /// @notice Zero = unset; margin reads revert OracleNotSet.
     IMarkPriceOracle public markPriceOracle;
 
+    /// @notice Zero = unset; submitPortfolioMargin reverts NotAuthorizedAttester.
+    IAttestationRouter public attestationRouter;
+
     /// @dev Registration order; the summation domain of the margin requirement.
     bytes32[] internal _markets;
     mapping(bytes32 => bool) internal _marketRegistered;
+
+    /// @notice Which execution path a market runs on. `Clob` (the zero
+    ///         value) is the default for every newly registered market,
+    ///         matching what every market already does today: a
+    ///         continuously-matched order book, with the kernel-owned
+    ///         backstop maker (crates/cerdic-tee-matcher::backstop)
+    ///         resting inside that same book as a floor, not a separate
+    ///         mode. `BackstopOnly` and `Rfq` are named here as the real
+    ///         open question this session's research left (does a thin
+    ///         FX pair want continuous book liquidity or a dealer-quoted
+    ///         RFQ path), not yet consumed by anything: the TEE matcher
+    ///         has no RPC client to read this on-chain value with, the
+    ///         same infrastructure gap documented in backstop.rs and
+    ///         api.rs's module docs for the missing oracle feed. This is
+    ///         the canonical, governance-controlled decision surface for
+    ///         that question, not a behavior switch yet.
+    enum ExecutionMode {
+        Clob,
+        BackstopOnly,
+        Rfq
+    }
+
+    mapping(bytes32 => ExecutionMode) public executionMode;
+
+    /// @dev Latest off-chain-computed full portfolio margin per trader, TEE-attested.
+    struct PortfolioAttestation {
+        uint256 requirement;
+        uint64 expiry;
+    }
+
+    mapping(address => PortfolioAttestation) internal _portfolioAttestations;
 
     event PositionEngineUpdated(address indexed engine);
     event CollateralEngineUpdated(address indexed engine);
     event LiquidationEntryUpdated(address indexed entry);
     event MarkPriceOracleUpdated(address indexed oracle);
+    event AttestationRouterUpdated(address indexed router);
     event MarketRegistered(bytes32 indexed marketId);
+    event ExecutionModeSet(bytes32 indexed marketId, ExecutionMode mode);
+    event PortfolioMarginAttested(address indexed trader, uint256 requirement, uint64 expiry, address indexed attester);
 
     error NotAdmin();
     error ZeroAddress();
@@ -46,6 +99,10 @@ contract RiskMonitor is IRiskMonitor {
     error PositionEngineNotSet();
     error CollateralEngineNotSet();
     error LiquidationEntryNotSet();
+    error AttestationRouterNotSet();
+    error NotAuthorizedAttester();
+    error AttestationAlreadyExpired();
+    error MarketNotRegistered(bytes32 marketId);
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
@@ -80,6 +137,45 @@ contract RiskMonitor is IRiskMonitor {
         }
     }
 
+    /// @notice A TEE authorized via `attestationRouter` submits the full portfolio margin
+    ///         requirement it computed off-chain (crates/risk `compute_portfolio_margin`)
+    ///         for `trader`, valid until `expiry`. Overwrites any prior attestation for
+    ///         the same trader; there is no partial update, matching the capability-token
+    ///         non-retroactivity pattern elsewhere in the kernel: a new attestation fully
+    ///         replaces the old one rather than adjusting it.
+    function submitPortfolioMargin(address trader, uint256 requirement, uint64 expiry) external {
+        IAttestationRouter router = attestationRouter;
+        if (address(router) == address(0)) revert AttestationRouterNotSet();
+        if (!router.isAuthorizedTEE(msg.sender)) revert NotAuthorizedAttester();
+        if (expiry <= block.timestamp) revert AttestationAlreadyExpired();
+
+        _portfolioAttestations[trader] = PortfolioAttestation({requirement: requirement, expiry: expiry});
+        emit PortfolioMarginAttested(trader, requirement, expiry, msg.sender);
+    }
+
+    /// @notice The latest portfolio-margin attestation for `trader` and whether it is
+    ///         still fresh (`expiry > now`). A stale attestation is not deleted, only
+    ///         ignored by `effectiveMarginRequirement`.
+    function portfolioMarginRequirement(address trader) public view returns (uint256 requirement, bool fresh) {
+        PortfolioAttestation memory attestation = _portfolioAttestations[trader];
+        fresh = attestation.expiry > block.timestamp;
+        requirement = attestation.requirement;
+    }
+
+    /// @notice The requirement `isWithdrawSafe`/`checkLiquidation` actually enforce: the
+    ///         fresh TEE-attested full portfolio margin when one exists (captures the
+    ///         `f_K` hedge credit an isolated sum cannot), else the isolated on-chain sum.
+    ///         Fail-safe by construction: an unset or expired attestation can only ever
+    ///         fall back to the MORE conservative isolated requirement, never silently
+    ///         under-margin a trader.
+    function effectiveMarginRequirement(address trader) public view returns (uint256) {
+        (uint256 attested, bool fresh) = portfolioMarginRequirement(trader);
+        if (fresh) {
+            return attested;
+        }
+        return currentMarginRequirement(trader);
+    }
+
     /// @dev Unregistered asset values at zero (caught AssetNotRegistered), can't breach margin.
     function isWithdrawSafe(address trader, address asset, uint256 amount) external view override returns (bool) {
         CollateralEngine collateral = collateralEngine;
@@ -90,7 +186,7 @@ contract RiskMonitor is IRiskMonitor {
         if (withdrawValue > effectiveCollateral) {
             return false;
         }
-        return effectiveCollateral - withdrawValue >= currentMarginRequirement(trader);
+        return effectiveCollateral - withdrawValue >= effectiveMarginRequirement(trader);
     }
 
     /// @notice On breach (requirement > collateral), delegates flagging to
@@ -104,7 +200,7 @@ contract RiskMonitor is IRiskMonitor {
         LiquidationEntry entry = liquidationEntry;
         if (address(entry) == address(0)) revert LiquidationEntryNotSet();
 
-        uint256 requirement = currentMarginRequirement(trader);
+        uint256 requirement = effectiveMarginRequirement(trader);
         uint256 effectiveCollateral = collateral.effectiveCollateral(trader);
         breached = requirement > effectiveCollateral;
         if (!breached) {
@@ -142,6 +238,11 @@ contract RiskMonitor is IRiskMonitor {
         emit MarkPriceOracleUpdated(oracle);
     }
 
+    function setAttestationRouter(address router) external onlyAdmin {
+        attestationRouter = IAttestationRouter(router);
+        emit AttestationRouterUpdated(router);
+    }
+
     /// @dev Idempotent, never double-counts a market.
     function registerMarket(bytes32 marketId) external onlyAdmin {
         if (marketId == bytes32(0)) revert ZeroMarketId();
@@ -155,6 +256,15 @@ contract RiskMonitor is IRiskMonitor {
 
     function registeredMarkets() external view returns (bytes32[] memory) {
         return _markets;
+    }
+
+    /// @notice Sets which execution path `marketId` runs on. Only ever
+    ///         callable on an already-registered market: the mode is a
+    ///         property OF a market, not a way to pre-declare one.
+    function setExecutionMode(bytes32 marketId, ExecutionMode mode) external onlyAdmin {
+        if (!_marketRegistered[marketId]) revert MarketNotRegistered(marketId);
+        executionMode[marketId] = mode;
+        emit ExecutionModeSet(marketId, mode);
     }
 
     function _withdrawValueUsd(CollateralEngine collateral, address asset, uint256 amount)

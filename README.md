@@ -1,68 +1,83 @@
-# Cerdic
+<div align="center">
+  <img src="app/public/logos/android-chrome-512x512.png" alt="Cerdic Logo" width="120" />
+  <h1>Cerdic</h1>
+  <p>
+    <b>Private, leveraged clearing for stablecoin finance on Arc.</b>
+  </p>
+  <p>
+    <a href="https://cerdicxyz.github.io/"><img src="https://img.shields.io/badge/docs-cerdic.xyz-3ee6b0?style=flat-square&logoColor=white" alt="Docs"></a>
+    <a href="https://github.com/cerdicxyz/cerdic"><img src="https://img.shields.io/github/license/cerdicxyz/cerdic?style=flat-square" alt="License"></a>
+    <a href="https://github.com/cerdicxyz/cerdic"><img src="https://img.shields.io/github/stars/cerdicxyz/cerdic?style=flat-square&color=3ee6b0" alt="Stars"></a>
+    <img src="https://img.shields.io/badge/Rust-1.75+-f74c00?style=flat-square&logo=rust&logoColor=white" alt="Rust">
+    <img src="https://img.shields.io/badge/Solidity-0.8.24-363636?style=flat-square&logo=solidity&logoColor=white" alt="Solidity">
+    <img src="https://img.shields.io/badge/Arc-Testnet-3ee6b0?style=flat-square" alt="Arc Testnet">
+  </p>
+  <p>
+    <a href="https://cerdicxyz.github.io/"><b>Docs</b></a> •
+    <a href="paper/cerdic.pdf"><b>Paper</b></a> •
+    <a href="ARCHITECTURE.md"><b>Architecture</b></a> •
+    <a href="#getting-started"><b>Getting Started</b></a>
+  </p>
+</div>
 
-Cerdic is a private, leveraged clearing layer for Arc. One collateral pool backs positions across perpetuals, FX, RWAs, and strategy vaults. Positions are margined at the portfolio level, matched inside a TEE, and earn yield the whole time.
+---
 
-1. **Portfolio margin.** Collateral is posted once, against the whole account, not per position. A long EURC/USDC hedge nets against a USDC-denominated perpetual instead of each requiring its own margin.
-2. **Private matching.** Orders are matched inside a TEE, not a public mempool or visible order book. The chain sees a settled trade; it never sees the order that produced it.
-3. **Yield-bearing collateral.** Collateral backing a position earns yield (USYC and similar instruments) instead of sitting idle.
+## Table of Contents
 
-- extensionable (hooks)
+- [Meet Cerdic](#meet-cerdic)
+- [Key Features](#key-features)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+- [Documentation](#documentation)
+- [License](#license)
 
-## Architecture overview
+---
 
-![Cerdic architecture overview](docs/overflow.png)
+## Meet Cerdic
 
-Trader/agent submits an encrypted order to a dual-cloud TEE matcher (GCP Confidential Space plus AWS Nitro Enclave, independent hardware trust domains, same matcher binary). The matcher's output passes through `AttestationRouter` and ZK verifiers on Arc EVM into the clearing kernel (accounts, collateral, positions, settlement) and risk engine, which route to markets, the oracle, and the insurance fund, settling in USDC/EURC via CCTP.
+Cerdic is a clearing kernel for Arc. One collateral pool backs positions across perpetuals, FX, RWAs, and strategy vaults. Positions are margined at the portfolio level, matched inside a TEE, and earn yield the whole time.
 
-## Trade lifecycle
+## Key Features
 
-Every trade takes the same path, regardless of which market extension or execution mode produced the match:
+**Portfolio margin** Collateral is posted once, against the whole account, not per position. A long EURC/USDC hedge nets against a USDC-denominated perpetual instead of each requiring its own margin.
 
+**Private matching** Orders are matched inside a TEE, not a public mempool or visible order book. The chain sees a settled trade; it never sees the order that produced it.
+
+**Yield-bearing collateral** Collateral backing a position earns yield (USYC and similar instruments) instead of sitting idle.
+
+**Market extensions** A market implements one interface (`IMarket`) and a handful of lifecycle callbacks; the kernel never needs to know what the market _is_. FX is the first module.
+
+## Architecture
+
+<p align="center">
+  <img src="docs/architecture.png" alt="Cerdic architecture: Frontend signs and encrypts an order to cerdic-tee-matcher, which decrypts, matches, and seals the position, then submits an attested settlement tx to Account.sol, SettlementEngine.sol, RiskMonitor.sol, and AttestationRouter.sol on Arc; keepers keep prices and liquidations live." width="720">
+</p>
+
+**Matching kernel** ([`crates/cerdic-tee-matcher`](crates/cerdic-tee-matcher)) — one Rust binary that decrypts signed orders, matches them against an in-memory book, and seals the resulting position (side, size, leverage never touch plaintext on-chain). Designed to run identically inside GCP Confidential Space and AWS Nitro Enclaves, so no single cloud vendor's attestation chain is a single point of trust.
+
+**Settlement layer** ([`packages/contracts`](packages/contracts)) — `Account.sol` is the one place real collateral custody lives (plain ERC20 deposit/withdraw); `SettlementEngine.sol` is deployed once per market and tracks each sealed position's collateral bound, gated to attested TEE callers via `AttestationRouter.sol`; `RiskMonitor.sol` enforces margin on withdrawal and liquidation. Trading itself is pure accounting inside `SettlementEngine`, reconciled against real custody in `Account.sol` — no on-chain gas cost per fill.
+
+**Keepers** ([`crates/cerdic-tee-matcher/src/bin`](crates/cerdic-tee-matcher/src/bin)) — independent processes that keep the system live: `keeper_price_pusher` pushes real Pyth prices on-chain (funding checkpoints revert without it), `keeper_liquidator` watches public sealed-position events and liquidates underwater portfolios, `market_maker` provides resting liquidity.
+
+**Frontend** ([`app/`](app)) — a browser client that signs and encrypts orders client-side before they ever reach the matcher.
+
+Full depth (privacy model, correctness proofs, market lifecycle) is in the [docs](https://cerdicxyz.github.io/guide/architecture).
+
+## Getting Started
+
+```bash
+git clone https://github.com/cerdicxyz/cerdic
+cd cerdic
 ```
-Order submitted → Matched (TEE / CLOB) → Margin checked → Position + collateral updated
-                                              │
-                                           fail → back to Order submitted
-```
 
-Funding and liquidation settlement follow the same shape: an event triggers a kernel-computed balance change, applied atomically with the position update. The kernel never interprets market-specific fields (positions are opaque bytes with typed accessors); it only enforces that collateral changes are atomic with position changes.
+The monorepo contains contracts, a Rust matching engine, a TEE prototype, and a frontend. See [`docs/`](docs/) for detailed setup.
 
-## Portfolio margin
+## Documentation
 
-Margining each position independently over-collateralizes hedged accounts. A trader long 10 BTC-notional on one market and short 9.5 BTC-notional on another has 0.5 BTC of real risk but would post margin on 19.5 BTC of gross notional under isolated margin. Cerdic margins the account, not the position:
+- [cerdicxyz.github.io](https://cerdicxyz.github.io/) — public docs: concepts, trading, API/contract reference.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — the full internal architecture writeup.
+- [`docs/`](docs/) — deployment runbooks, keeper setup, and other operational notes.
 
-$$\mathcal{M}(\mathcal{P}) = f_S(\mathcal{P}) + f_C(\mathcal{P}) + f_L(\mathcal{P}) + f_K(\mathcal{P})$$
+## License
 
-- $f_S$ **(scenario margin):** worst-case loss across a scenario set (parallel price shifts, funding-rate spikes, correlation breakdown).
-- $f_C$ **(concentration charge):** penalizes exposure concentrated in one asset group beyond a threshold.
-- $f_L$ **(liquidity charge):** larger for thinner markets, scales with position size.
-- $f_K$ **(correlation adjustment):** opposite-direction correlated positions reduce margin (a genuine hedge); same-direction correlated positions increase it (concentrated risk, not diversification).
-
-Effective collateral, summed over every posted asset:
-
-$$\mathcal{C}_{\text{eff}} = \sum_{a} b_a \cdot (1 - h_a) \cdot p_a$$
-
-```
-Healthy --[C_eff < M]--> Warning --[C_eff < γ·M]--> Liquidation
-   ^                        |
-   └──────── top up / reduce ┘
-```
-
-Liquidation is tranched, not all-at-once, to avoid cascades. The insurance fund target scales with the square root of aggregate squared position size:
-
-$$F^{*} = \kappa\sqrt{\sum_p \text{size}_p^2}$$
-
-## Private matching
-
-Orders are end-to-end encrypted to the TEE's public key, never touching a public mempool. Inside the enclave, the matcher decrypts, matches, checks margin, and computes settlement, then submits an attested, sealed result on-chain. The kernel trusts the attested output; it never recomputes from plaintext. It does not depend on the TEE for *correctness*, only for *confidentiality*: a compromised enclave leaks order flow, it cannot forge a settlement.
-
-Two independent hardware trust domains run the same matcher binary: GCP Confidential Space (AMD SEV-SNP) as primary, AWS Nitro Enclaves as secondary, so no single cloud vendor's attestation chain is a single point of failure. ZK correctness proofs (`MatchCorrectness`, `MarginCorrectness`, Groth16/BN254) are generated asynchronously and verified on-chain post-settlement, threshold-gated so the common case doesn't pay proving cost up front.
-
-## Market extensions
-
-A market implements one interface (`IMarket`) and a handful of lifecycle callbacks; the kernel never needs to know what the market *is*. FX is the first module (EURC/USDC at launch, funding follows the interest-rate differential). Later modules, including BTC/USDC, RWA and rate markets, and strategy vaults, plug into the same interface without kernel changes.
-
-## Papers
-
-- [`paper/cerdic.tex`](paper/cerdic.tex): full protocol paper
-- [`paper/cerdic-propdesk.tex`](paper/cerdic-propdesk.tex): prop-desk brief
-- [`ARCHITECTURE.md`](ARCHITECTURE.md): implementation-level architecture and TEE deployment detail
+[MIT](LICENSE)

@@ -7,11 +7,17 @@
 
 pub mod api;
 pub mod attestation;
+pub mod backstop;
 pub mod book;
 pub mod decrypt;
+pub mod fees;
 pub mod keystore;
 pub mod kms;
 pub mod logging;
+pub mod market_data;
+pub mod market_hours;
+pub mod oracle;
+pub mod persistence;
 pub mod proof;
 pub mod sealed;
 pub mod settle;

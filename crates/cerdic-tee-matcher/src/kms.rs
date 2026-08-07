@@ -107,6 +107,28 @@ impl EnclaveSecrets {
         portfolio_key_secret.copy_from_slice(&bytes[64..96]);
         Ok(Self { sealed_key, settlement_signer_seed, portfolio_key_secret })
     }
+
+    /// Derives the three secrets deterministically from a hex seed, via
+    /// domain-separated `keccak256(seed || label)` for each: same seed
+    /// in means same three secrets out, every time, across restarts.
+    /// Only ever reached through `CERDIC_DEV_SECRETS_SEED`, see
+    /// `recover_or_generate`'s doc on why this exists and why it's safe.
+    fn from_dev_seed(seed_hex: &str) -> Result<Self, KmsError> {
+        use alloy::primitives::keccak256;
+        let seed_hex = seed_hex.strip_prefix("0x").unwrap_or(seed_hex);
+        let seed = hex::decode(seed_hex).map_err(|_| KmsError::BadLength(seed_hex.len()))?;
+
+        let derive = |label: &str| -> [u8; 32] {
+            let mut input = seed.clone();
+            input.extend_from_slice(label.as_bytes());
+            *keccak256(&input)
+        };
+        Ok(Self {
+            sealed_key: derive("sealed_key"),
+            settlement_signer_seed: derive("settlement_signer_seed"),
+            portfolio_key_secret: derive("portfolio_key_secret"),
+        })
+    }
 }
 
 /// Recovers this enclave's secrets from KMS-wrapped state in GCS, or
@@ -115,7 +137,31 @@ impl EnclaveSecrets {
 /// misconfiguration) logs and falls back to fresh ephemeral secrets, so
 /// a persistence outage degrades to the old behavior instead of taking
 /// the matcher down.
+///
+/// `CERDIC_DEV_SECRETS_SEED` (a 32-byte hex string) is checked first, a
+/// deterministic local-dev alternative to ephemeral-random: without it,
+/// every restart of an unattested local matcher loses continuity (a new
+/// settlement address needing re-authorization, every prior sealed
+/// position becoming unreadable), which makes ordinary local
+/// multi-session testing painful for no real reason, there's no
+/// attestation boundary to protect on a dev machine that isn't already
+/// broken. Never checked on a real Confidential Space boot: the KMS
+/// path above always wins when `CERDIC_KMS_KEY_NAME`/`CERDIC_STATE_BUCKET`
+/// are set, this is purely a fallback for the "neither configured" case.
 pub async fn recover_or_generate() -> EnclaveSecrets {
+    if let Ok(seed_hex) = std::env::var("CERDIC_DEV_SECRETS_SEED") {
+        match EnclaveSecrets::from_dev_seed(&seed_hex) {
+            Ok(secrets) => {
+                tracing::warn!(
+                    "using CERDIC_DEV_SECRETS_SEED, a deterministic local-dev fallback, \
+                     never valid for a real deployment"
+                );
+                return secrets;
+            }
+            Err(e) => tracing::warn!(error = %e, "CERDIC_DEV_SECRETS_SEED set but invalid, ignoring it"),
+        }
+    }
+
     match try_recover_or_generate().await {
         Ok(secrets) => secrets,
         Err(e) => {
@@ -329,6 +375,42 @@ mod tests {
         assert_ne!(secrets.sealed_key, [0u8; 32]);
         assert_ne!(secrets.sealed_key, secrets.settlement_signer_seed);
         assert_ne!(secrets.settlement_signer_seed, secrets.portfolio_key_secret);
+    }
+
+    #[test]
+    fn dev_seed_is_deterministic_across_calls() {
+        let a = EnclaveSecrets::from_dev_seed("aa".repeat(32).as_str()).unwrap();
+        let b = EnclaveSecrets::from_dev_seed("aa".repeat(32).as_str()).unwrap();
+        assert_eq!(a.sealed_key, b.sealed_key);
+        assert_eq!(a.settlement_signer_seed, b.settlement_signer_seed);
+        assert_eq!(a.portfolio_key_secret, b.portfolio_key_secret);
+    }
+
+    #[test]
+    fn dev_seed_accepts_0x_prefix_identically() {
+        let a = EnclaveSecrets::from_dev_seed(&"bb".repeat(32)).unwrap();
+        let b = EnclaveSecrets::from_dev_seed(&format!("0x{}", "bb".repeat(32))).unwrap();
+        assert_eq!(a.portfolio_key_secret, b.portfolio_key_secret);
+    }
+
+    #[test]
+    fn different_dev_seeds_give_different_secrets() {
+        let a = EnclaveSecrets::from_dev_seed(&"aa".repeat(32)).unwrap();
+        let b = EnclaveSecrets::from_dev_seed(&"bb".repeat(32)).unwrap();
+        assert_ne!(a.portfolio_key_secret, b.portfolio_key_secret);
+    }
+
+    #[test]
+    fn dev_seed_derives_three_distinct_secrets_from_one_seed() {
+        let secrets = EnclaveSecrets::from_dev_seed(&"cc".repeat(32)).unwrap();
+        assert_ne!(secrets.sealed_key, secrets.settlement_signer_seed);
+        assert_ne!(secrets.settlement_signer_seed, secrets.portfolio_key_secret);
+        assert_ne!(secrets.sealed_key, secrets.portfolio_key_secret);
+    }
+
+    #[test]
+    fn malformed_dev_seed_is_an_explicit_error_not_a_panic() {
+        assert!(EnclaveSecrets::from_dev_seed("not hex").is_err());
     }
 
     #[tokio::test]

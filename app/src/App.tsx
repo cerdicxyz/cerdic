@@ -1,92 +1,102 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useState } from 'react';
+import { Routes, Route } from 'react-router';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { PrivyProvider } from '@privy-io/react-auth';
+import { Header } from './components/Header';
+import { Sidebar } from './components/Sidebar';
+import { TradePage } from './pages/TradePage';
+import { AgentsPage } from './pages/AgentsPage';
+import { LandingPage } from './pages/LandingPage';
+import { PortfolioModal } from './components/PortfolioModal';
+import { ToastProvider } from './toast/toast-context';
+import { ToastContainer } from './toast/toast-container';
+import { WalletProvider } from './wallet/wallet-context';
+import { privyAppId, privyClientId, privyConfig } from './wallet/privy';
 
-const DITHER_RAMP = ' .,:;irsXA253hMHGS#9B&@';
-const BAYER_4X4 = [
-  0, 8, 2, 10,
-  12, 4, 14, 6,
-  3, 11, 1, 9,
-  15, 7, 13, 5,
-];
+// wagmi/Web3Auth/Kernel (wallet/wagmiConfig.ts, wallet/web3auth.ts,
+// wallet/pimlicoWallet.ts) are no longer wired in here — Privy is the
+// only wallet path (see wallet/privy.ts and wallet-context.tsx's module
+// docs for why). Those files stay in the tree, unused, since they
+// document a real, confirmed Arc Testnet infrastructure gap that's
+// worth keeping the trail for, not because anything still imports them.
+const queryClient = new QueryClient();
 
-function generateAsciiDither(cols: number, rows: number) {
-  const canvas = document.createElement('canvas');
-  const context = canvas.getContext('2d', { willReadFrequently: true });
+// App.tsx owns the shell shared across routes (Header/Sidebar/
+// ToastContainer). Trade is a real route (react-router); Portfolio is a
+// modal instead — reachable from Sidebar's Portfolio icon from wherever
+// you are, not a page navigation. State lives here since Sidebar and the
+// modal itself are siblings, not parent/child.
 
-  if (!context) {
-    return Array.from({ length: rows }, () => ' '.repeat(cols)).join('\n');
-  }
+function AppShell({ portfolioOpen, setPortfolioOpen }: { portfolioOpen: boolean; setPortfolioOpen: (v: boolean) => void }) {
+  return (
+    <ToastProvider>
+      <WalletProvider>
+        <div className="flex h-full flex-col overflow-hidden bg-surface-base">
+          <ToastContainer />
+          <Header />
+          <div className="flex min-h-0 flex-1 overflow-hidden bg-surface-base">
+            <Sidebar onOpenPortfolio={() => setPortfolioOpen(true)} portfolioOpen={portfolioOpen} />
+            <Routes>
+              <Route path="/" element={<TradePage />} />
+              <Route path="/trade" element={<TradePage />} />
+              <Route path="/trade/:pair" element={<TradePage />} />
+              <Route path="/agents" element={<AgentsPage />} />
+            </Routes>
+          </div>
+          <PortfolioModal open={portfolioOpen} onClose={() => setPortfolioOpen(false)} />
+        </div>
+      </WalletProvider>
+    </ToastProvider>
+  );
+}
 
-  canvas.width = cols;
-  canvas.height = rows;
-
-  context.clearRect(0, 0, cols, rows);
-  context.fillStyle = '#000';
-  context.fillRect(0, 0, cols, rows);
-  context.fillStyle = '#fff';
-  context.textAlign = 'center';
-  context.textBaseline = 'middle';
-  context.font = `700 ${Math.max(12, Math.floor(rows * 0.78))}px 'Courier New', monospace`;
-  context.fillText('syntra', cols / 2, rows / 2 + rows * 0.02);
-
-  const image = context.getImageData(0, 0, cols, rows).data;
-
-  return Array.from({ length: rows }, (_, y) => {
-    return Array.from({ length: cols }, (_, x) => {
-      const index = (y * cols + x) * 4;
-      const brightness = image[index] ?? 0;
-      const threshold = (BAYER_4X4[(y % 4) * 4 + (x % 4)] + 0.5) / 16;
-      const dithered = Math.max(0, Math.min(1, brightness / 255 + (threshold - 0.5) * 0.9));
-      const rampIndex = Math.min(
-        DITHER_RAMP.length - 1,
-        Math.floor(dithered * (DITHER_RAMP.length - 1)),
-      );
-
-      return DITHER_RAMP[rampIndex] ?? ' ';
-    }).join('');
-  }).join('\n');
+// Privy's OAuth redirect URL is configured as bare http://localhost:5174
+// (root, no path) and reads privy_oauth_code/state straight off
+// window.location.search on landing — a client-side <Navigate replace>
+// at "/" would rewrite the URL and strip that query string in a race
+// against Privy's own callback parsing, which is exactly what broke
+// Google login the first time this was built. Checked once, synchronously,
+// at mount (useState initializer, never an effect that would itself
+// trigger a re-render/redirect) rather than every render: this only ever
+// needs to be true for the single render right after Privy bounces back,
+// and computing it fresh each render would flip it back to false as soon
+// as something else (e.g. Privy's own SDK) touches the URL later in the
+// same session.
+function isPrivyOAuthCallback(): boolean {
+  return typeof window !== 'undefined' && window.location.search.includes('privy_oauth_code');
 }
 
 export default function App() {
-  const frameRef = useRef<HTMLDivElement | null>(null);
-  const [ascii, setAscii] = useState('');
-
-  useEffect(() => {
-    const frame = frameRef.current;
-
-    if (!frame) {
-      return;
-    }
-
-    const update = () => {
-      const width = frame.clientWidth;
-      const height = frame.clientHeight;
-      const cols = Math.max(48, Math.floor(width / 9));
-      const rows = Math.max(18, Math.floor(height / 18));
-
-      setAscii(generateAsciiDither(cols, rows));
-    };
-
-    update();
-
-    const resizeObserver = new ResizeObserver(() => {
-      update();
-    });
-
-    resizeObserver.observe(frame);
-
-    return () => {
-      resizeObserver.disconnect();
-    };
-  }, []);
-
-  const lines = useMemo(() => ascii.split('\n'), [ascii]);
+  const [portfolioOpen, setPortfolioOpen] = useState(false);
+  const [oauthCallback] = useState(isPrivyOAuthCallback);
 
   return (
-    <main className="scene" aria-label="Syntra landing page">
-      <div ref={frameRef} className="ascii-frame" aria-hidden="true">
-        <pre className="ascii-dither">{lines.join('\n')}</pre>
-      </div>
-      <h1 className="sr-only">syntra</h1>
-    </main>
+    <PrivyProvider appId={privyAppId} clientId={privyClientId} config={privyConfig}>
+      <QueryClientProvider client={queryClient}>
+        <Routes>
+          {/* "/" is the marketing landing page (no Header/Sidebar/
+              PortfolioModal chrome — a landing page isn't the trading
+              terminal) EXCEPT immediately after a Privy OAuth bounce-back,
+              which also lands on bare "/" — that one case still needs to
+              render AppShell (whose own inner Routes resolves "/" to
+              TradePage), not the landing page, or a mid-login user would
+              land back on marketing copy instead of the terminal they were
+              using. No redirect either way — just a different element
+              rendered for the same URL, so the OAuth query string is never
+              touched. */}
+          <Route
+            path="/"
+            element={
+              oauthCallback ? (
+                <AppShell portfolioOpen={portfolioOpen} setPortfolioOpen={setPortfolioOpen} />
+              ) : (
+                <LandingPage />
+              )
+            }
+          />
+          <Route path="*" element={<AppShell portfolioOpen={portfolioOpen} setPortfolioOpen={setPortfolioOpen} />} />
+        </Routes>
+      </QueryClientProvider>
+    </PrivyProvider>
   );
 }

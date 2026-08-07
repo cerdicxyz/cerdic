@@ -1,0 +1,217 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { PriceChart, type OhlcHover, type Timeframe } from './PriceChart';
+import { MarketBar } from './MarketBar';
+import type { Market } from './MarketDropdown';
+import { usePersistedState } from '../hooks/usePersistedState';
+import { decimalsForMarket } from '../lib/priceScale';
+
+// Chart panel, structured like the reference (Lighter's own chart widget):
+// a market stat row, sub-tabs, timeframe pills, a chart-type toggle, then
+// the chart itself with an OHLC crosshair legend overlaid top-left.
+//
+// MarketBar.tsx (symbol + Mark/24h/Funding/OI) lives here as this panel's
+// own top row, not as a separate strip above the whole grid — matching
+// the reference, where those stats sit inside the chart card itself, and
+// closing the visual gap that separate strip left above everything.
+//
+// TradingView and Depth are visibly disabled with a "Soon" badge, not
+// silently missing or faked as working — TradingView's full Advanced
+// Charts library requires applying for access and keeping attribution
+// visible (see the chart research this was built from), so it's a real
+// gate, not a UI choice; Depth (a cumulative bid/ask curve view, distinct
+// from OrderBookDepth's heatmap) is simply a later phase.
+
+const TIMEFRAMES: Timeframe[] = ['5m', '15m', '1h', '4h'];
+// Not in the pill row above — reachable through "More" instead, same
+// setTimeframe/persisted-state path either way.
+const MORE_TIMEFRAMES: Timeframe[] = ['1m', '30m', '1d'];
+type SubTab = 'price' | 'funding' | 'details';
+type ChartType = 'original' | 'tradingview' | 'depth';
+
+// PriceChart.tsx's `candles` are already real prices, not raw ticks (see
+// that file's own doc), so this is display precision only — but it still
+// has to match this market's own resolution (priceScale.ts), not a fixed
+// 4 that was wrong for both FX (needs 5) and everything else (2 is
+// plenty, 4 prints two meaningless trailing digits).
+function formatOhlc(candle: OhlcHover, marketId: string) {
+  const digits = decimalsForMarket(marketId);
+  return {
+    open: candle.open.toFixed(digits),
+    high: candle.high.toFixed(digits),
+    low: candle.low.toFixed(digits),
+    close: candle.close.toFixed(digits),
+    volume: `${candle.volume.toFixed(3)}K`,
+  };
+}
+
+export function ChartPanel({ market, onSelectMarket }: { market: Market; onSelectMarket: (market: Market) => void }) {
+  const [subTab, setSubTab] = useState<SubTab>('price');
+  const [chartType, setChartType] = useState<ChartType>('original');
+  const [timeframe, setTimeframe] = usePersistedState<Timeframe>('chartTimeframe', '5m');
+  const [hover, setHover] = useState<OhlcHover | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+
+  const handleHover = useCallback((candle: OhlcHover | null) => setHover(candle), []);
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (moreRef.current && !moreRef.current.contains(event.target as Node)) setMoreOpen(false);
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') setMoreOpen(false);
+    }
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [moreOpen]);
+
+  return (
+    <div className="flex h-full flex-col">
+      <MarketBar market={market} onSelect={onSelectMarket} />
+      <div className="flex items-center gap-[var(--space-5)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
+        {(['price', 'funding', 'details'] as const).map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setSubTab(tab)}
+            className={`rounded-sm px-[var(--space-2)] py-[var(--space-1)] text-xs font-medium capitalize transition-colors duration-150 ${
+              subTab === tab
+                ? 'bg-surface-hover text-text-primary'
+                : 'text-text-tertiary hover:text-text-secondary'
+            }`}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+
+      {subTab !== 'price' ? (
+        <div className="flex flex-1 items-center justify-center text-xs text-text-quaternary">—</div>
+      ) : (
+        <>
+          <div className="flex items-center justify-between border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
+            <div className="flex items-center gap-[var(--space-4)]">
+              {TIMEFRAMES.map((tf) => (
+                <button
+                  key={tf}
+                  type="button"
+                  onClick={() => setTimeframe(tf)}
+                  className={`text-xs font-medium transition-colors duration-150 ${
+                    timeframe === tf ? 'text-text-primary' : 'text-text-tertiary hover:text-text-secondary'
+                  }`}
+                >
+                  {tf}
+                </button>
+              ))}
+              <div ref={moreRef} className="relative">
+                <button
+                  type="button"
+                  onClick={() => setMoreOpen((v) => !v)}
+                  aria-expanded={moreOpen}
+                  className={`text-xs font-medium transition-colors duration-150 ${
+                    moreOpen || MORE_TIMEFRAMES.includes(timeframe)
+                      ? 'text-text-primary'
+                      : 'text-text-tertiary hover:text-text-secondary'
+                  }`}
+                >
+                  {MORE_TIMEFRAMES.includes(timeframe) ? timeframe : 'More'} ▾
+                </button>
+                {moreOpen && (
+                  <div
+                    className="absolute left-0 top-[calc(100%+var(--space-2))] z-50 flex min-w-20 flex-col gap-[var(--space-1)] rounded-md border border-border-subtle bg-surface-overlay p-[var(--space-2)]"
+                    style={{ boxShadow: 'rgba(255,255,255,0.08) 0 0.4px 0 0 inset, rgb(0,0,0) 0 0 0 0.5px' }}
+                  >
+                    {MORE_TIMEFRAMES.map((tf) => (
+                      <button
+                        key={tf}
+                        type="button"
+                        onClick={() => {
+                          setTimeframe(tf);
+                          setMoreOpen(false);
+                        }}
+                        className={`rounded-sm px-[var(--space-2)] py-[var(--space-1)] text-left text-xs font-medium transition-colors duration-150 ${
+                          timeframe === tf
+                            ? 'bg-surface-hover text-text-primary'
+                            : 'text-text-tertiary hover:text-text-secondary'
+                        }`}
+                      >
+                        {tf}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-[var(--space-4)]">
+              {(['tradingview', 'original', 'depth'] as const).map((type) => (
+                <button
+                  key={type}
+                  type="button"
+                  disabled={type !== 'original'}
+                  onClick={() => setChartType(type)}
+                  title={type !== 'original' ? 'Coming soon' : undefined}
+                  className={`flex items-center gap-[var(--space-1)] text-xs font-medium capitalize transition-colors duration-150 ${
+                    chartType === type
+                      ? 'text-text-primary'
+                      : type !== 'original'
+                        ? 'cursor-not-allowed text-text-quaternary/60'
+                        : 'text-text-tertiary hover:text-text-secondary'
+                  }`}
+                >
+                  {type}
+                  {type !== 'original' && (
+                    <span className="rounded-pill border border-border-subtle px-[var(--space-2)] py-px text-[9px] uppercase tracking-[0.04em] text-text-quaternary">
+                      Soon
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="relative min-h-0 flex-1">
+            {hover && (
+              <div className="pointer-events-none absolute left-[var(--space-4)] top-[var(--space-2)] z-10 flex items-center gap-[var(--space-4)] text-xs">
+                <OhlcField label="Open" value={formatOhlc(hover, market.id).open} up={hover.up} />
+                <OhlcField label="High" value={formatOhlc(hover, market.id).high} up={hover.up} />
+                <OhlcField label="Low" value={formatOhlc(hover, market.id).low} up={hover.up} />
+                <OhlcField label="Close" value={formatOhlc(hover, market.id).close} up={hover.up} />
+                <OhlcField label="Volume" value={formatOhlc(hover, market.id).volume} up={hover.up} muted />
+              </div>
+            )}
+            {hover && (
+              // Approximates the volume pane's top edge from
+              // PriceChart's own 3.2:1 price/volume stretch factor
+              // (3.2 / (3.2 + 1) ≈ 76%) — the two aren't otherwise
+              // linked, so if that ratio changes this needs a matching
+              // nudge.
+              <div
+                className="pointer-events-none absolute left-[var(--space-4)] z-10 flex items-center gap-[var(--space-4)] text-xs"
+                style={{ top: '76%' }}
+              >
+                <span className="text-text-quaternary">VOL(5,10,20)</span>
+                <span style={{ color: '#ffb454' }}>MA5: {hover.ma5?.toFixed(2) ?? '—'}</span>
+                <span className="text-privacy">MA10: {hover.ma10?.toFixed(2) ?? '—'}</span>
+                <span className="text-chart-line">MA20: {hover.ma20?.toFixed(2) ?? '—'}</span>
+              </div>
+            )}
+            <PriceChart marketId={market.id} timeframe={timeframe} onHover={handleHover} />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function OhlcField({ label, value, up, muted }: { label: string; value: string; up: boolean; muted?: boolean }) {
+  return (
+    <span className="text-text-quaternary">
+      {label}: <span className={muted ? 'text-text-secondary' : up ? 'text-long' : 'text-short'}>{value}</span>
+    </span>
+  );
+}

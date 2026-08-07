@@ -11,6 +11,7 @@ import {IMarket} from "../src/clearing/IMarket.sol";
 import {IMarketLifecycle} from "../src/clearing/IMarketLifecycle.sol";
 import {LiquidationEntry} from "../src/clearing/LiquidationEntry.sol";
 import {RiskMonitor} from "../src/clearing/RiskMonitor.sol";
+import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
 import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 
 /// @dev Minimal mintable ERC-20 used as a collateral asset stand-in for the
@@ -112,11 +113,13 @@ contract RiskMonitorTest is Test {
     MockMarkPriceOracle internal oracle;
     MockERC20 internal usdc;
     ProtocolConstants internal constants;
+    AttestationRouter internal attestationRouter;
 
     address internal admin = makeAddr("admin");
     address internal trader = makeAddr("trader");
     address internal counterparty = makeAddr("counterparty");
     address internal stranger = makeAddr("stranger");
+    address internal tee = makeAddr("tee");
 
     bytes32 internal constant MARKET_ID = keccak256("BTC-USDC-PERP");
     bytes32 internal constant MARKET_ID_2 = keccak256("ETH-USDC-PERP");
@@ -133,7 +136,7 @@ contract RiskMonitorTest is Test {
         account = new ClearingAccount(admin);
         usdc = new MockERC20("USD Coin", "USDC");
         collateralEngine = new CollateralEngine(admin, address(usdc));
-        settlementEngine = new SettlementEngine(admin);
+        settlementEngine = new SettlementEngine(admin, 20);
         market = new MockMarket();
         oracle = new MockMarkPriceOracle(PRICE);
         entry = new LiquidationEntry(
@@ -141,6 +144,7 @@ contract RiskMonitorTest is Test {
         );
         monitor = new RiskMonitor(admin, address(oracle));
         constants = new ProtocolConstants();
+        attestationRouter = new AttestationRouter(admin);
 
         // Role wiring: every external read needed for arguments is hoisted
         // ABOVE the prank — an inline role getter would consume it
@@ -179,6 +183,12 @@ contract RiskMonitorTest is Test {
     function _openLong(address who, bytes32 marketId, int256 size) internal {
         vm.prank(admin);
         settlementEngine.settleTrade(marketId, who, counterparty, size, PRICE, 0);
+    }
+
+    /// @dev Opens a short position of `size` at `PRICE` for `who` in `marketId`.
+    function _openShort(address who, bytes32 marketId, int256 size) internal {
+        vm.prank(admin);
+        settlementEngine.settleTrade(marketId, counterparty, who, size, PRICE, 0);
     }
 
     /// @dev Withdraws `amount` of USDC as `who`.
@@ -347,10 +357,19 @@ contract RiskMonitorTest is Test {
     ///         maintenance requirement above the effective collateral, so
     ///         `checkLiquidation` breaches and the liquidation entry
     ///         freezes the account (paper fig:liquidation).
+    /// @dev A SHORT position, not long: `entry.checkAndFlag`'s equity check
+    ///      (security-audit-tee-contracts.md finding C2 fix) is PnL-aware, so a
+    ///      genuine breach needs a price move that both raises RiskMonitor's own
+    ///      notional-based requirement AND is a real loss for the position. For a
+    ///      short, a price rise is both at once (a long profiting from the same
+    ///      rise would never actually be equity-breached, no matter how large
+    ///      notional grows — that mismatch is real, and out of C2's scope, see
+    ///      LiquidationEntry.t.sol's own test file for the isolated-market version
+    ///      of this same fix).
     function test_CheckLiquidationTriggersOnUnderMarginedAccount() public {
         _fund(trader, 1_000e18);
-        _openLong(trader, MARKET_ID, SIZE);
-        oracle.setPrice(5_000e18); // notional $50,000; MMR $1,500 > C_eff $1,000
+        _openShort(trader, MARKET_ID, SIZE);
+        oracle.setPrice(5_000e18); // notional $50,000; MMR $1,500 > C_eff $1,000; short is deeply underwater
 
         vm.expectEmit(true, false, false, false, address(account));
         emit ClearingAccount.AccountFrozen(trader);
@@ -557,5 +576,145 @@ contract RiskMonitorTest is Test {
 
         uint256 expected = uint256(size) * price * 300 / (1e18 * 10_000);
         assertEq(monitor.currentMarginRequirement(trader), expected, "reference formula");
+    }
+
+    // ---------------------------------------------------------------------
+    // Portfolio margin: TEE-attested M(P) = f_S + f_C + f_L + f_K.
+    // ---------------------------------------------------------------------
+
+    /// @dev Wires the attestation router and authorizes the mock TEE address.
+    function _wireAttestationRouter() internal {
+        vm.startPrank(admin);
+        monitor.setAttestationRouter(address(attestationRouter));
+        attestationRouter.authorizeTEE(tee);
+        vm.stopPrank();
+    }
+
+    /// @notice A fresh attestation from an authorized TEE becomes the
+    ///         effective requirement, even when it's BELOW the isolated sum
+    ///         (the hedge-credit case that is the whole point of portfolio
+    ///         margin).
+    function test_FreshPortfolioAttestationOverridesIsolatedRequirement() public {
+        _wireAttestationRouter();
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30
+
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        assertEq(monitor.effectiveMarginRequirement(trader), 5e18, "attested value wins while fresh");
+        (uint256 requirement, bool fresh) = monitor.portfolioMarginRequirement(trader);
+        assertEq(requirement, 5e18);
+        assertTrue(fresh);
+    }
+
+    /// @notice An expired attestation is ignored: the monitor falls back to
+    ///         the conservative isolated sum rather than trusting stale data.
+    function test_ExpiredPortfolioAttestationFallsBackToIsolated() public {
+        _wireAttestationRouter();
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30
+
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1));
+        vm.warp(block.timestamp + 2);
+
+        assertEq(monitor.effectiveMarginRequirement(trader), MMR, "falls back to isolated once stale");
+        (, bool fresh) = monitor.portfolioMarginRequirement(trader);
+        assertFalse(fresh);
+    }
+
+    /// @notice No attestation ever submitted behaves exactly like before
+    ///         this feature existed: effective == isolated.
+    function test_NoAttestationUsesIsolatedRequirement() public {
+        _openLong(trader, MARKET_ID, SIZE);
+        assertEq(monitor.effectiveMarginRequirement(trader), MMR, "unset attestation, isolated fallback");
+    }
+
+    /// @notice Only an address the AttestationRouter has authorized as a TEE
+    ///         can submit; everyone else reverts, and an unset router fails closed.
+    function test_SubmitPortfolioMarginGatedToAuthorizedTEE() public {
+        vm.expectRevert(RiskMonitor.AttestationRouterNotSet.selector);
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        _wireAttestationRouter();
+
+        vm.expectRevert(RiskMonitor.NotAuthorizedAttester.selector);
+        vm.prank(stranger);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp + 1 hours));
+
+        vm.expectRevert(RiskMonitor.AttestationAlreadyExpired.selector);
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 5e18, uint64(block.timestamp));
+    }
+
+    /// @notice A hedge-credited portfolio attestation flows through to
+    ///         withdraw safety and liquidation, exactly as the isolated
+    ///         requirement does today: the plumbing is the same, only the
+    ///         number changes.
+    function test_PortfolioAttestationDrivesWithdrawAndLiquidation() public {
+        _wireAttestationRouter();
+        _fund(trader, 100e18);
+        _openLong(trader, MARKET_ID, SIZE); // isolated MMR = $30, C_eff = $100
+
+        // Attest a requirement of $90: withdrawing down to exactly $90 left is safe.
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 90e18, uint64(block.timestamp + 1 hours));
+
+        assertFalse(monitor.isWithdrawSafe(trader, address(usdc), 11e18), "would breach the attested $90");
+        assertTrue(monitor.isWithdrawSafe(trader, address(usdc), 10e18), "leaves exactly $90");
+
+        // Re-attest a requirement above C_eff: checkLiquidation now breaches
+        // even though the isolated sum alone would not have.
+        vm.prank(tee);
+        monitor.submitPortfolioMargin(trader, 200e18, uint64(block.timestamp + 1 hours));
+
+        // `checkLiquidation`'s own top-level `breached` return is driven purely by
+        // the attestation vs C_eff (unaffected by price, see below) — but actually
+        // FREEZING the account is `entry.checkAndFlag`'s call, per market, and
+        // that's an ISOLATED equity check (security-audit-tee-contracts.md finding
+        // C2 fix) that doesn't know about the portfolio-wide attestation at all.
+        // Move price against the position so this market's own equity is ALSO
+        // genuinely underwater, not just the portfolio-level number: $100 deposit,
+        // 10 units, entry $100 -> at $90 equity = 100 + 10*(90-100) = $0, maintenance
+        // = 10*90*300/10_000 = $27, a real isolated breach too.
+        oracle.setPrice(90e18);
+
+        bool breached = monitor.checkLiquidation(trader);
+        assertTrue(breached, "attested portfolio requirement breaches C_eff");
+        assertTrue(account.accounts(trader), "frozen off the attested requirement");
+    }
+
+    // ---------------------------------------------------------------------
+    // executionMode: the per-market CLOB/backstop/RFQ decision surface.
+    // ---------------------------------------------------------------------
+
+    /// @notice Every registered market defaults to Clob (the zero value),
+    ///         matching what every market already does today with no
+    ///         explicit configuration needed.
+    function test_NewlyRegisteredMarketDefaultsToClobMode() public view {
+        assertEq(uint8(monitor.executionMode(MARKET_ID)), uint8(RiskMonitor.ExecutionMode.Clob));
+    }
+
+    function test_AdminCanSetExecutionMode() public {
+        vm.expectEmit(true, false, false, true, address(monitor));
+        emit RiskMonitor.ExecutionModeSet(MARKET_ID, RiskMonitor.ExecutionMode.Rfq);
+
+        vm.prank(admin);
+        monitor.setExecutionMode(MARKET_ID, RiskMonitor.ExecutionMode.Rfq);
+
+        assertEq(uint8(monitor.executionMode(MARKET_ID)), uint8(RiskMonitor.ExecutionMode.Rfq));
+    }
+
+    function test_SetExecutionModeRevertsForAnUnregisteredMarket() public {
+        bytes32 unregistered = keccak256("NEVER-REGISTERED");
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(RiskMonitor.MarketNotRegistered.selector, unregistered));
+        monitor.setExecutionMode(unregistered, RiskMonitor.ExecutionMode.BackstopOnly);
+    }
+
+    function test_SetExecutionModeGatedToAdmin() public {
+        vm.prank(stranger);
+        vm.expectRevert(RiskMonitor.NotAdmin.selector);
+        monitor.setExecutionMode(MARKET_ID, RiskMonitor.ExecutionMode.BackstopOnly);
     }
 }

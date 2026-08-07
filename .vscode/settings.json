@@ -1,4 +1,6 @@
 {
 	"solidity.defaultCompiler": "localFile",
-	"solidity.compileUsingLocalVersion": "/Users/mac/PersonalProjects/Solidity/soljson-v0.8.35+commit.47b9dedd.js"
+	"solidity.compileUsingLocalVersion": "/Users/mac/PersonalProjects/Solidity/soljson-v0.8.35+commit.47b9dedd.js",
+	"rust-analyzer.linkedProjects": ["Cargo.toml"],
+	"rust-analyzer.excludeDirs": ["crates/zk-circuits"]
 }

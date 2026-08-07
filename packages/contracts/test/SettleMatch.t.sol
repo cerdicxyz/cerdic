@@ -36,7 +36,7 @@ contract SettleMatchTest is Test {
     bytes32 internal constant MATCH_ID = keccak256("match1");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
 
@@ -51,6 +51,31 @@ contract SettleMatchTest is Test {
     function _settle(int256 deltaA, int256 deltaB, bytes memory sealedA, bytes memory sealedB) internal {
         vm.prank(tee);
         engine.settleMatch(MATCH_ID, MARKET_ID, PORTFOLIO_A, deltaA, sealedA, PORTFOLIO_B, deltaB, sealedB);
+    }
+
+    /// @notice The keeper discovery surface `docs/spec-contracts-tee.md` section 2.4
+    ///         describes: both legs' portfolioKeys must be publicly learnable from this
+    ///         one call, paired with their market, and nothing else.
+    function test_SettleMatchEmitsSealedPositionTouchedForBothLegs() public {
+        vm.recordLogs();
+        _settle(1_000e18, 1_000e18, "", "");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        bool foundA;
+        bool foundB;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] == SettlementEngine.SealedPositionTouched.selector) {
+                if (logs[i].topics[1] == PORTFOLIO_A) {
+                    foundA = true;
+                    assertEq(logs[i].topics[2], MARKET_ID);
+                } else if (logs[i].topics[1] == PORTFOLIO_B) {
+                    foundB = true;
+                    assertEq(logs[i].topics[2], MARKET_ID);
+                }
+            }
+        }
+        assertTrue(foundA, "portfolio A must be publicly discoverable");
+        assertTrue(foundB, "portfolio B must be publicly discoverable");
     }
 
     function test_SettleMatchStoresSealedParamsAndCollateralPerPortfolioKey() public {
@@ -114,7 +139,7 @@ contract SettleMatchTest is Test {
     }
 
     function test_UnwiredAttestationRouterReverts() public {
-        SettlementEngine bare = new SettlementEngine(admin);
+        SettlementEngine bare = new SettlementEngine(admin, 20);
         vm.expectRevert(SettlementEngine.AttestationRouterNotSet.selector);
         vm.prank(tee);
         bare.settleMatch(MATCH_ID, MARKET_ID, PORTFOLIO_A, 1, "", PORTFOLIO_B, 1, "");
@@ -178,7 +203,7 @@ contract SettleTakerSweepTest is Test {
     bytes32 internal constant PORTFOLIO_MAKER_3 = keccak256("portfolioMaker3");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
 
@@ -284,7 +309,7 @@ contract SettleTakerSweepTest is Test {
         engine.settleTakerSweep(MARKET_ID, PORTFOLIO_TAKER, 5_000e18, "", legs);
         uint256 batchedTotal = (gasBefore - gasleft()) + baseTxGas;
 
-        SettlementEngine individualEngine = new SettlementEngine(admin);
+        SettlementEngine individualEngine = new SettlementEngine(admin, 20);
         vm.prank(admin);
         individualEngine.setAttestationRouter(address(router));
         vm.prank(admin);
@@ -325,7 +350,7 @@ contract LiquidateSealedTest is Test {
     bytes32 internal constant PORTFOLIO = keccak256("portfolioLiq");
 
     function setUp() public {
-        engine = new SettlementEngine(admin);
+        engine = new SettlementEngine(admin, 20);
         router = new AttestationRouter(admin);
         market = new MockSealedMarket();
         marketTwo = new MockSealedMarket();

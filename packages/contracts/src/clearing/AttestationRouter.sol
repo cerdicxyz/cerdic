@@ -5,9 +5,10 @@ import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessContr
 /// @title  AttestationRouter
 /// @notice Allowlist of TEE addresses authorized to call SettlementEngine.settleMatch.
 /// @dev    MVP scope: admin registers a TEE address after verifying its attestation
-///         token off-chain. On-chain OIDC/COSE verification (GcpAttestationVerifier)
-///         replaces this with a real check later; the isAuthorizedTEE surface this
-///         router exposes doesn't need to change when that lands.
+///         token off-chain. On-chain OIDC/COSE verification (TeeAttestationVerifier,
+///         see clearing/TeeAttestationVerifier.sol) replaces this with a real check
+///         later; the isAuthorizedTEE surface this router exposes doesn't need to
+///         change when that lands.
 contract AttestationRouter is AccessControl {
     bytes32 public constant ROUTER_ADMIN_ROLE = keccak256("ROUTER_ADMIN_ROLE");
 

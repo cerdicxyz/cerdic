@@ -17,7 +17,6 @@ import {OracleHub} from "../oracle/OracleHub.sol";
 ///         Funding: deltaF = clamp((markPrice - indexPrice) / indexPrice, +-maxRate) * blocksElapsed.
 ///         PnL is computed lazily on read (never mutates state in the view path).
 contract PerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMarketLifecycle, IPositionDecoder {
-    uint256 internal constant MAX_LEVERAGE_BPS = 2000;
     uint256 internal constant FUNDING_MAX_RATE_BPS_PER_SEC = 30;
 
     /// @notice This instance's market, doubling as its Pyth feed ID. Immutable: a
@@ -45,7 +44,9 @@ contract PerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMarke
     error PositionNotFound(bytes32 positionId);
     error WrongMarket(bytes32 got, bytes32 expected);
 
-    constructor(address admin, address oracleHubAddr, bytes32 marketId_) SettlementEngine(admin) {
+    constructor(address admin, address oracleHubAddr, bytes32 marketId_, uint256 leverageCeiling_)
+        SettlementEngine(admin, leverageCeiling_)
+    {
         marketId = marketId_;
         oracleHub = OracleHub(oracleHubAddr);
         lastIndexUpdateBlock = block.number;
@@ -90,8 +91,9 @@ contract PerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMarke
         return size * (currentFunding - entryFunding) * int256(pIndex) / int256(SCALE * SCALE);
     }
 
-    /// @dev Initial-margin and leverage-cap checks; arithmetically identical at
-    ///      IMR_BPS=500/MAX_LEVERAGE_BPS=2000 but both kept so drift is independently caught.
+    /// @dev Initial-margin and leverage-cap checks, both derived from this instance's own
+    ///      LEVERAGE_CEILING (see SettlementEngine's doc) but computed independently here
+    ///      so drift between the two formulas is still caught.
     function validateOpen(int256 size, uint256 collateral) external view returns (bool) {
         if (size == 0) return false;
 
@@ -102,7 +104,7 @@ contract PerpMarket is SettlementEngine, IMarket, IMarketLifecycle, ISealedMarke
         uint256 requiredMargin = absSize * oraclePrice * IMR_BPS / (SCALE * BPS_DENOMINATOR);
         if (requiredMargin > collateral) return false;
 
-        uint256 maxNotional = collateral * MAX_LEVERAGE_BPS / 100;
+        uint256 maxNotional = collateral * LEVERAGE_CEILING;
         if (absSize * oraclePrice / SCALE > maxNotional) return false;
 
         return true;
