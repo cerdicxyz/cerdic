@@ -9,9 +9,11 @@ import { IconBriefcase, IconChartCandle, IconHelpCircle, IconReceipt2 } from '@t
 // Trade is a real route (react-router, see App.tsx). Portfolio opens a
 // modal instead (PortfolioModal.tsx) rather than navigating — it's an
 // account overview reachable from wherever you are, not its own screen.
-// Orders and Docs stay disabled with a "Coming soon" title — there's no
-// page/modal behind them yet, same honesty convention as the chart's
-// TradingView/Depth tabs rather than a link to nowhere.
+// Docs links out to the real protocol docs site (cerdicxyz.github.io,
+// VitePress, source: cerdicxyz/cerdicxyz.github.io) — a new tab, not a
+// route in this app. Orders stays disabled with a "Coming soon" title —
+// there's no page/modal behind it yet, same honesty convention as the
+// chart's TradingView/Depth tabs rather than a link to nowhere.
 //
 // The TradingView attribution link that used to live here moved to
 // SettingsDropdown.tsx's footer — see that file for why it can't just be
@@ -69,13 +71,16 @@ export function Sidebar({
         >
           <IconReceipt2 size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
         </span>
-        <span
-          title="Docs — coming soon"
+        <a
+          href="https://cerdicxyz.github.io"
+          target="_blank"
+          rel="noreferrer"
+          title="Docs"
           aria-label="Docs"
-          className="grid h-9 w-9 cursor-not-allowed place-items-center rounded-sm text-text-quaternary/50 transition-colors duration-150"
+          className="grid h-9 w-9 place-items-center rounded-sm text-text-tertiary transition-colors duration-150 hover:bg-surface-hover hover:text-text-secondary"
         >
           <IconHelpCircle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />
-        </span>
+        </a>
       </div>
     </nav>
   );

@@ -83,7 +83,18 @@ export function useSubmitOrder(address: `0x${string}` | undefined) {
       ].join('|');
 
       onProgress?.('signing');
-      const { signature } = await signMessage({ message: signingBytes });
+      // Pin the signer to `address` explicitly — the same fix
+      // DepositModal.tsx's sendTransaction calls needed. Without it,
+      // Privy signs with whatever it considers its default embedded
+      // wallet, which isn't guaranteed to be the SAME address as
+      // `address` here (wallet-context.tsx's `wallet.address`, what's
+      // actually displayed as "your" account everywhere in this app).
+      // The matcher recovers whoever really signed from the signature
+      // itself, so a mismatch here wouldn't make an order fail — it'd
+      // just mean orders and deposits could silently be happening as
+      // two DIFFERENT on-chain identities, which is exactly the shape
+      // of "I deposited but the order still says I have $0 collateral."
+      const { signature } = await signMessage({ message: signingBytes }, { address });
 
       const payload = {
         market_id: args.marketId,

@@ -6,6 +6,7 @@ import { toast } from '../toast/toast-context';
 import { useWallet } from '../wallet/wallet-context';
 import { publicClient } from '../wallet/publicClient';
 import { activeChain } from '../wallet/privy';
+import { BALANCES_CHANGED_EVENT } from '../hooks/useWalletBalances';
 
 // Deposit flow, modal so it's reachable from anywhere (Header, Portfolio)
 // without a full page navigation for what's a quick action.
@@ -98,39 +99,42 @@ export function DepositModal({ open, onClose }: { open: boolean; onClose: () => 
   // Real balance/allowance, re-read every time the modal opens or the
   // asset changes — not polled continuously (DepositModal isn't mounted
   // most of the time, matches useWalletBalances.ts's own posture of only
-  // reading what's actually on screen).
+  // reading what's actually on screen). Also called directly by
+  // handleApprove/handleDeposit right after their tx confirms — without
+  // that, this modal's own "Bal."/allowance stayed frozen at whatever it
+  // read on open until the NEXT time the modal reopened, which is
+  // exactly what made a real, already-landed deposit look like it "did
+  // nothing": the number on screen just hadn't been refetched.
+  async function refreshBalanceAndAllowance() {
+    if (wallet.status !== 'connected' || !tokenAddress) return;
+    try {
+      const [bal, allow] = await Promise.all([
+        publicClient.readContract({ address: tokenAddress, abi: erc20Abi, functionName: 'balanceOf', args: [wallet.address!] }),
+        accountAddress
+          ? publicClient.readContract({
+              address: tokenAddress,
+              abi: erc20Abi,
+              functionName: 'allowance',
+              args: [wallet.address!, accountAddress],
+            })
+          : Promise.resolve(0n),
+      ]);
+      setBalance(formatUnits(bal, 18));
+      setAllowance(allow);
+    } catch {
+      // Real chain read failed (RPC down, wrong network) — leave whatever
+      // was already on screen in place rather than a misleading blank.
+    }
+  }
+
   useEffect(() => {
     if (!open || wallet.status !== 'connected' || !tokenAddress) {
       setBalance(null);
       setAllowance(0n);
       return;
     }
-    let cancelled = false;
-    async function load() {
-      try {
-        const [bal, allow] = await Promise.all([
-          publicClient.readContract({ address: tokenAddress!, abi: erc20Abi, functionName: 'balanceOf', args: [wallet.address!] }),
-          accountAddress
-            ? publicClient.readContract({
-                address: tokenAddress!,
-                abi: erc20Abi,
-                functionName: 'allowance',
-                args: [wallet.address!, accountAddress],
-              })
-            : Promise.resolve(0n),
-        ]);
-        if (cancelled) return;
-        setBalance(formatUnits(bal, 18));
-        setAllowance(allow);
-      } catch {
-        // Real chain read failed (RPC down, wrong network) — leave the
-        // form's numbers blank rather than a stale/misleading balance.
-      }
-    }
-    load();
-    return () => {
-      cancelled = true;
-    };
+    void refreshBalanceAndAllowance();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, wallet.status, wallet.address, tokenAddress, asset]);
 
   const amountValue = useMemo(() => {
@@ -172,15 +176,32 @@ export function DepositModal({ open, onClose }: { open: boolean; onClose: () => 
     setSubmitting(true);
     const progressId = toast.progress(`Approve ${selected.symbol}`, 20, 'Sign approval…');
     try {
-      const { hash } = await sendTransaction({
-        to: tokenAddress,
-        chainId: activeChain.id,
-        data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [accountAddress, amountWei] }),
-      });
+      const { hash } = await sendTransaction(
+        {
+          to: tokenAddress,
+          chainId: activeChain.id,
+          data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [accountAddress, amountWei] }),
+        },
+        // Without this `address`, Privy signs with whatever it considers
+        // the default embedded wallet — not guaranteed to be the SAME
+        // address `wallet.address` (wallet-context.tsx's `user.wallet`,
+        // Privy's "first verified wallet") this modal reads balance/
+        // allowance for and displays as "Bal." above. If those two ever
+        // diverge (e.g. an external wallet was ever linked alongside the
+        // embedded one), the approval/deposit genuinely succeeds — just
+        // paid from a different address than the one this UI is
+        // watching, which is exactly what "it said successful but my
+        // balance never changed" looks like from a real, confirmed tx.
+        { address: wallet.address },
+      );
       toast.update(progressId, { description: 'Confirming on-chain…', progress: 70 });
       await waitForReceipt(hash);
       setAllowance(amountWei);
       setStep('deposit');
+      // The approve tx also spent real gas (ETH), so the wallet's ETH
+      // balance shown elsewhere (header dropdown) is stale too now, not
+      // just allowance — same one event both effects care about.
+      window.dispatchEvent(new CustomEvent(BALANCES_CHANGED_EVENT));
       toast.update(progressId, {
         type: 'success',
         title: `Approved ${amount} ${selected.symbol}`,
@@ -206,13 +227,23 @@ export function DepositModal({ open, onClose }: { open: boolean; onClose: () => 
     setSubmitting(true);
     const progressId = toast.progress(`Deposit ${selected.symbol}`, 20, 'Sign deposit…');
     try {
-      const { hash } = await sendTransaction({
-        to: accountAddress,
-        chainId: activeChain.id,
-        data: encodeFunctionData({ abi: DEPOSIT_ABI, functionName: 'deposit', args: [tokenAddress, amountWei] }),
-      });
+      const { hash } = await sendTransaction(
+        {
+          to: accountAddress,
+          chainId: activeChain.id,
+          data: encodeFunctionData({ abi: DEPOSIT_ABI, functionName: 'deposit', args: [tokenAddress, amountWei] }),
+        },
+        // Same fix as handleApprove above — pin the signer to the exact
+        // address this modal reads balance/allowance for and displays.
+        { address: wallet.address },
+      );
       toast.update(progressId, { description: 'Confirming on-chain…', progress: 70 });
       await waitForReceipt(hash);
+      // Real, already-landed balance change — refresh right away instead
+      // of leaving the header/wallet dropdown to catch up on its own
+      // 10s poll (useWalletBalances.ts), which is what made a genuinely
+      // successful deposit look like it silently did nothing.
+      window.dispatchEvent(new CustomEvent(BALANCES_CHANGED_EVENT));
       toast.update(progressId, {
         type: 'success',
         title: `Deposited ${amount} ${selected.symbol}`,

@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 // (crates/cerdic-tee-matcher/src/api.rs's `stream_orderbook`), just
 // never wired to this app until now. `VITE_MATCHER_URL` defaults to the
 // matcher's own default local bind address (main.rs: 0.0.0.0:8787).
-const matcherHttpUrl = (import.meta.env.VITE_MATCHER_URL as string | undefined) ?? 'http://localhost:8787';
+export const matcherHttpUrl = (import.meta.env.VITE_MATCHER_URL as string | undefined) ?? 'http://localhost:8787';
 const matcherWsUrl = matcherHttpUrl.replace(/^http/, 'ws');
 
 export interface OrderBookLevel {
@@ -165,4 +165,21 @@ export function useOrderBook(marketId: string, group: number = 1): LiveOrderBook
   }, [marketId, group, cacheKey]);
 
   return book;
+}
+
+/** A live "mark price," in raw ticks — bid/ask mid when the book has a
+ *  real touch on both sides, falling back to the last trade print only
+ *  when one side has no resting liquidity at all. `lastPrice` alone is
+ *  the wrong thing to call a mark price: it only updates when a trade
+ *  actually happens, so a market that's gone quiet for a stretch reads
+ *  as a frozen PnL even while the book itself is still moving —
+ *  confirmed live (PositionsPanel.tsx's own "PnL not updating" report).
+ *  Mid price updates on every book mutation (every market maker requote,
+ *  ~every 11-15s in local_dev.rs), independent of whether anyone's
+ *  actually traded recently. */
+export function markPriceFromBook(book: LiveOrderBook): number | null {
+  if (book.bestBid !== null && book.bestAsk !== null) {
+    return (book.bestBid + book.bestAsk) / 2;
+  }
+  return book.lastPrice;
 }

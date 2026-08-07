@@ -50,7 +50,19 @@ export function SettingsDropdown() {
     true,
   );
   const [fillSound, setFillSound] = usePersistedState('fillSound', false);
+  // Every input's red focus color (the wrapper `focus-within:border-
+  // border-focus` technique DepositModal/TradePanel/etc. all use, plus
+  // the global `:focus-visible` outline in app.css) funnels through one
+  // token, `--color-border-focus` — so this toggle doesn't need to touch
+  // any of those components' own classNames, just flip a data attribute
+  // on <html> that app.css overrides that one variable under (see the
+  // `[data-focus-ring-off]` rule there).
+  const [focusRing, setFocusRing] = usePersistedState('focusRingEnabled', false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    document.documentElement.toggleAttribute('data-focus-ring-off', !focusRing);
+  }, [focusRing]);
 
   useEffect(() => {
     if (!open) return;
@@ -110,6 +122,11 @@ export function SettingsDropdown() {
               checked={fillSound}
               onChange={setFillSound}
               label="Sound on fill"
+            />
+            <Toggle
+              checked={focusRing}
+              onChange={setFocusRing}
+              label="Highlight focused input"
             />
           </div>
 

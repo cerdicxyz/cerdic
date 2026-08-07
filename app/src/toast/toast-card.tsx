@@ -1,5 +1,13 @@
 import { useEffect } from 'react';
 import { motion } from 'framer-motion';
+import {
+  IconCircleCheckFilled,
+  IconInfoCircleFilled,
+  IconAlertTriangleFilled,
+  IconCircleXFilled,
+  IconLoader2,
+  IconX,
+} from '@tabler/icons-react';
 import type { Toast } from './toast-context';
 
 // Same panel shadow every box in the terminal uses (Panel.tsx's
@@ -9,12 +17,22 @@ import type { Toast } from './toast-context';
 // hardcoded hex colors; here it's our real tokens).
 const PANEL_SHADOW = 'rgba(255,255,255,0.08) 0 0.4px 0 0 inset, rgb(0,0,0) 0 0 0 0.5px';
 
-const STATUS: Record<Toast['type'], { glyph: string; colorClass: string }> = {
-  success: { glyph: '✓', colorClass: 'text-long' },
-  info: { glyph: 'ℹ', colorClass: 'text-chart-line' },
-  warning: { glyph: '⚠', colorClass: 'text-warning' },
-  error: { glyph: '✕', colorClass: 'text-short' },
-  progress: { glyph: '◌', colorClass: 'text-privacy' },
+// Real Tabler icons in a soft colored badge, not bare text glyphs
+// (✓/ℹ/⚠/✕/◌) — those rendered as whatever the OS's own default glyph
+// font happened to draw, inconsistent weight/alignment across platforms
+// and no real visual hierarchy against the title text next to them. A
+// filled icon inside a tinted circle reads as a real status badge, the
+// same convention Linear/Vercel-style toast systems use, and the spin
+// on IconLoader2 (progress) is real motion, not the static "◌" this
+// replaced pretending to spin.
+const ICON_SIZE = 15;
+
+const STATUS: Record<Toast['type'], { Icon: typeof IconCircleCheckFilled; colorClass: string; bgClass: string; spin?: boolean }> = {
+  success: { Icon: IconCircleCheckFilled, colorClass: 'text-long', bgClass: 'bg-long/15' },
+  info: { Icon: IconInfoCircleFilled, colorClass: 'text-chart-line', bgClass: 'bg-chart-line/15' },
+  warning: { Icon: IconAlertTriangleFilled, colorClass: 'text-warning', bgClass: 'bg-warning/15' },
+  error: { Icon: IconCircleXFilled, colorClass: 'text-short', bgClass: 'bg-short/15' },
+  progress: { Icon: IconLoader2, colorClass: 'text-privacy', bgClass: 'bg-privacy/15', spin: true },
 };
 
 export function ToastCard({ toast, onClose }: { toast: Toast; onClose: (id: string) => void }) {
@@ -24,7 +42,7 @@ export function ToastCard({ toast, onClose }: { toast: Toast; onClose: (id: stri
     return () => clearTimeout(timer);
   }, [toast.id, toast.duration, onClose]);
 
-  const { glyph, colorClass } = STATUS[toast.type];
+  const { Icon, colorClass, bgClass, spin } = STATUS[toast.type];
 
   return (
     <motion.div
@@ -37,9 +55,9 @@ export function ToastCard({ toast, onClose }: { toast: Toast; onClose: (id: stri
       style={{ boxShadow: PANEL_SHADOW }}
     >
       <div className="flex items-start justify-between gap-[var(--space-3)]">
-        <div className="flex min-w-0 flex-1 items-start gap-[var(--space-2)]">
-          <span className={`mt-px shrink-0 text-base ${colorClass} ${toast.type === 'progress' ? 'animate-pulse' : ''}`} aria-hidden="true">
-            {glyph}
+        <div className="flex min-w-0 flex-1 items-start gap-[var(--space-3)]">
+          <span className={`grid h-6 w-6 shrink-0 place-items-center rounded-full ${bgClass}`} aria-hidden="true">
+            <Icon size={ICON_SIZE} className={`${colorClass} ${spin ? 'animate-spin' : ''}`} />
           </span>
           <div className="min-w-0 flex-1">
             <p className={`text-sm font-semibold leading-tight ${colorClass}`}>{toast.title}</p>
@@ -54,7 +72,7 @@ export function ToastCard({ toast, onClose }: { toast: Toast; onClose: (id: stri
           aria-label="Dismiss"
           className="mt-px shrink-0 text-text-quaternary transition-colors duration-150 hover:text-text-primary"
         >
-          ✕
+          <IconX size={14} stroke={2} />
         </button>
       </div>
 

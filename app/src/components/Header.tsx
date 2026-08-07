@@ -29,16 +29,16 @@ export function Header() {
   const location = useLocation();
 
   return (
-    <header className="grid h-16 flex-shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
+    <header className="grid h-14 flex-shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-[var(--space-6)] border-b border-border-subtle px-[var(--space-6)]">
       <a
         href="/"
-        className="flex items-center gap-[var(--space-3)] text-sm font-semibold text-text-primary no-underline"
+        className="flex items-center gap-[var(--space-2)] text-base font-semibold text-text-primary no-underline"
       >
         <img
-          src="/logos/android-chrome-512x512.png"
+          src="/cerdic-logo-white.png"
           alt=""
           aria-hidden="true"
-          className="h-11 w-11 flex-shrink-0"
+          className="h-12 w-12 flex-shrink-0 object-contain"
         />
         <span>Cerdic</span>
       </a>
@@ -51,8 +51,8 @@ export function Header() {
           const active =
             item.path !== null && location.pathname.startsWith(item.path);
           const className = active
-            ? 'text-[13px] font-medium text-text-primary no-underline transition-colors duration-150'
-            : 'text-[13px] font-medium text-text-tertiary no-underline transition-colors duration-150 hover:text-text-secondary';
+            ? 'text-sm font-medium text-text-primary no-underline transition-colors duration-150'
+            : 'text-sm font-medium text-text-tertiary no-underline transition-colors duration-150 hover:text-text-secondary';
 
           if (item.path === null) {
             return (

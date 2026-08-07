@@ -17,6 +17,14 @@ export interface WalletBalances {
 
 const POLL_INTERVAL_MS = 10000;
 
+/** DepositModal.tsx fires this right after a deposit/approve tx
+ *  confirms, so the balance shown elsewhere (header dropdown, etc.)
+ *  updates immediately instead of waiting up to POLL_INTERVAL_MS — the
+ *  actual reason a real, already-landed balance change reads as "the
+ *  deposit didn't do anything," the number on screen just hadn't been
+ *  refetched yet. */
+export const BALANCES_CHANGED_EVENT = 'cerdic:balances-changed';
+
 // `toFixed(4)`/`toFixed(2)`, not the raw formatted string: `formatEther`
 // on a real balance regularly comes back with 18 decimal places, which
 // reads as noise in a dropdown, not information.
@@ -60,9 +68,11 @@ export function useWalletBalances(address: Address | undefined): WalletBalances 
 
     load();
     const interval = window.setInterval(load, POLL_INTERVAL_MS);
+    window.addEventListener(BALANCES_CHANGED_EVENT, load);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
+      window.removeEventListener(BALANCES_CHANGED_EVENT, load);
     };
   }, [address]);
 

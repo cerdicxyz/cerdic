@@ -69,6 +69,20 @@
   --radius-pill: 9999px;
 }
 
+/* Terminal-style hard on/off blink, not a fade — LandingPage.tsx's
+   typewriter cursor uses this instead of Tailwind's animate-pulse,
+   which smoothly fades rather than snapping like a real text cursor. */
+@keyframes cursor-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
 :root {
   --space-1: 1.76px;
   --space-2: 3.52px;
@@ -139,6 +153,24 @@ select,
   outline-offset: 2px;
 }
 
+/* "Highlight focused input" toggle (SettingsDropdown.tsx) — every
+   component's own focus styling (DepositModal/TradePanel/LoginModal/
+   MarketSearchModal's `focus:border-border-focus` / `focus-within:
+   border-border-focus` Tailwind classes, plus the bare :focus-visible
+   rule above) all funnel through this one `--color-border-focus` token,
+   so overriding it here under one root attribute turns the red ring off
+   everywhere at once — no per-input className changes needed. Falls
+   back to the same subtle color every idle border already uses, so a
+   focused input still reads as "the active one" by outline presence
+   alone, just without the accent color call-out. */
+[data-focus-ring-off] {
+  --color-border-focus: var(--color-border-subtle);
+}
+
+[data-focus-ring-off] :focus-visible {
+  outline: none;
+}
+
 input[type='number']::-webkit-inner-spin-button,
 input[type='number']::-webkit-outer-spin-button {
   -webkit-appearance: none;
@@ -191,8 +223,14 @@ input[type='number'] {
 
 .trade-grid-row--bottom {
   flex: 1;
-  grid-template-columns: 1fr 1fr;
-  grid-template-areas: 'positions stats';
+  /* Stats removed (folded into MarketBar's own top row, see that
+     component's own doc) — Positions and Account now split the row two
+     ways instead of three, Positions still getting the larger share
+     since it's the one panel here a trader actually scans row by row,
+     Account is more of an occasional jump-off point to the Deposit
+     modal. */
+  grid-template-columns: 1.6fr 1fr;
+  grid-template-areas: 'positions account';
 }
 
 .trade-grid-side {
@@ -229,7 +267,7 @@ input[type='number'] {
     grid-template-areas: 'chart' 'book';
   }
   .trade-grid-row--bottom {
-    grid-template-areas: 'positions' 'stats';
+    grid-template-areas: 'positions' 'account';
   }
   .trade-grid-side {
     flex: none;

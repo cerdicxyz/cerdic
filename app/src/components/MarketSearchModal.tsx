@@ -96,7 +96,7 @@ export function MarketSearchModal({
 
   return (
     <div
-      className="fixed inset-0 z-[900] flex items-start justify-center bg-black/60 p-[var(--space-6)] pt-[22vh]"
+      className="fixed inset-0 z-[900] flex items-start justify-center bg-black/60 p-[var(--space-6)] pt-[22vh] backdrop-blur-[3px]"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}

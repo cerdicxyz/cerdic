@@ -77,7 +77,14 @@ export function TradesPanel() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="grid grid-cols-[1fr_1.4fr_1fr_1fr] gap-[var(--space-3)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-3)] text-[10px] font-medium uppercase tracking-[0.08em] text-text-quaternary">
+      <div className="flex items-center gap-[var(--space-2)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
+        <span className="relative flex h-1.5 w-1.5 flex-shrink-0" aria-hidden="true">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-long opacity-60" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-long" />
+        </span>
+        <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-text-quaternary">Live</span>
+      </div>
+      <div className="grid grid-cols-[1fr_1.4fr_1fr_1fr] gap-[var(--space-3)] border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)] text-[10px] font-medium uppercase tracking-[0.08em] text-text-quaternary">
         <span>Time</span>
         <span>Pair</span>
         <span className="text-right">Price</span>
@@ -106,7 +113,7 @@ export function TradesPanel() {
               key={key}
               className="group grid grid-cols-[1fr_1.4fr_1fr_1fr] items-center gap-[var(--space-3)] border-l-2 px-[var(--space-4)] py-[var(--space-2)] text-xs transition-[background-color,border-color] duration-500 hover:bg-surface-hover"
               style={{
-                borderLeftColor: flashing ? toneColor : 'transparent',
+                borderLeftColor: flashing ? toneColor : `color-mix(in oklch, ${toneColor} 30%, transparent)`,
                 backgroundColor: flashing ? `color-mix(in oklch, ${toneColor} 12%, transparent)` : undefined,
               }}
             >
@@ -114,7 +121,13 @@ export function TradesPanel() {
                 {formatTime(trade.time)}
               </span>
               <span className="flex items-center gap-[var(--space-2)] text-text-secondary">
-                <img src={market.icon} alt="" aria-hidden="true" className="h-4 w-4 flex-shrink-0 rounded-full" />
+                <img
+                  src={market.icon}
+                  alt=""
+                  aria-hidden="true"
+                  className="h-4 w-4 flex-shrink-0 rounded-full ring-1 ring-inset ring-border-subtle transition-[box-shadow] duration-500"
+                  style={flashing ? { boxShadow: `0 0 0 1px color-mix(in oklch, ${toneColor} 60%, transparent)` } : undefined}
+                />
                 <span className="truncate">{market.label}</span>
               </span>
               <span

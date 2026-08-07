@@ -68,3 +68,27 @@ export function decimalsForGroupingOption(option: number): number {
 export function groupTicksForOption(option: number, marketId: string): number {
   return Math.max(1, Math.round(option * priceScaleForMarket(marketId)));
 }
+
+/** Client-side mirror of api.rs's `group_levels`: merges consecutive raw
+ *  levels into `group`-tick buckets, summing qty per bucket. Used to
+ *  simulate a handful of grouping options against one raw snapshot
+ *  (`OrderBookDepth.tsx`'s default-grouping pick), not to re-bucket the
+ *  live, already-server-grouped feed itself — see `useOrderBook.ts`'s own
+ *  doc on why that stays server-side for the feed the UI actually renders. */
+export function groupRawLevels<T extends { tick: number; qty: number }>(
+  levels: T[],
+  group: number,
+): Array<{ tick: number; qty: number }> {
+  if (group <= 1) return levels.map((l) => ({ tick: l.tick, qty: l.qty }));
+  const out: Array<{ tick: number; qty: number }> = [];
+  for (const level of levels) {
+    const bucket = Math.floor(level.tick / group) * group;
+    const last = out[out.length - 1];
+    if (last && last.tick === bucket) {
+      last.qty += level.qty;
+    } else {
+      out.push({ tick: bucket, qty: level.qty });
+    }
+  }
+  return out;
+}

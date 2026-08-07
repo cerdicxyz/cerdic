@@ -4,8 +4,8 @@ import { Panel } from '../components/Panel';
 import { OrderBookDepth } from '../components/OrderBookDepth';
 import { TradePanel } from '../components/TradePanel';
 import { ChartPanel } from '../components/ChartPanel';
-import { StatsPanel } from '../components/StatsPanel';
 import { PositionsPanel } from '../components/PositionsPanel';
+import { AccountPanel } from '../components/AccountPanel';
 import { TradesPanel } from '../components/TradesPanel';
 import { TradeModeDropdown } from '../components/TradeModeDropdown';
 import { MARKETS, marketFromSlug, marketToSlug, type Market } from '../components/MarketDropdown';
@@ -75,8 +75,8 @@ export function TradePage() {
             <Panel label="Positions" area="positions" noPadding>
               <PositionsPanel />
             </Panel>
-            <Panel label="Stats" area="stats" noPadding>
-              <StatsPanel market={market} />
+            <Panel label="Account" area="account" noPadding>
+              <AccountPanel />
             </Panel>
           </div>
         </div>

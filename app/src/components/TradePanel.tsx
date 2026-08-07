@@ -1,12 +1,48 @@
 import { useEffect, useMemo, useState } from 'react';
 import { LeverageSlider } from './LeverageSlider';
 import { ConnectWallet } from './ConnectWallet';
+import { DepositModal } from './DepositModal';
 import { useWallet } from '../wallet/wallet-context';
 import { useOrderBook } from '../hooks/useOrderBook';
 import { useSubmitOrder, type SubmitOrderStage } from '../hooks/useSubmitOrder';
+import { recordFill, useLocalPositions } from '../hooks/useLocalPositions';
+import { useDepositedCollateral } from '../hooks/useDepositedCollateral';
 import type { Market } from './MarketDropdown';
 import { formatMarketPrice, tickToPrice } from '../lib/priceScale';
-import { toast } from '../toast/toast-context';
+import { toast, type ToastAction } from '../toast/toast-context';
+
+// Turns a raw thrown error's `.message` into what a trader actually
+// needs to read, not the wire-format string useSubmitOrder.ts's
+// `order submission failed: ${status} ${body}` produces (the matcher's
+// real error Display text, forwarded as-is — see api.rs's own
+// IntoResponse impl on why that's honest, not a bug, just not written
+// for a toast). Known shapes get a real title + a plain-English
+// description (still the real numbers, just not "order submission
+// failed: 402" boilerplate in front of them); anything unrecognized
+// falls back to the raw message rather than hiding it.
+function describeOrderError(
+  message: string,
+  onDeposit: () => void,
+): { title: string; description: string; action?: ToastAction } {
+  const collateral = message.match(/insufficient deposited collateral: need \$([\d.]+), have \$([\d.]+)/);
+  if (collateral) {
+    const [, need, have] = collateral;
+    return {
+      title: 'Not enough collateral',
+      description:
+        have === '0.00'
+          ? `This order needs $${need} deposited, and you haven't deposited anything yet.`
+          : `This order needs $${need} deposited — you have $${have}.`,
+      action: { label: 'Deposit', onClick: onDeposit },
+    };
+  }
+  // Strips useSubmitOrder.ts's own "order submission failed: NNN "
+  // prefix for every other real backend error — the status code is
+  // useful in a log, not in a toast a trader has to read in half a
+  // second.
+  const stripped = message.match(/^order submission failed: \d+ (.+)$/);
+  return { title: 'Order failed', description: stripped ? stripped[1] : message };
+}
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -70,6 +106,9 @@ export function TradePanel({ market }: { market: Market }) {
   const [stopLoss, setStopLoss] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitStatus, setSubmitStatus] = useState<{ kind: 'ok' | 'error'; message: string } | null>(null);
+  const [depositOpen, setDepositOpen] = useState(false);
+  const positions = useLocalPositions();
+  const deposited = useDepositedCollateral(wallet.status === 'connected' ? wallet.address : undefined);
 
   const maxLeverage = market.leverage;
   // Solidity's own integer-division truncation (SettlementEngine's
@@ -123,6 +162,25 @@ export function TradePanel({ market }: { market: Market }) {
     return (qty * tickToPrice(tick, market.id)) / leverage;
   }, [amount, price, orderType, marketTick, leverage, market.id]);
 
+  // The matcher's own pre-trade gate (check_deposited_collateral, api.rs)
+  // checks deposited collateral against locked_usd (every OTHER open
+  // position's own margin, summed) PLUS this new order's margin — not
+  // just the new order alone. Showing only `marginRequirement` here read
+  // as "the server disagrees with the client" (a real report: the 402's
+  // own "need $X" was consistently higher than what this panel showed),
+  // when the two numbers were actually just answering different
+  // questions. `position.entryPrice * position.size / position.leverage`
+  // mirrors the same margin formula PositionsPanel.tsx's own "Margin"
+  // column already uses — the best local approximation of `locked_usd`
+  // this frontend has, since the real figure lives in each SealedPosition
+  // on-chain, not locally.
+  const existingLockedMargin = useMemo(
+    () => positions.reduce((sum, p) => sum + (p.entryPrice * p.size) / p.leverage, 0),
+    [positions],
+  );
+  const totalMarginRequirement = marginRequirement !== null ? existingLockedMargin + marginRequirement : null;
+  const freeMargin = deposited !== null && totalMarginRequirement !== null ? deposited - totalMarginRequirement : null;
+
   // One progress toast driven through the submission's real stages
   // (sign -> encrypt -> submit -> settled), matching cer-perp's own
   // trading-panel.tsx pattern: `toast.progress` once up front, then
@@ -172,6 +230,9 @@ export function TradePanel({ market }: { market: Market }) {
       } else if (result.status === 'filled') {
         const message = `Filled (${result.fills} fill${result.fills === 1 ? '' : 's'})`;
         setSubmitStatus({ kind: 'ok', message });
+        if (wallet.address) {
+          recordFill(wallet.address, market.id, side, qty, tickToPrice(tick, market.id), leverage);
+        }
         // Terminal, but not "done": the settlement tx itself is still
         // in flight on the matcher's side (fire-and-forget on that end,
         // see api.rs's own doc) — `loadingAction` keeps this toast alive
@@ -223,12 +284,14 @@ export function TradePanel({ market }: { market: Market }) {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'submission failed';
       setSubmitStatus({ kind: 'error', message });
+      const { title, description, action } = describeOrderError(message, () => setDepositOpen(true));
       toast.update(progressId, {
         type: 'error',
-        title: 'Order failed',
-        description: message,
+        title,
+        description,
         progress: undefined,
-        duration: 6000,
+        duration: action ? 10000 : 6000,
+        action,
       });
     } finally {
       setSubmitting(false);
@@ -359,9 +422,10 @@ export function TradePanel({ market }: { market: Market }) {
         </span>
         <span
           className="text-text-secondary"
-          title="Trader's own Price × Amount × 5% initial margin — see required_margin in api.rs"
+          title="This order's own margin PLUS every other open position's locked margin — the same total the matcher's pre-trade collateral check (check_deposited_collateral, api.rs) actually compares against your deposited balance"
         >
-          {marginRequirement !== null ? `$${marginRequirement.toFixed(2)}` : '$0.00'} (Free: —)
+          {totalMarginRequirement !== null ? `$${totalMarginRequirement.toFixed(2)}` : '$0.00'} (Free:{' '}
+          {freeMargin !== null ? `$${freeMargin.toFixed(2)}` : '—'})
         </span>
       </div>
 
@@ -459,6 +523,8 @@ export function TradePanel({ market }: { market: Market }) {
           <span className="font-medium text-privacy">Private (shielded)</span>
         </div>
       </div>
+
+      <DepositModal open={depositOpen} onClose={() => setDepositOpen(false)} />
     </div>
   );
 }

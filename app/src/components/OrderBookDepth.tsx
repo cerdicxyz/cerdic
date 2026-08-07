@@ -1,11 +1,12 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
-import { useOrderBook } from '../hooks/useOrderBook';
+import { useOrderBook, matcherHttpUrl } from '../hooks/useOrderBook';
 import {
   formatMarketPrice,
   tickToPrice,
   groupingOptionsForMarket,
   decimalsForGroupingOption,
   groupTicksForOption,
+  groupRawLevels,
 } from '../lib/priceScale';
 
 // Depth-heatmap order book, rendered on a single canvas — matching how
@@ -258,18 +259,65 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
   // directly, so switching markets can reset to a sane default without
   // needing to know the new market's scale up front.
   //
-  // Defaults to the MIDDLE option, not the finest (index 0): the finest
-  // bucket is one raw tick, which on a real live book packs dozens of
-  // rows into single-unit price gaps — technically correct but far too
-  // dense to read at a glance. A real venue's own default grouping is
-  // never its tightest either, for the same reason.
+  // Which option actually looks "most densely populated" isn't a fixed
+  // index — it depends on how this market's real resting liquidity
+  // happens to be spread at this moment, so neither a fixed finest nor a
+  // fixed coarsest index holds up across every market. On every market
+  // switch this fetches ONE raw (ungrouped) snapshot over HTTP and
+  // simulates every candidate bucket size against it locally
+  // (`groupRawLevels`, the same merge api.rs's `group_levels` does
+  // server-side) to find whichever option actually yields the most rows
+  // up to what the panel can show (`LEVELS_PER_SIDE`) on both sides —
+  // then that's what the live WS subscription below groups by. Ties
+  // (multiple options all reaching the panel's cap) resolve to the
+  // finer one, since finer is strictly more informative once the panel
+  // is already full either way.
   const groupOptions = useMemo(() => groupingOptionsForMarket(marketId), [marketId]);
-  const defaultGroupIndex = Math.floor((groupOptions.length - 1) / 2);
-  const [groupIndex, setGroupIndex] = useState(defaultGroupIndex);
+  const [groupIndex, setGroupIndex] = useState(() => groupOptions.length - 1);
   const [groupMenuOpen, setGroupMenuOpen] = useState(false);
   useEffect(() => {
-    setGroupIndex(Math.floor((groupingOptionsForMarket(marketId).length - 1) / 2));
+    let cancelled = false;
+    const options = groupingOptionsForMarket(marketId);
     setGroupMenuOpen(false);
+
+    async function pickDefaultGrouping() {
+      try {
+        // levels=200 (MAX_DEPTH_LEVELS, api.rs's own ceiling), not 50: a
+        // coarse bucket needs raw levels well beyond the touch to have
+        // any real material to merge — scoring against only the nearest
+        // 50 systematically undercounted every wide option, the same
+        // truncation broadcast_orderbook_update's own doc had to fix on
+        // the live feed itself.
+        const res = await fetch(`${matcherHttpUrl}/orderbook/${encodeURIComponent(marketId)}?levels=200`);
+        const data: { bids: { tick: number; qty: number }[]; asks: { tick: number; qty: number }[] } =
+          await res.json();
+        let bestIndex = options.length - 1;
+        let bestScore = -1;
+        options.forEach((option, i) => {
+          const ticks = groupTicksForOption(option, marketId);
+          const score = Math.min(
+            groupRawLevels(data.bids, ticks).length,
+            groupRawLevels(data.asks, ticks).length,
+            LEVELS_PER_SIDE,
+          );
+          if (score > bestScore) {
+            bestScore = score;
+            bestIndex = i;
+          }
+        });
+        if (!cancelled) setGroupIndex(bestIndex);
+      } catch {
+        // Matcher unreachable (e.g. right after a market switch, before
+        // the backend answers) — same safe fallback this used before
+        // this dynamic pick existed.
+        if (!cancelled) setGroupIndex(options.length - 1);
+      }
+    }
+    pickDefaultGrouping();
+
+    return () => {
+      cancelled = true;
+    };
   }, [marketId]);
   const groupOption = groupOptions[groupIndex] ?? groupOptions[0];
   const groupTicks = groupTicksForOption(groupOption, marketId);
