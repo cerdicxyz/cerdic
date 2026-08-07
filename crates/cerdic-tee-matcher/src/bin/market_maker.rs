@@ -61,7 +61,7 @@
 //!   MM_SPREAD_BPS            - optional, default 20 (FLOOR half-spread each
 //!                              side, before the volatility term below —
 //!                              not the spread actually quoted)
-//!   MM_QUOTE_SIZE            - optional, default 10 (CENTER of the size
+//!   MM_QUOTE_SIZE            - optional, default 40 (CENTER of the size
 //!                              range each side draws from, see
 //!                              MM_SIZE_JITTER_PCT)
 //!   MM_SKEW_BPS_PER_UNIT     - optional, default 2 (how hard inventory
@@ -84,9 +84,9 @@
 //!   MM_SIZE_JITTER_PCT       - optional, default 35 (± this percent of
 //!                              MM_QUOTE_SIZE, applied independently to bid
 //!                              and ask each cycle)
-//!   MM_LADDER_LEVELS         - optional, default 4 (resting levels quoted
-//!                              per side per cycle, each 2x/3x/4x... the
-//!                              base spread out from mid with 60% less
+//!   MM_LADDER_LEVELS         - optional, default 14 (resting levels
+//!                              quoted per side per cycle, each 1.5x the
+//!                              base spread out from mid with 15% less
 //!                              size than the level before it — real
 //!                              price-RANGE coverage, not one tick per
 //!                              side; see the ladder loop's own doc)
@@ -133,7 +133,7 @@ async fn main() {
     let feed_id = std::env::var("PYTH_FEED_ID").expect("PYTH_FEED_ID not set");
     let private_key = std::env::var("MM_PRIVATE_KEY").expect("MM_PRIVATE_KEY not set");
     let spread_bps: u64 = std::env::var("MM_SPREAD_BPS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let quote_size: u64 = std::env::var("MM_QUOTE_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let quote_size: u64 = std::env::var("MM_QUOTE_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let skew_bps_per_unit: i64 =
         std::env::var("MM_SKEW_BPS_PER_UNIT").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     let requote_interval = Duration::from_secs(
@@ -147,7 +147,7 @@ async fn main() {
     let size_jitter_pct: f64 =
         std::env::var("MM_SIZE_JITTER_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(35.0);
     let ladder_levels: u64 =
-        std::env::var("MM_LADDER_LEVELS").ok().and_then(|s| s.parse().ok()).unwrap_or(4).max(1);
+        std::env::var("MM_LADDER_LEVELS").ok().and_then(|s| s.parse().ok()).unwrap_or(14).max(1);
 
     let wallet: PrivateKeySigner = private_key.parse().expect("invalid MM_PRIVATE_KEY");
     let http = reqwest::Client::new();
@@ -272,7 +272,20 @@ async fn main() {
         // maker (a real participant quotes tighter/bigger near the
         // touch, wider/smaller further out), not fabricated filler.
         for level in 0..ladder_levels {
-            let level_mult = (level + 1) as f64;
+            // Geometric growth (1.5x per level, not the doubling this
+            // loop used right after the previous fix): with
+            // MM_LADDER_LEVELS now 14 (up from 4, see this fn's own
+            // param doc — more real distinct price rungs is the actual
+            // fix for a grouping option collapsing to one or two giant
+            // buckets, not reshaping what a "bucket" means), pure
+            // doubling would blow past the 5000bps safety clamp by level
+            // 8, leaving levels 8-13 all duplicated on top of that same
+            // clamped tick — six wasted levels contributing nothing.
+            // 1.5x reaches the clamp around level 14 instead, so every
+            // level actually lands at its own distinct price, spreading
+            // real resting liquidity out to ~39% of mid before anything
+            // clips.
+            let level_mult = 1.5f64.powi(level as i32);
             let bid_jitter = 1.0 + rng.gen_range(-jitter_bps_pct..=jitter_bps_pct) / 100.0;
             let ask_jitter = 1.0 + rng.gen_range(-jitter_bps_pct..=jitter_bps_pct) / 100.0;
             // Clamped at 5000bps (50%) — an already-unrealistic spread
@@ -292,7 +305,15 @@ async fn main() {
             let bid_tick = mid.saturating_sub(mid * bid_bps / 10_000);
             let ask_tick = mid.saturating_add(mid * ask_bps / 10_000);
 
-            let level_size = ((quote_size as f64) * 0.6f64.powi(level as i32)).round().max(1.0) as u64;
+            // Decay softened from 0.6 (~40% lost per level) to 0.85
+            // (~15%) alongside the level count going 4 -> 14: at the old
+            // rate an outer level on a 14-deep ladder would round down
+            // to a 1-unit order (0.6^13 * quote_size is a rounding error,
+            // not a real resting size) — technically a distinct price
+            // point but not a believable one, and not what "we have
+            // money, testnet" calls for. 0.85^13 keeps the deepest level
+            // a real double-digit size instead.
+            let level_size = ((quote_size as f64) * 0.85f64.powi(level as i32)).round().max(1.0) as u64;
             let bid_size = jittered_size(level_size, size_jitter_pct, &mut rng);
             let ask_size = jittered_size(level_size, size_jitter_pct, &mut rng);
 
@@ -354,7 +375,19 @@ fn jittered_size(center: u64, pct: f64, rng: &mut impl Rng) -> u64 {
     ((center as f64 * factor).round() as i64).max(1) as u64
 }
 
+/// The on-chain bytes32 marketId: `ONCHAIN_MARKET_ID` if set, else
+/// `keccak256(market_id.as_bytes())`. Real necessity on a live deployment, not
+/// convenience: FxPerpMarket's own `marketId` immutable "doubles as the Pyth
+/// feed ID" (OracleHub.sol's own doc), so the real on-chain marketId is Pyth's
+/// externally-fixed feed ID, which won't equal a hash of this process's own
+/// `MARKET_ID` string except by the coincidence local dev deliberately
+/// engineers (DeployLocal.s.sol sets its own feed id to exactly
+/// `keccak256("EURC/USDC")`). Unset (local dev's default) keeps today's
+/// behavior unchanged.
 fn market_hash(market_id: &str) -> FixedBytes<32> {
+    if let Ok(raw) = std::env::var("ONCHAIN_MARKET_ID") {
+        return raw.parse().unwrap_or_else(|_| panic!("invalid ONCHAIN_MARKET_ID: {raw}"));
+    }
     alloy::primitives::keccak256(market_id.as_bytes())
 }
 

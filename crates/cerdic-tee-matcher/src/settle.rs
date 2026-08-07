@@ -103,6 +103,21 @@ sol! {
         event SealedPositionTouched(bytes32 indexed portfolioKey, bytes32 indexed marketId);
     }
 
+    /// `RiskMonitor.sol`'s own TEE-attested portfolio margin surface: the
+    /// one bridge between the sealed settlement path's real, cross-market
+    /// margin computation (`risk::RiskMonitor::compute_margin`, the same
+    /// formula `api::compute_margin` already runs for `/liquidation-check`)
+    /// and the plaintext `Account.sol.withdraw()` safety check. Without a
+    /// fresh attestation here, `RiskMonitor.effectiveMarginRequirement`
+    /// falls back to `currentMarginRequirement`, which sums the OTHER,
+    /// unused plaintext `PositionEngine` — structurally blind to real
+    /// sealed positions, so a withdraw's margin check would see zero
+    /// requirement for every real trader. See `submit_portfolio_margin`'s
+    /// own doc for when this gets called.
+    interface IRiskMonitor {
+        function submitPortfolioMargin(address trader, uint256 requirement, uint64 expiry) external;
+    }
+
     /// The one real-collateral-custody read this crate needs —
     /// `packages/contracts/src/clearing/Account.sol`'s own view function,
     /// a single global contract (not per-market like SettlementEngine).
@@ -582,6 +597,36 @@ pub async fn checkpoint_funding_index(
     let calldata = Bytes::from(call.abi_encode());
     if let Err(e) = broadcast(signer, &rpc_url, contract, calldata).await {
         tracing::warn!(error = %e, "funding index checkpoint failed");
+    }
+}
+
+/// Submits a fresh TEE-attested portfolio margin requirement for
+/// `trader` to `RiskMonitor.sol` (a single global contract, like
+/// `Account.sol`, not per-market like `SettlementEngine`), the one thing
+/// that makes `Account.sol.withdraw()`'s on-chain margin check see a
+/// trader's real sealed exposure instead of falling back to the unused
+/// plaintext `PositionEngine`. Called after every settled fill (see
+/// `api.rs`'s `post_order`) for the taker and every maker leg, so the
+/// attestation stays fresh for anyone actually trading; `expiry` is a
+/// fixed window from now (not tied to the next expected trade), so a
+/// trader who stops trading has their attestation simply go stale and
+/// fall back to the conservative isolated sum, never silently stay
+/// permissively wrong. A no-op when broadcasting isn't configured, same
+/// posture as `checkpoint_funding_index`.
+pub async fn submit_portfolio_margin(
+    signer: &SettlementSigner,
+    trader: Address,
+    requirement: U256,
+    expiry: u64,
+    contract: Option<Address>,
+) {
+    let Some((rpc_url, contract)) = broadcast_config(contract) else {
+        return;
+    };
+    let call = IRiskMonitor::submitPortfolioMarginCall { trader, requirement, expiry };
+    let calldata = Bytes::from(call.abi_encode());
+    if let Err(e) = broadcast(signer, &rpc_url, contract, calldata).await {
+        tracing::warn!(error = %e, trader = %trader, "portfolio margin attestation failed");
     }
 }
 

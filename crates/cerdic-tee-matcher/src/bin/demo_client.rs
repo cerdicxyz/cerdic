@@ -6,7 +6,14 @@
 //! exactly what a real client would send.
 //!
 //! Usage:
-//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id] [private_key] [leverage]
+//!   cargo run --bin demo_client -- [buy|sell] [tick] [qty] [market_id] [private_key] [leverage] [tif]
+//!
+//! `tif` is one of `gtc` (default, rests any unfilled remainder — what a
+//! manual "resting sell" test wants) or `ioc` (cancels any unfilled
+//! remainder instead of resting it at the crossing price — what a
+//! marketable order that only means to take the touch, not leave a
+//! stale off-market resting order behind, wants; see local_dev.rs's
+//! seed loop, its only non-interactive caller).
 //!
 //! Run two of these (e.g. a resting sell then a crossing buy at the
 //! same tick) against one running server to see a real fill and the
@@ -42,6 +49,10 @@ fn main() {
     let market_id = args.next().unwrap_or_else(|| "EURC/USDC".to_string());
     let private_key = args.next();
     let leverage: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let tif = match args.next().as_deref() {
+        Some("ioc") => TimeInForce::ImmediateOrCancel,
+        _ => TimeInForce::GoodTilCancel,
+    };
 
     println!("Fetching enclave public key from {SERVER}/pubkey ...");
     let pubkey_json = curl_get(&format!("{SERVER}/pubkey"));
@@ -62,7 +73,7 @@ fn main() {
         side,
         tick,
         qty,
-        tif: TimeInForce::GoodTilCancel,
+        tif,
         post_only: false,
         nonce: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
         leverage,

@@ -17,6 +17,7 @@ pub mod logging;
 pub mod market_data;
 pub mod market_hours;
 pub mod oracle;
+pub mod persistence;
 pub mod proof;
 pub mod sealed;
 pub mod settle;

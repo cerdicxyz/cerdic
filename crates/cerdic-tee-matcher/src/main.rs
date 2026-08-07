@@ -1,8 +1,8 @@
 //! `cerdic-tee-matcher` entrypoint. See `docs/spec-contracts-tee.md` for
 //! the full module layout and HTTP API this binary implements.
 
-use cerdic_tee_matcher::{api, logging};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use cerdic_tee_matcher::{api, logging, persistence};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 /// 64 KiB. An order/offer payload is a handful of fields; this is
@@ -24,19 +24,38 @@ async fn main() {
         );
     }
 
+    let db_path = std::env::var("CERDIC_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("cerdic-state.redb"));
+    let db = Arc::new(
+        persistence::open(&db_path)
+            .unwrap_or_else(|e| panic!("failed to open state database at {}: {e}", db_path.display())),
+    );
+    tracing::info!(path = %db_path.display(), "state database opened");
+
     let secrets = cerdic_tee_matcher::kms::recover_or_generate().await;
     let mut app_state = api::AppState::from_secrets(secrets);
     configure_oracle_feeds(&mut app_state);
     configure_settlement_contracts(&mut app_state);
     configure_collateral_check(&mut app_state);
+    configure_risk_monitor(&mut app_state);
+    configure_market_id_overrides(&mut app_state);
     configure_backstop_notional_cap(&mut app_state);
     configure_debug_seed(&mut app_state);
+
+    let persisted = persistence::load(&db);
+    let (markets, nonces, portfolios) =
+        (persisted.market_data.len(), persisted.last_nonce.len(), persisted.portfolio_markets.len());
+    app_state.apply_persisted_state(persisted);
+    tracing::info!(markets, nonces, portfolios, "rehydrated persisted state from disk");
+
     let state = Arc::new(app_state);
     tracing::info!(pubkey = %state.keystore.public_key_b64(), "enclave keypair generated");
 
     tokio::spawn(oracle_poll_loop(state.clone()));
     tokio::spawn(funding_poll_loop(state.clone()));
     tokio::spawn(oi_poll_loop(state.clone()));
+    tokio::spawn(persist_loop(state.clone(), db.clone()));
 
     // Permissive by design, not an oversight: every mutating endpoint here
     // is authenticated by a signed payload (decrypt::decrypt_and_authenticate),
@@ -47,17 +66,74 @@ async fn main() {
     // server, or any real frontend) couldn't reach it, full stop.
     let cors = CorsLayer::permissive();
 
-    let app = api::router(state)
+    let app = api::router(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(TimeoutLayer::new(Duration::from_secs(10)))
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
+    let port: u16 = std::env::var("CERDIC_HTTP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8787);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind listen address");
     tracing::info!(%addr, "listening");
 
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.expect("server error");
+
+    // One last flush on the way out — bounds data loss to whatever
+    // happened between the last `persist_loop` tick and this shutdown,
+    // not a full `PERSIST_INTERVAL`'s worth. Best-effort: a failed final
+    // save just means the last periodic tick's data is what a future
+    // boot recovers, same posture `persist_loop` itself already takes.
+    if let Err(e) = persistence::save(&db, &state.snapshot_for_persistence()) {
+        tracing::error!(error = %e, "final state persist on shutdown failed");
+    } else {
+        tracing::info!("state persisted on shutdown");
+    }
+}
+
+/// Resolves once either Ctrl-C or (on Unix, e.g. a `docker stop`/systemd
+/// `SIGTERM`) a termination signal arrives — `axum::serve`'s own
+/// `with_graceful_shutdown` waits on this before it stops accepting new
+/// connections, so the final persistence flush above only ever runs
+/// after real requests have finished draining, not concurrently with
+/// them.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// How often `persist_loop` flushes live state to disk. Bounds worst-case
+/// data loss on an unclean exit (a crash, `kill -9`, a host eviction —
+/// anything that skips the graceful `shutdown_signal` path above) to
+/// roughly this interval; the clean-shutdown path above flushes
+/// immediately regardless of this cadence.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(10);
+
+async fn persist_loop(state: Arc<api::AppState>, db: Arc<redb::Database>) {
+    let mut interval = tokio::time::interval(PERSIST_INTERVAL);
+    loop {
+        interval.tick().await;
+        let snapshot = state.snapshot_for_persistence();
+        if let Err(e) = persistence::save(&db, &snapshot) {
+            tracing::error!(error = %e, "periodic state persist failed");
+        }
+    }
 }
 
 /// Reads `CERDIC_ORACLE_FEEDS`, a comma-separated list of
@@ -149,6 +225,75 @@ fn configure_collateral_check(state: &mut api::AppState) {
             asset = asset_raw,
             "malformed CERDIC_ACCOUNT_CONTRACT/CERDIC_COLLATERAL_ASSET, no pre-trade collateral check"
         ),
+    }
+}
+
+/// Reads `CERDIC_RISK_MONITOR_CONTRACT` (a plain address) and wires the
+/// post-trade portfolio-margin attestation, see
+/// `api::AppState::configure_risk_monitor`'s own doc. Unset or malformed
+/// leaves it off — same "opt-in, not opt-out" posture as
+/// `configure_collateral_check` above, not fatal: without this,
+/// `Account.sol.withdraw()`'s margin check keeps falling back to the
+/// unused plaintext `PositionEngine` sum instead of a trader's real
+/// sealed exposure.
+fn configure_risk_monitor(state: &mut api::AppState) {
+    let Ok(raw) = std::env::var("CERDIC_RISK_MONITOR_CONTRACT") else {
+        tracing::info!(
+            "CERDIC_RISK_MONITOR_CONTRACT not set, withdraw()'s margin check will not see real sealed exposure"
+        );
+        return;
+    };
+    match raw.parse() {
+        Ok(contract) => {
+            tracing::info!(contract = %raw, "portfolio margin attestation configured");
+            state.configure_risk_monitor(contract);
+        }
+        Err(e) => tracing::warn!(
+            contract = raw,
+            error = %e,
+            "malformed CERDIC_RISK_MONITOR_CONTRACT, no portfolio margin attestation"
+        ),
+    }
+}
+
+/// Reads `CERDIC_MARKET_ID_OVERRIDES`, a comma-separated list of
+/// `marketId=0xOnChainId` pairs, see `api::AppState::onchain_market_id`'s own
+/// doc for why this needs to exist at all on a real deployment: FxPerpMarket's
+/// own `marketId` immutable "doubles as the Pyth feed ID" (OracleHub.sol's own
+/// doc), so a real deployment's on-chain marketId is Pyth's externally-fixed
+/// feed ID — never a hash of this process's own market-name string, except by
+/// the coincidence local dev deliberately engineers. A market with no entry
+/// here falls back to `keccak256(market_id.as_bytes())`, so an unconfigured
+/// deployment (every local dev run today) behaves exactly as it always has.
+fn configure_market_id_overrides(state: &mut api::AppState) {
+    let Ok(raw) = std::env::var("CERDIC_MARKET_ID_OVERRIDES") else {
+        tracing::info!(
+            "CERDIC_MARKET_ID_OVERRIDES not set, every market's on-chain id is keccak256(market_id) \
+             — correct for local dev, WRONG for a deployment against real Pyth feed ids"
+        );
+        return;
+    };
+    for pair in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match pair.split_once('=') {
+            Some((market_id, onchain_id)) if !market_id.is_empty() && !onchain_id.is_empty() => {
+                match onchain_id.parse() {
+                    Ok(id) => {
+                        tracing::info!(market_id, onchain_id, "on-chain marketId override configured");
+                        state.configure_market_id_override(market_id.to_string(), id);
+                    }
+                    Err(e) => tracing::warn!(
+                        market_id,
+                        onchain_id,
+                        error = %e,
+                        "malformed CERDIC_MARKET_ID_OVERRIDES id, skipping"
+                    ),
+                }
+            }
+            _ => tracing::warn!(
+                pair,
+                "malformed CERDIC_MARKET_ID_OVERRIDES entry, expected marketId=0xOnChainId, skipping"
+            ),
+        }
     }
 }
 

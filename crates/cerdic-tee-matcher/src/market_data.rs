@@ -9,18 +9,21 @@
 
 use std::collections::VecDeque;
 
-/// Widened from a strict 24h to 3 days so longer-timeframe candles (4h,
-/// 1d) have enough real retained history to draw more than one or two
-/// bars — a real, deliberate tradeoff: `MarketSnapshot.change_24h_bps`/
+/// Widened from a strict 24h to 7 days so longer-timeframe candles (4h,
+/// 1d) have enough real retained history to draw a real, non-degenerate
+/// week of bars — a real, deliberate tradeoff: `MarketSnapshot.change_24h_bps`/
 /// `volume_24h` (named for the original 24h window) now technically
 /// compare against whatever's oldest in this WIDER buffer, which only
 /// diverges from a literal calendar-24h figure once trades that old are
 /// actually still retained. Worth a follow-up rename if that field name
 /// starts reading as misleading in practice; not renamed here since
-/// nothing downstream currently depends on the literal 24h meaning.
-const WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
+/// nothing downstream currently depends on the literal 24h meaning. Memory
+/// cost is trivial either way: even at one print/minute across every
+/// market, a week is ~90k `TradeRecord`s total (24 bytes each), not a
+/// real budget concern.
+const WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct TradeRecord {
     timestamp: u64,
     price: u64,
@@ -31,7 +34,14 @@ struct TradeRecord {
 /// insert. `VecDeque` because trades arrive in non-decreasing timestamp
 /// order (the matcher's own clock, see `book::OrderBook::submit`'s `now`
 /// parameter), so pruning is always a pop from the front, never a scan.
-#[derive(Debug, Default)]
+///
+/// `Serialize`/`Deserialize`: this is exactly the public tape
+/// (`security-audit-tee-contracts.md`'s own "structural leak 2" —
+/// `/candles`/`/trades`/`/orderbook` already serve this in plaintext to
+/// anyone), so persisting it to `persistence.rs`'s on-disk store carries
+/// no privacy regression, unlike sealed position data (see that module's
+/// own doc on why `position_cache` deliberately stays RAM-only).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TradeTape {
     trades: VecDeque<TradeRecord>,
 }

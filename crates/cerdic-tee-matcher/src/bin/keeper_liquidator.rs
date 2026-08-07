@@ -63,10 +63,29 @@ async fn main() {
         std::env::var("KEEPER_POLL_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
     );
 
-    // marketId string -> (contract address, keccak256(marketId) as the
-    // on-chain topic to recognize). Computed once at startup: this is the
-    // keeper's own required config, not derived from the chain (see
-    // module doc on why the hash can't be reversed).
+    // Optional marketId=onchainId overrides, same shape as KEEPER_MARKET_CONTRACTS.
+    // Real necessity on a live deployment, not convenience: FxPerpMarket's own
+    // marketId immutable "doubles as the Pyth feed ID" (OracleHub.sol's own doc), so
+    // the real on-chain marketId is Pyth's externally-fixed feed ID, which won't
+    // equal a hash of this process's own market-name string except by the
+    // coincidence local dev deliberately engineers (DeployLocal.s.sol sets its own
+    // feed id to exactly keccak256("EURC/USDC")). A market with no entry here falls
+    // back to the hash, unset (local dev's default) keeps today's behavior.
+    let mut onchain_id_overrides: HashMap<String, FixedBytes<32>> = HashMap::new();
+    if let Ok(raw) = std::env::var("KEEPER_MARKET_ONCHAIN_IDS") {
+        for pair in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (market_id, onchain_id) = pair
+                .split_once('=')
+                .unwrap_or_else(|| panic!("malformed KEEPER_MARKET_ONCHAIN_IDS entry: {pair}"));
+            let onchain_id: FixedBytes<32> =
+                onchain_id.parse().unwrap_or_else(|_| panic!("invalid onchain marketId: {onchain_id}"));
+            onchain_id_overrides.insert(market_id.to_string(), onchain_id);
+        }
+    }
+
+    // marketId string -> (contract address, on-chain topic to recognize).
+    // Computed once at startup: this is the keeper's own required config, not
+    // derived from the chain (see module doc on why the hash can't be reversed).
     let mut market_by_hash: HashMap<FixedBytes<32>, (String, Address)> = HashMap::new();
     let mut contracts: HashSet<Address> = HashSet::new();
     for pair in market_contracts_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -74,7 +93,8 @@ async fn main() {
             pair.split_once('=').unwrap_or_else(|| panic!("malformed KEEPER_MARKET_CONTRACTS entry: {pair}"));
         let contract: Address =
             contract.parse().unwrap_or_else(|_| panic!("invalid contract address: {contract}"));
-        let hash = keccak256(market_id.as_bytes());
+        let hash =
+            onchain_id_overrides.get(market_id).copied().unwrap_or_else(|| keccak256(market_id.as_bytes()));
         market_by_hash.insert(hash, (market_id.to_string(), contract));
         contracts.insert(contract);
     }

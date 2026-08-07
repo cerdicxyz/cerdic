@@ -564,6 +564,26 @@ pub struct AppState {
     /// deployment that never wires this up behaves exactly as it always
     /// has, not silently broken.
     collateral_check: Option<(alloy::primitives::Address, alloy::primitives::Address)>,
+    /// `RiskMonitor.sol`'s own address (a single global contract, like
+    /// `Account.sol`) — `None` until `configure_risk_monitor` is called,
+    /// same "opt-in, not opt-out" posture as `collateral_check`. `None`
+    /// means `post_order` never submits a portfolio margin attestation,
+    /// so `Account.sol.withdraw()`'s on-chain check keeps falling back to
+    /// the unused plaintext `PositionEngine` sum, see
+    /// `settle::submit_portfolio_margin`'s own doc for why that matters.
+    risk_monitor_contract: Option<alloy::primitives::Address>,
+    /// Overrides the on-chain bytes32 marketId this process uses for `market_id`
+    /// (a plain string like "EURC/USDC") when it otherwise defaults to
+    /// `keccak256(market_id.as_bytes())`. Real necessity, not convenience: FxPerpMarket's
+    /// own `marketId` immutable "doubles as the Pyth feed ID" (OracleHub.sol's own doc on
+    /// `_fetchPrices`), so on a real deployment the on-chain marketId is Pyth's real,
+    /// externally-fixed feed ID, which is never going to equal a hash of this process's own
+    /// internal market-name string. Local dev never needed this: DeployLocal.s.sol
+    /// deliberately sets its (mock) feed id to `keccak256("EURC/USDC")` so the two already
+    /// agree there — this override is what makes a REAL deployment (Deploy.s.sol, a real
+    /// Pyth feed id) agree too. A market with no entry here falls back to the hash, so an
+    /// unconfigured deployment behaves exactly as before this existed.
+    market_id_overrides: HashMap<MarketId, FixedBytes<32>>,
     /// Cumulative notional volume per trader, priced against `fees::FEE_TIERS`.
     /// See `fees.rs`'s module doc: cumulative-since-inception, not a rolling
     /// window, and the same unbounded-growth caveat as `last_nonce`.
@@ -673,6 +693,8 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             collateral_check: None,
+            risk_monitor_contract: None,
+            market_id_overrides: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
             funding_index_native: Mutex::new(HashMap::new()),
@@ -708,6 +730,8 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             collateral_check: None,
+            risk_monitor_contract: None,
+            market_id_overrides: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
             debug_seed_enabled: false,
             funding_index_native: Mutex::new(HashMap::new()),
@@ -764,6 +788,65 @@ impl AppState {
         asset: alloy::primitives::Address,
     ) {
         self.collateral_check = Some((account, asset));
+    }
+
+    /// Opts the whole deployment into real portfolio-margin attestation,
+    /// see `risk_monitor_contract`'s own doc. `contract` is
+    /// `RiskMonitor.sol`'s address.
+    pub fn configure_risk_monitor(&mut self, contract: alloy::primitives::Address) {
+        self.risk_monitor_contract = Some(contract);
+    }
+
+    /// Opts one market into a real on-chain marketId override, see
+    /// `market_id_overrides`'s own doc.
+    pub fn configure_market_id_override(&mut self, market_id: MarketId, onchain_id: FixedBytes<32>) {
+        self.market_id_overrides.insert(market_id, onchain_id);
+    }
+
+    /// The on-chain bytes32 marketId for `market_id`: the configured override
+    /// if one exists, else `keccak256(market_id.as_bytes())` — every call site
+    /// that used to compute that hash inline goes through here now, so there
+    /// is exactly one place this convention lives, see `market_id_overrides`'s
+    /// own doc for why it needs to be overridable at all.
+    pub fn onchain_market_id(&self, market_id: &str) -> FixedBytes<32> {
+        self.market_id_overrides.get(market_id).copied().unwrap_or_else(|| keccak256(market_id.as_bytes()))
+    }
+
+    /// Overwrites this state's persisted-eligible fields with `persisted`,
+    /// see `persistence.rs`'s own doc for exactly which fields those are
+    /// and why. Called once at boot, before this `AppState` is
+    /// `Arc`-wrapped and handed to any request handler — a fresh
+    /// (never-before-persisted) database round-trips through
+    /// `persistence::load` as `PersistedState::default()`, so this is a
+    /// safe no-op overwrite of the same empty maps `new`/`from_secrets`
+    /// already constructed on a first-ever boot.
+    pub fn apply_persisted_state(&mut self, persisted: crate::persistence::PersistedState) {
+        *self.market_data.get_mut().expect("market_data mutex poisoned") = persisted.market_data;
+        *self.last_nonce.get_mut().expect("last_nonce mutex poisoned") = persisted.last_nonce;
+        *self.portfolio_markets.get_mut().expect("portfolio_markets mutex poisoned") =
+            persisted.portfolio_markets;
+        *self.trader_volume.get_mut().expect("trader_volume mutex poisoned") = persisted.trader_volume;
+        *self.oi_index.get_mut().expect("oi_index mutex poisoned") = persisted.oi_index;
+    }
+
+    /// Clones out this instant's value of every persisted-eligible field —
+    /// see `persistence.rs`'s own doc for why this particular set and not
+    /// more (`position_cache` above all: sealed plaintext, deliberately
+    /// excluded). Each lock is held only long enough to clone, never
+    /// across the actual disk write, so persisting never blocks a live
+    /// request on I/O.
+    pub fn snapshot_for_persistence(&self) -> crate::persistence::PersistedState {
+        crate::persistence::PersistedState {
+            market_data: self.market_data.lock().expect("market_data mutex poisoned").clone(),
+            last_nonce: self.last_nonce.lock().expect("last_nonce mutex poisoned").clone(),
+            portfolio_markets: self
+                .portfolio_markets
+                .lock()
+                .expect("portfolio_markets mutex poisoned")
+                .clone(),
+            trader_volume: self.trader_volume.lock().expect("trader_volume mutex poisoned").clone(),
+            oi_index: self.oi_index.lock().expect("oi_index mutex poisoned").clone(),
+        }
     }
 
     /// Overrides the backstop maker's `notional_cap` (default
@@ -1085,7 +1168,7 @@ impl AppState {
     /// index rather than losing history over one bad poll.
     pub async fn poll_open_interest(&self) {
         for (market_id, contract) in &self.settlement_contracts {
-            let market_hash = keccak256(market_id.as_bytes());
+            let market_hash = self.onchain_market_id(market_id);
 
             let from_block = {
                 let oi = self.oi_index.lock().expect("oi_index mutex poisoned");
@@ -1344,6 +1427,11 @@ async fn post_order(
     let mut taker_collateral_delta = I256::ZERO;
 
     let mut maker_legs = Vec::with_capacity(result.fills.len());
+    // Parallel to `maker_legs` (same push order, one entry per maker leg):
+    // `settle::MakerFill` only carries `portfolio_key`, not the real
+    // address, so the address needed for `attest_portfolio_margin` after
+    // settlement is collected here separately.
+    let mut maker_traders: Vec<Address> = Vec::with_capacity(result.fills.len());
     let mut taker_weighted_price: u128 = 0;
     // Priced once against volume BEFORE this sweep (fees.rs's own doc: a
     // trader can't buy a better rate on the same trade that earns it), then
@@ -1426,6 +1514,7 @@ async fn post_order(
             )
             .await;
         maker_legs.push(maker_leg);
+        maker_traders.push(maker_address);
     }
 
     if taker_weighted_price > 0 {
@@ -1484,7 +1573,7 @@ async fn post_order(
             None => Bytes::new(),
         };
         let sweep = crate::settle::TakerSweep {
-            market_id: keccak256(payload.market_id.as_bytes()),
+            market_id: state.onchain_market_id(&payload.market_id),
             portfolio_key_taker: taker_portfolio_key,
             collateral_delta_taker: taker_collateral_delta,
             sealed_params_taker,
@@ -1501,6 +1590,8 @@ async fn post_order(
         let market_id_for_settlement = payload.market_id.clone();
         let signer_for_settlement = signer;
         let nonce_for_settlement = payload.nonce;
+        let taker_portfolio_key_for_settlement = taker_portfolio_key;
+        let maker_traders_for_settlement = maker_traders;
         // Never awaited: settlement is async network I/O (or a no-op
         // when unconfigured, see settle.rs), not something the trader's
         // response should wait on.
@@ -1530,6 +1621,22 @@ async fn post_order(
             let tx_hash_string = match &result.broadcast_tx_hash {
                 Some(tx_hash) => {
                     tracing::info!(tx_hash = %tx_hash, market_id = %sweep.market_id, "taker sweep settled on-chain");
+                    // Only re-attest off a settlement that actually landed
+                    // — attesting off a failed broadcast would submit a
+                    // margin requirement for state that never took effect
+                    // on-chain, see the failure branch below instead.
+                    attest_portfolio_margin(
+                        &state_for_settlement,
+                        signer_for_settlement,
+                        taker_portfolio_key_for_settlement,
+                    )
+                    .await;
+                    for (maker_leg, &maker_trader) in
+                        sweep.maker_legs.iter().zip(maker_traders_for_settlement.iter())
+                    {
+                        attest_portfolio_margin(&state_for_settlement, maker_trader, maker_leg.portfolio_key)
+                            .await;
+                    }
                     Some(tx_hash.to_string())
                 }
                 // See `invalidate_position`'s own doc: a failed broadcast
@@ -1695,7 +1802,20 @@ fn broadcast_orderbook_update(state: &AppState, market_id: &MarketId) {
         updates.get(market_id).cloned()
     };
     if let Some(sender) = sender {
-        let _ = sender.send(build_orderbook_response(state, market_id, DEFAULT_DEPTH_LEVELS));
+        // MAX_DEPTH_LEVELS (200), not DEFAULT_DEPTH_LEVELS (50): every
+        // `/ws/orderbook` subscriber's own `group` re-buckets THIS same
+        // raw response per-connection (see `stream_orderbook`'s own
+        // doc), so whatever raw depth this carries is the hard ceiling
+        // on how many rows ANY subscriber's grouped view can ever show,
+        // no matter how wide a bucket the frontend is trying to fill —
+        // confirmed directly: a market with 160+ real distinct price
+        // levels still only showed a handful of grouped rows at coarser
+        // buckets, because this was cutting the raw ladder off at 50
+        // before grouping ever got a chance to run. One extra shared
+        // build per mutation (not per-subscriber) is a cheap price for
+        // every subscriber's grouping to actually have real material to
+        // work with.
+        let _ = sender.send(build_orderbook_response(state, market_id, MAX_DEPTH_LEVELS));
     }
 }
 
@@ -1869,7 +1989,7 @@ async fn get_open_interest(
     let Some(&contract) = state.settlement_contracts.get(&market_id) else {
         return Json(OpenInterestResponse { market_id, total_collateral: None, position_count: None });
     };
-    let market_hash = keccak256(market_id.as_bytes());
+    let market_hash = state.onchain_market_id(&market_id);
 
     let keys: Vec<FixedBytes<32>> = {
         let oi = state.oi_index.lock().expect("oi_index mutex poisoned");
@@ -2016,7 +2136,10 @@ async fn stream_orderbook(mut socket: WebSocket, state: Arc<AppState>, market_id
         senders.entry(market_id.clone()).or_insert_with(|| broadcast::channel(64).0).subscribe()
     };
 
-    let initial = build_orderbook_response_grouped(&state, &market_id, DEFAULT_DEPTH_LEVELS, group);
+    // MAX_DEPTH_LEVELS, matching broadcast_orderbook_update's own reasoning
+    // above — the initial snapshot shouldn't have less raw material to
+    // group from than every subsequent update already does.
+    let initial = build_orderbook_response_grouped(&state, &market_id, MAX_DEPTH_LEVELS, group);
     let Ok(initial_text) = serde_json::to_string(&initial) else { return };
     if socket.send(Message::Text(initial_text)).await.is_err() {
         return;
@@ -2153,7 +2276,7 @@ async fn load_single_market_state(
     portfolio_key: FixedBytes<32>,
     market_id: &str,
 ) -> Option<PortfolioMarketState> {
-    let market_hash = keccak256(market_id.as_bytes());
+    let market_hash = state.onchain_market_id(market_id);
     let contract = state.settlement_contracts.get(market_id).copied();
     let sealed = match crate::settle::load_sealed(portfolio_key, market_hash, contract).await {
         Ok(s) => s,
@@ -2289,6 +2412,61 @@ fn compute_margin(
     risk::RiskMonitor::compute_margin(&risk::AccountState { positions, effective_collateral }, &mark_prices)
 }
 
+/// How long a submitted portfolio-margin attestation stays fresh on
+/// `RiskMonitor.sol` before `effectiveMarginRequirement` falls back to
+/// the conservative isolated sum again, see `configure_risk_monitor`'s
+/// own doc. Deliberately generous relative to the poll/settlement
+/// cadence: every fill re-submits a fresh one anyway (this window only
+/// matters for a trader who stops trading), and understating it just
+/// means `withdraw()` gets MORE conservative sooner, never less safe.
+const PORTFOLIO_MARGIN_ATTESTATION_TTL_SECS: u64 = 3600;
+
+/// Recomputes `trader`'s real cross-market margin requirement from this
+/// process's own sealed-position state (the same `compute_margin` path
+/// `/liquidation-check` already uses) and submits it as a fresh
+/// TEE-attested `RiskMonitor.sol` attestation, see
+/// `settle::submit_portfolio_margin`'s own doc for why this exists at
+/// all. A no-op when `risk_monitor_contract` isn't configured. Called
+/// from `post_order`'s settlement spawn for the taker and every maker
+/// leg after each fill — never awaited by the trader's own response,
+/// same "settlement is fire-and-forget" posture as the settlement
+/// broadcast itself.
+async fn attest_portfolio_margin(state: &AppState, trader: Address, portfolio_key: FixedBytes<32>) {
+    let Some(contract) = state.risk_monitor_contract else {
+        return;
+    };
+
+    let market_states = load_portfolio_state(state, portfolio_key, &[]).await;
+    if market_states.is_empty() {
+        return;
+    }
+    let market_ids: Vec<MarketId> = market_states.iter().map(|m| m.market_id.clone()).collect();
+    let live_prices = live_mark_prices(state, &market_ids).await;
+
+    let requirement = match compute_margin(&market_states, &live_prices) {
+        Ok(result) => result.margin_requirement,
+        Err(e) => {
+            tracing::warn!(error = %e, trader = %trader, "portfolio margin computation failed, not attesting");
+            return;
+        }
+    };
+
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
+        + PORTFOLIO_MARGIN_ATTESTATION_TTL_SECS;
+
+    crate::settle::submit_portfolio_margin(
+        &state.settlement_signer,
+        trader,
+        U256::from(requirement),
+        expiry,
+        Some(contract),
+    )
+    .await;
+}
+
 async fn post_liquidation_check(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LiquidationCheckRequest>,
@@ -2386,7 +2564,7 @@ fn size_liquidation_legs(
     let legs = market_states
         .iter()
         .map(|m| {
-            let market_hash = keccak256(m.market_id.as_bytes());
+            let market_hash = state.onchain_market_id(&m.market_id);
             let size_abs = m.signed_size.unsigned_abs();
             let current_tick = live_prices.get(&m.market_id).copied().unwrap_or(m.entry_price as u128) as u64;
             let current_funding_index =
@@ -2579,7 +2757,7 @@ async fn post_liquidate(
     let market_contracts: std::collections::HashMap<FixedBytes<32>, Address> = state
         .settlement_contracts
         .iter()
-        .map(|(market_id, contract)| (keccak256(market_id.as_bytes()), *contract))
+        .map(|(market_id, contract)| (state.onchain_market_id(market_id), *contract))
         .collect();
 
     let results = crate::settle::liquidate_sealed(&state.settlement_signer, &sweep, &market_contracts).await;
@@ -3039,6 +3217,27 @@ mod tests {
 
     fn wallet() -> PrivateKeySigner {
         PrivateKeySigner::random()
+    }
+
+    #[test]
+    fn onchain_market_id_defaults_to_hash_when_unconfigured() {
+        let state = AppState::new();
+        assert_eq!(state.onchain_market_id("EURC/USDC"), keccak256("EURC/USDC".as_bytes()));
+    }
+
+    #[test]
+    fn onchain_market_id_uses_the_configured_override() {
+        let mut state = AppState::new();
+        // A real Pyth feed id, deliberately NOT keccak256("EURC/USDC") — the exact
+        // mismatch a real deployment has (FxPerpMarket's marketId doubles as the
+        // Pyth feed id, see OracleHub.sol's own doc), and the whole reason this
+        // override exists.
+        let real_pyth_feed_id = FixedBytes::from([0x42u8; 32]);
+        state.configure_market_id_override("EURC/USDC".to_string(), real_pyth_feed_id);
+
+        assert_eq!(state.onchain_market_id("EURC/USDC"), real_pyth_feed_id);
+        // An unconfigured market is unaffected.
+        assert_eq!(state.onchain_market_id("BTC/USDC"), keccak256("BTC/USDC".as_bytes()));
     }
 
     /// Compile-time regression check, not a runtime assertion: axum's

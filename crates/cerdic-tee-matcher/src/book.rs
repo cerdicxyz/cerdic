@@ -672,6 +672,38 @@ impl OrderBook {
         node
     }
 
+    /// Unlinks every expired head at the touch of `side`, repeatedly,
+    /// until the best remaining head is live or the side runs empty —
+    /// the same lazy-expiry cleanup the matching loop in `submit`
+    /// already does while it walks a side to fill against it, just
+    /// runnable standalone for a caller (the `post_only` guard) that
+    /// needs an honest best price WITHOUT actually matching anything.
+    /// Appends every id it drops to `expired_out`, same bookkeeping
+    /// `submit`'s own matching loop does for its `SubmitResult::expired`.
+    fn prune_expired_head(&mut self, side: Side, now: Timestamp, expired_out: &mut Vec<OrderId>) {
+        loop {
+            let best = match side {
+                Side::Long => self.best_bid,
+                Side::Short => self.best_ask,
+            };
+            let Some(level_tick) = best else { break };
+            let level_idx = self
+                .ladder(side)
+                .index_of(level_tick)
+                .expect("cached best price must always reference an allocated level");
+            let head = self.ladder(side).level(level_idx).head;
+            let expired = self.slot(head).expiry.is_some_and(|e| now >= e);
+            if !expired {
+                break;
+            }
+            self.unlink(head);
+            expired_out.push(head);
+            if self.ladder(side).level(level_idx).is_empty() {
+                self.advance_best_from(side, level_tick);
+            }
+        }
+    }
+
     /// Cancels a live resting order in O(1). Returns its remaining
     /// quantity and price if it was still live.
     pub fn cancel(&mut self, id: OrderId) -> Option<(Tick, Qty)> {
@@ -762,6 +794,22 @@ impl OrderBook {
         let opposite = opposite_side(side);
 
         if order.post_only {
+            // The matching loop below already prunes expired heads lazily
+            // as it walks the opposite side, but this guard runs BEFORE
+            // that loop and was reading `best_bid`/`best_ask` raw — an
+            // expired-but-not-yet-swept order at the touch (nothing has
+            // crossed it since it expired, since expiry is only enforced
+            // lazily, "on touch") made `would_cross` true forever against
+            // a price nothing live actually occupies anymore, silently
+            // rejecting every real requote on this side until some
+            // unrelated taker order happened to sweep it. A market maker
+            // with no cancel endpoint (post_offer's own module doc) hits
+            // this constantly: one side's quotes go stale, its own next
+            // cycle's fresh quote gets rejected by its own expired
+            // leftover, and that side never refreshes until the stale
+            // order finally gets swept — read from outside as "this side
+            // got eaten" / "only the last cycle's few levels are left."
+            self.prune_expired_head(opposite, now, &mut result.expired);
             let would_cross = match opposite {
                 Side::Long => self.best_bid.is_some_and(|bid| tick <= bid),
                 Side::Short => self.best_ask.is_some_and(|ask| tick >= ask),
@@ -1175,6 +1223,31 @@ mod tests {
         assert!(r.fills.is_empty());
         assert_eq!(r.resting_id, None, "a rejected post-only order rests nothing, not even its own quantity");
         assert_eq!(book.depth_at(Side::Short, 100), 5, "the resting maker order must be untouched");
+    }
+
+    #[test]
+    fn post_only_prunes_a_stale_expired_touch_instead_of_rejecting_against_it() {
+        // A maker with no cancel endpoint (market_maker.rs's own posture)
+        // leaves last cycle's ask resting past its GTT expiry until
+        // something touches it. A later cycle's post-only bid technically
+        // "crosses" that price, but the order sitting there is already
+        // dead — rejecting the new bid against a price nothing live
+        // occupies anymore is exactly the "this side won't refresh" bug
+        // this test locks in the fix for.
+        let mut book = OrderBook::new();
+        let stale = NewOrder { tif: TimeInForce::GoodTilTime(100), ..gtc(Side::Short, 100, 5, MAKER) };
+        book.submit(stale, 0);
+        let fresh_bid = NewOrder { post_only: true, ..gtc(Side::Long, 100, 5, MAKER) };
+        let r = book.submit(fresh_bid, 200); // now (200) is well past the stale order's expiry (100)
+        assert!(!r.post_only_rejected, "an expired resting order must not block a fresh post-only quote");
+        assert!(r.fills.is_empty(), "the stale order is pruned, not traded against");
+        assert_eq!(
+            r.expired,
+            vec![0],
+            "the stale order must be reported as expired, same as the matching loop would"
+        );
+        assert_eq!(r.resting_qty, 5);
+        assert_eq!(book.depth_at(Side::Short, 100), 0, "the stale ask must be gone from depth too");
     }
 
     #[test]

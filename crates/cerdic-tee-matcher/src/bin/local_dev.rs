@@ -363,8 +363,17 @@ async fn cmd_up() {
         .env("CERDIC_ORACLE_FEEDS", &oracle_feeds)
         .env("CERDIC_ACCOUNT_CONTRACT", &account_contract)
         .env("CERDIC_COLLATERAL_ASSET", &usdc_token)
+        .env("CERDIC_RISK_MONITOR_CONTRACT", &risk_monitor)
         .env("CERDIC_ENABLE_DEBUG_SEED", "1")
         .env("CERDIC_LOG", "info")
+        // Same state dir every other local_dev artifact (logs, pids) lives
+        // in — a real file, survives this one matcher process restarting.
+        // NOT survived by a fresh `local_dev up`, which always starts
+        // anvil and every contract from scratch (a new `dir` per run, see
+        // `state_dir`'s own doc), so pre-restart candles/nonces wouldn't
+        // line up with a brand new chain anyway; this matters for
+        // restarting just the matcher binary against an already-live chain.
+        .env("CERDIC_DB_PATH", dir.join("cerdic-state.redb"))
         .stdout(Stdio::from(matcher_log.try_clone().unwrap()))
         .stderr(Stdio::from(matcher_log))
         .process_group(0)
@@ -424,9 +433,15 @@ async fn cmd_up() {
             .env("MARKET_CONTRACT_ADDRESS", contract)
             .env("PYTH_FEED_ID", feed)
             .env("MM_PRIVATE_KEY", key_a)
-            .env("MM_QUOTE_SIZE", "80")
+            // Bumped from 80/5 (size/levels): this is what was actually
+            // capping real book depth regardless of market_maker.rs's
+            // own tuning — these per-wave envs override that binary's
+            // defaults outright, so raising the defaults there alone
+            // never reached the running book. Testnet, no real capital
+            // at risk, so "go big" is the actual fix, not a workaround.
+            .env("MM_QUOTE_SIZE", "200")
             .env("MM_SPREAD_BPS", "20")
-            .env("MM_LADDER_LEVELS", "5")
+            .env("MM_LADDER_LEVELS", "14")
             .stdout(Stdio::from(log_a.try_clone().unwrap()))
             .stderr(Stdio::from(log_a))
             .process_group(0)
@@ -445,10 +460,15 @@ async fn cmd_up() {
             .env("MARKET_CONTRACT_ADDRESS", contract)
             .env("PYTH_FEED_ID", feed)
             .env("MM_PRIVATE_KEY", key_b)
-            .env("MM_QUOTE_SIZE", "55")
+            // Same "these override market_maker.rs's own defaults, go
+            // big since it's testnet" reasoning as wave-a above — kept
+            // deliberately smaller/wider/slower than wave-a for real
+            // layered variety (two bots that look identical isn't real
+            // depth, it's one bot's book doubled), not scaled back.
+            .env("MM_QUOTE_SIZE", "150")
             .env("MM_SPREAD_BPS", "35")
             .env("MM_REQUOTE_INTERVAL_SECS", "11")
-            .env("MM_LADDER_LEVELS", "3")
+            .env("MM_LADDER_LEVELS", "12")
             .stdout(Stdio::from(log_b.try_clone().unwrap()))
             .stderr(Stdio::from(log_b))
             .process_group(0)
@@ -889,7 +909,18 @@ async fn fire_priced_trade(
     // next to that depth reads as a rounding error, not real flow.
     let qty = rng.gen_range(20..=110);
 
-    let filled = run_demo_client(bin_dir, side, cross_tick, qty, market, trader_key, 5).await;
+    // IOC: this order only ever means to take whatever real depth sits
+    // at/inside the crossing price (see crossing_tick's own doc — a
+    // couple ticks past the touch, sized just to comfortably cross tick
+    // granularity, not to guarantee the full requested qty fills). A
+    // GTC order that only partially fills used to rest its remainder
+    // at that off-market crossing price instead of being dropped — a
+    // stale, artificially-priced resting order that a later opposing
+    // seed trade could go on to cross, printing a trade far from the
+    // real oracle mid. This is exactly what made candles "later on"
+    // (once enough of these had accumulated) print wildly off from the
+    // live mark price.
+    let filled = run_demo_client(bin_dir, side, cross_tick, qty, market, trader_key, 5, "ioc").await;
     let now = chrono_like_time();
     if filled {
         println!("{now} {market} {side} {qty} @ {cross_tick} -> filled");
@@ -1183,6 +1214,7 @@ fn crossing_tick(book: &OrderBookResponse, side: &str) -> Option<u64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_demo_client(
     bin_dir: &Path,
     side: &str,
@@ -1191,9 +1223,10 @@ async fn run_demo_client(
     market: &str,
     key: &str,
     leverage: u64,
+    tif: &str,
 ) -> bool {
     let output = tokio::process::Command::new(bin_dir.join("demo_client"))
-        .args([side, &tick.to_string(), &qty.to_string(), market, key, &leverage.to_string()])
+        .args([side, &tick.to_string(), &qty.to_string(), market, key, &leverage.to_string(), tif])
         .output()
         .await;
     match output {

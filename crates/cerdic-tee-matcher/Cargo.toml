@@ -19,6 +19,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 alloy = { workspace = true, features = ["k256", "serde", "signer-local", "provider-http", "rpc-types-eth", "reqwest", "sol-types"] }
+redb = "4"
 
 axum = { version = "0.7", features = ["ws"] }
 tracing = "0.1"
