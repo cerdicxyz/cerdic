@@ -158,11 +158,12 @@ contract LiquidationEntry {
     /// @dev `effectiveCollateral + unrealized PnL at mark`, signed per `position.size`'s own
     ///      direction. Shared by `checkAndFlag` and `executeStandardLiquidation`'s
     ///      re-validation guard so both use exactly the same formula.
-    function _equity(IMarket.MarketPosition memory position, uint256 absSize, uint256 markPrice, uint256 effectiveCollateral)
-        internal
-        pure
-        returns (int256)
-    {
+    function _equity(
+        IMarket.MarketPosition memory position,
+        uint256 absSize,
+        uint256 markPrice,
+        uint256 effectiveCollateral
+    ) internal pure returns (int256) {
         // forge-lint: disable-next-line(unsafe-typecast)
         int256 priceDelta = position.size > 0
             ? int256(markPrice) - int256(position.entryPrice)
