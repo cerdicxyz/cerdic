@@ -185,6 +185,12 @@ contract RiskMonitorTest is Test {
         settlementEngine.settleTrade(marketId, who, counterparty, size, PRICE, 0);
     }
 
+    /// @dev Opens a short position of `size` at `PRICE` for `who` in `marketId`.
+    function _openShort(address who, bytes32 marketId, int256 size) internal {
+        vm.prank(admin);
+        settlementEngine.settleTrade(marketId, counterparty, who, size, PRICE, 0);
+    }
+
     /// @dev Withdraws `amount` of USDC as `who`.
     function _withdraw(address who, uint256 amount) internal {
         vm.prank(who);
@@ -351,10 +357,19 @@ contract RiskMonitorTest is Test {
     ///         maintenance requirement above the effective collateral, so
     ///         `checkLiquidation` breaches and the liquidation entry
     ///         freezes the account (paper fig:liquidation).
+    /// @dev A SHORT position, not long: `entry.checkAndFlag`'s equity check
+    ///      (security-audit-tee-contracts.md finding C2 fix) is PnL-aware, so a
+    ///      genuine breach needs a price move that both raises RiskMonitor's own
+    ///      notional-based requirement AND is a real loss for the position. For a
+    ///      short, a price rise is both at once (a long profiting from the same
+    ///      rise would never actually be equity-breached, no matter how large
+    ///      notional grows — that mismatch is real, and out of C2's scope, see
+    ///      LiquidationEntry.t.sol's own test file for the isolated-market version
+    ///      of this same fix).
     function test_CheckLiquidationTriggersOnUnderMarginedAccount() public {
         _fund(trader, 1_000e18);
-        _openLong(trader, MARKET_ID, SIZE);
-        oracle.setPrice(5_000e18); // notional $50,000; MMR $1,500 > C_eff $1,000
+        _openShort(trader, MARKET_ID, SIZE);
+        oracle.setPrice(5_000e18); // notional $50,000; MMR $1,500 > C_eff $1,000; short is deeply underwater
 
         vm.expectEmit(true, false, false, false, address(account));
         emit ClearingAccount.AccountFrozen(trader);
@@ -652,6 +667,17 @@ contract RiskMonitorTest is Test {
         // even though the isolated sum alone would not have.
         vm.prank(tee);
         monitor.submitPortfolioMargin(trader, 200e18, uint64(block.timestamp + 1 hours));
+
+        // `checkLiquidation`'s own top-level `breached` return is driven purely by
+        // the attestation vs C_eff (unaffected by price, see below) — but actually
+        // FREEZING the account is `entry.checkAndFlag`'s call, per market, and
+        // that's an ISOLATED equity check (security-audit-tee-contracts.md finding
+        // C2 fix) that doesn't know about the portfolio-wide attestation at all.
+        // Move price against the position so this market's own equity is ALSO
+        // genuinely underwater, not just the portfolio-level number: $100 deposit,
+        // 10 units, entry $100 -> at $90 equity = 100 + 10*(90-100) = $0, maintenance
+        // = 10*90*300/10_000 = $27, a real isolated breach too.
+        oracle.setPrice(90e18);
 
         bool breached = monitor.checkLiquidation(trader);
         assertTrue(breached, "attested portfolio requirement breaches C_eff");

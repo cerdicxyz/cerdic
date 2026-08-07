@@ -173,6 +173,8 @@ contract CapabilityRegistryTest is Test {
         vm.expectEmit(true, false, false, false, address(registry));
         emit CapabilityRegistry.CapabilityRevoked(trader);
 
+        // security-audit-tee-contracts.md finding C1: no longer permissionless.
+        vm.prank(admin);
         bool breached = registry.checkAndFreezeOnBreach(trader, 1_500e18, 500); // over daily loss limit
         assertTrue(breached);
         assertFalse(registry.isActive(trader), "capability revoked");
@@ -182,6 +184,7 @@ contract CapabilityRegistryTest is Test {
     function test_HealthyAccountDoesNotBreach() public {
         _grant(trader, defaultLimits, uint64(block.timestamp + 30 days));
 
+        vm.prank(admin);
         bool breached = registry.checkAndFreezeOnBreach(trader, 500e18, 200); // within limits
         assertFalse(breached);
         assertTrue(registry.isActive(trader), "capability untouched");
@@ -191,6 +194,7 @@ contract CapabilityRegistryTest is Test {
     function test_DrawdownBreachAloneTriggersFreeze() public {
         _grant(trader, defaultLimits, uint64(block.timestamp + 30 days));
 
+        vm.prank(admin);
         bool breached = registry.checkAndFreezeOnBreach(trader, 0, 1_001); // over max drawdown
         assertTrue(breached);
         assertTrue(account.accounts(trader));

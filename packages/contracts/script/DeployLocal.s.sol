@@ -8,6 +8,7 @@ import {Account as AccountContract} from "../src/clearing/Account.sol";
 import {CollateralEngine} from "../src/clearing/CollateralEngine.sol";
 import {RiskMonitor} from "../src/clearing/RiskMonitor.sol";
 import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
+import {PositionEngine} from "../src/clearing/PositionEngine.sol";
 import {TeeAttestationVerifier} from "../src/clearing/TeeAttestationVerifier.sol";
 import {OracleHub} from "../src/oracle/OracleHub.sol";
 import {PythConsumer} from "../src/oracle/PythConsumer.sol";
@@ -122,6 +123,23 @@ contract DeployLocal is Script {
         c.riskMonitor.setAttestationRouter(address(c.attestationRouter));
         c.riskMonitor.registerMarket(t.feedId);
         c.account.setRiskMonitor(address(c.riskMonitor));
+
+        // Previously missing entirely: without this, CollateralEngine.effectiveCollateral
+        // reverts BalanceSourceNotSet on every call, which means RiskMonitor.isWithdrawSafe
+        // (and therefore Account.withdraw() itself, since account.riskMonitor is set above)
+        // reverted unconditionally on every withdraw attempt, on every deployment from this
+        // script including local dev — a real, deploy-blocking bug independent of the
+        // security-audit-tee-contracts.md findings.
+        c.collateralEngine.setBalanceSource(address(c.account));
+        // RiskMonitor.positionEngine backs the LEGACY plaintext fallback
+        // (currentMarginRequirement, only consulted when no fresh TEE portfolio-margin
+        // attestation exists, see RiskMonitor.sol's own doc) — the live sealed-TEE trading
+        // path never writes to a PositionEngine at all, so a dedicated, permanently-empty
+        // instance is the correct target: every lookup legitimately returns "no position",
+        // same as an unset field would mean by intent, but without reverting
+        // PositionEngineNotSet the way leaving this wire missing did.
+        PositionEngine emptyPositionEngine = new PositionEngine(admin);
+        c.riskMonitor.setPositionEngine(address(emptyPositionEngine));
 
         ProtocolConstants constants = new ProtocolConstants();
         c.collateralEngine.registerAsset(address(t.usdc), 1, uint16(constants.t1HaircutBps()));

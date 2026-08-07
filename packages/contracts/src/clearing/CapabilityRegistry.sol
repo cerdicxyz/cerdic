@@ -174,18 +174,28 @@ contract CapabilityRegistry {
     ///         freezes the clearing account in the same transaction. Caller must have
     ///         `CLEARING_ADMIN_ROLE` on `account` for the freeze to succeed, the same
     ///         admin wiring `LiquidationEntry` uses for margin breaches.
+    /// @dev    `security-audit-tee-contracts.md` finding C1, fixed: previously callable by
+    ///         anyone with caller-supplied loss/drawdown figures (`type(uint256).max` always
+    ///         breached), and froze accounts with no capability at all (`checkBreach`
+    ///         reports breached for those by design, see that function's own doc — correct
+    ///         for a general breach query, wrong to act on here). `onlyAdmin` is the interim
+    ///         fix until a real kernel-sourced risk feed replaces the caller-supplied
+    ///         figures; the `isActive` guard means a capability-less address can never be
+    ///         frozen through this path, full stop.
     function checkAndFreezeOnBreach(address trader, uint256 realizedLossTodayUsd, uint256 drawdownBps)
         external
+        onlyAdmin
         returns (bool breached)
     {
+        if (!isActive(trader)) {
+            return false;
+        }
         breached = checkBreach(trader, realizedLossTodayUsd, drawdownBps);
         if (!breached) {
             return false;
         }
-        if (isActive(trader)) {
-            capabilities[trader].revoked = true;
-            emit CapabilityRevoked(trader);
-        }
+        capabilities[trader].revoked = true;
+        emit CapabilityRevoked(trader);
         account.freezeAccount(trader);
         emit LimitBreached(trader, realizedLossTodayUsd, drawdownBps);
     }

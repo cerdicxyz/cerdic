@@ -7,6 +7,7 @@ import {CollateralEngine} from "../src/clearing/CollateralEngine.sol";
 import {RiskMonitor} from "../src/clearing/RiskMonitor.sol";
 import {AttestationRouter} from "../src/clearing/AttestationRouter.sol";
 import {TeeAttestationVerifier} from "../src/clearing/TeeAttestationVerifier.sol";
+import {PositionEngine} from "../src/clearing/PositionEngine.sol";
 import {OracleHub} from "../src/oracle/OracleHub.sol";
 import {PythConsumer} from "../src/oracle/PythConsumer.sol";
 import {ChainlinkConsumer} from "../src/oracle/ChainlinkConsumer.sol";
@@ -81,6 +82,20 @@ contract Deploy is Script {
         riskMonitor.setAttestationRouter(address(attestationRouter));
         riskMonitor.registerMarket(eurcUsdcFeedId);
         account.setRiskMonitor(address(riskMonitor));
+
+        // Previously missing entirely: without this, CollateralEngine.effectiveCollateral
+        // reverts BalanceSourceNotSet on every call, which means RiskMonitor.isWithdrawSafe
+        // (and therefore Account.withdraw() itself, since account.riskMonitor is set above)
+        // reverted unconditionally on every withdraw attempt on this deployment — a real,
+        // deploy-blocking bug independent of the security-audit-tee-contracts.md findings.
+        collateralEngine.setBalanceSource(address(account));
+        // RiskMonitor.positionEngine backs the LEGACY plaintext fallback
+        // (currentMarginRequirement, only consulted when no fresh TEE portfolio-margin
+        // attestation exists) — the live sealed-TEE trading path never writes to a
+        // PositionEngine at all, so a dedicated, permanently-empty instance is the correct
+        // target: every lookup legitimately returns "no position" without reverting
+        // PositionEngineNotSet the way leaving this wire missing did.
+        riskMonitor.setPositionEngine(address(new PositionEngine(admin)));
 
         ProtocolConstants constants = new ProtocolConstants();
         collateralEngine.registerAsset(usdcToken, 1, uint16(constants.t1HaircutBps()));
