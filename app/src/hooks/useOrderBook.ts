@@ -20,6 +20,12 @@ export interface LiveOrderBook {
   bestBid: number | null;
   bestAsk: number | null;
   lastPrice: number | null;
+  /** Real, book-independent reference price (api.rs's `OrderBookResponse.mark_price`
+   *  — a rolling mean fed by both real trades and the oracle poll, the
+   *  same center the backend's own margin/PnL math trusts). Prefer this
+   *  over deriving a mid from `bestBid`/`bestAsk` yourself — see
+   *  `markPriceFromBook`'s own doc on why a naive book mid is fragile. */
+  markPrice: number | null;
   /** Basis points, trailing 24h — null means no comparison trade exists
    *  yet, not zero change, matching MarketSnapshot's own doc in market_data.rs. */
   change24hBps: number | null;
@@ -39,6 +45,7 @@ const EMPTY_BOOK: LiveOrderBook = {
   bestBid: null,
   bestAsk: null,
   lastPrice: null,
+  markPrice: null,
   change24hBps: null,
   volume24h: 0,
   high24h: null,
@@ -63,6 +70,7 @@ interface WireOrderBookResponse {
   best_ask: number | null;
   bids: WirePriceLevel[];
   asks: WirePriceLevel[];
+  mark_price: number | null;
   last_price: number | null;
   last_trade_at: number | null;
   change_24h_bps: number | null;
@@ -129,6 +137,7 @@ export function useOrderBook(marketId: string, group: number = 1): LiveOrderBook
             bestBid: data.best_bid,
             bestAsk: data.best_ask,
             lastPrice: data.last_price,
+            markPrice: data.mark_price,
             change24hBps: data.change_24h_bps,
             volume24h: data.volume_24h,
             high24h: data.high_24h,
@@ -167,17 +176,25 @@ export function useOrderBook(marketId: string, group: number = 1): LiveOrderBook
   return book;
 }
 
-/** A live "mark price," in raw ticks — bid/ask mid when the book has a
- *  real touch on both sides, falling back to the last trade print only
- *  when one side has no resting liquidity at all. `lastPrice` alone is
- *  the wrong thing to call a mark price: it only updates when a trade
- *  actually happens, so a market that's gone quiet for a stretch reads
- *  as a frozen PnL even while the book itself is still moving —
- *  confirmed live (PositionsPanel.tsx's own "PnL not updating" report).
- *  Mid price updates on every book mutation (every market maker requote,
- *  ~every 11-15s in local_dev.rs), independent of whether anyone's
- *  actually traded recently. */
+/** A live "mark price," in raw ticks. Prefers `book.markPrice` — the
+ *  backend's own real, book-independent reference (a rolling mean fed by
+ *  both real trades and the oracle poll, `api.rs`'s `OrderBookResponse.mark_price`
+ *  doc). Real, confirmed bug this replaces: this used to be a naive
+ *  `(bestBid + bestAsk) / 2` computed straight from the resting book —
+ *  fine on a normal two-sided book, but one outsized market order can
+ *  walk it thin enough that the surviving best level on one side sits far
+ *  from fair value, and the naive mid inherited that distortion wholesale
+ *  (confirmed live: a 100,000-unit order left EURC/USDC's best ask
+ *  resting near 1.7 against a real ~1.16 market, showing a real position
+ *  over 100% "up" on a mark that never actually traded). Falls back to
+ *  the bid/ask mid, then the last trade print, only for a market with no
+ *  reference price at all yet (nothing has ever priced it, backend and
+ *  book both empty) — `lastPrice` alone is still the wrong first choice
+ *  even as a fallback: it only updates on an actual trade, so a quiet
+ *  market reads as frozen PnL even while the book keeps moving
+ *  (PositionsPanel.tsx's own "PnL not updating" report). */
 export function markPriceFromBook(book: LiveOrderBook): number | null {
+  if (book.markPrice !== null) return book.markPrice;
   if (book.bestBid !== null && book.bestAsk !== null) {
     return (book.bestBid + book.bestAsk) / 2;
   }

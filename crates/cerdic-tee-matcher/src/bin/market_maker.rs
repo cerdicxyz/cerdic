@@ -24,31 +24,39 @@
 //! symmetrically (no skew) rather than guess -- worse capital
 //! efficiency, never unsafe.
 //!
-//! ## Requoting stacks size, it doesn't replace it -- another real, honest gap
+//! ## Requoting used to stack size instead of replacing it -- fixed
 //!
-//! There is no cancel endpoint anywhere in this crate's HTTP API (`api.rs`'s
-//! own router only has `/order`, `/offer`, `/liquidation-check`,
-//! `/liquidate`, `/portfolio-key`, `/orderbook`, `/ws/orderbook`; nothing
-//! else). Confirmed directly against a real running matcher: two
+//! Previously there was no cancel endpoint anywhere in this crate's HTTP API,
+//! so every requote cycle only ever ADDED resting orders, never removed the
+//! previous cycle's. Confirmed directly against a real running matcher: two
 //! requote cycles at a stable price left TWO separate resting orders in
 //! the book at (near-)identical ticks rather than one replacing the
-//! other, `GET /orderbook` showing 30-unit cumulative depth from a bot
-//! only ever configured to quote 10 at a time. Each cycle's short GTT
-//! expiry (`post_offer`'s `ttl.as_secs() * 2`) is what eventually clears
-//! stale ones out, not this bot -- meaning outstanding size genuinely
-//! grows across a run of stable-price cycles before settling into a
-//! rolling window, a real operational property to size `MM_QUOTE_SIZE`
-//! and `MM_REQUOTE_INTERVAL_SECS` around, not a bug this bot works around
-//! by itself. It also means the "one outstanding bid, one outstanding
-//! ask" assumption `infer_fill_side` leans on only holds within a single
-//! cycle's own pair, not across the whole stacked window -- a fill
-//! against an OLDER stacked order at the same tick still has the right
-//! per-unit size (all cycles quote the same `MM_QUOTE_SIZE`), so the 1%
-//! tolerance match still succeeds for a single-order fill, but a fill
-//! that consumes MULTIPLE stacked orders at once would show up as a
-//! collateral delta the tolerance check correctly refuses to attribute
-//! (logged as "couldn't attribute," not silently misattributed) --
-//! failing safe into "unknown," per this module's own stated posture.
+//! other. Worse than the depth-inflation itself: with no bound on how
+//! stale a resting level could get beyond its own GTT expiry, a
+//! many-cycles-old stale price level from well before a real market move
+//! sat at the top of the book indefinitely and filled a real trader's
+//! order at a wildly wrong price -- confirmed live, the actual bug that
+//! forced this fix.
+//!
+//! `api.rs` now has a real `/cancel` endpoint (signed, ownership-checked
+//! against the book's own `owner_of`), and `post_offer` returns the
+//! `offer_id` the matcher assigns each resting order. Every cycle now
+//! replaces last cycle's id at each ladder slot (`resting_ids`, below)
+//! one slot at a time -- placing that slot's new offer BEFORE cancelling
+//! its old one, not the whole ladder cancelled upfront. Cancel-first was
+//! tried and reverted: it left this bot's entire side of the book empty
+//! for the full cancel+place round-trip every cycle, visible on a real
+//! running matcher as the book repeatedly clearing and refilling. The
+//! GTT expiry (`post_offer`'s `ttl.as_secs() * 2`) is purely a backstop
+//! for a crashed/killed process, not the primary cleanup path either way.
+//!
+//! This closes the CROSS-CYCLE stacking gap specifically: `infer_fill_side`'s
+//! "one outstanding bid, one outstanding ask" tracking is still only ever
+//! fed by level 0 (the innermost, most-likely-to-fill level) within a
+//! single cycle -- levels 1..MM_LADDER_LEVELS still degrade to "unknown"
+//! if THEY'RE what fills, exactly as before, that part of the design is
+//! unchanged. What's fixed is that there's no longer an ever-growing
+//! window of PAST cycles' stale orders sitting in the book at all.
 //!
 //! Usage (env vars):
 //!   MATCHER_URL              - e.g. http://127.0.0.1:8787
@@ -107,7 +115,9 @@ use alloy::{
     signers::{local::PrivateKeySigner, SignerSync},
 };
 use cerdic_tee_matcher::{
-    api::{OfferPayload, OrderSide, PortfolioKeyRequest, BPS_DENOMINATOR, IMR_BPS},
+    api::{
+        CancelPayload, OfferPayload, OfferResponse, OrderSide, PortfolioKeyRequest, BPS_DENOMINATOR, IMR_BPS,
+    },
     decrypt::{self, SignedPayload},
     oracle, settle,
 };
@@ -186,19 +196,43 @@ async fn main() {
     let mut mid_history: VecDeque<f64> = VecDeque::with_capacity(vol_window);
     let mut rng = rand::thread_rng();
 
+    // Every order id this bot currently has resting, across every ladder
+    // level on both sides — cancelled in full at the START of the next
+    // cycle, before any new offer goes out. See this module's own doc
+    // ("Requoting stacks size, it doesn't replace it") for why this
+    // exists: without it, every cycle only ever ADDS resting orders,
+    // never removes the previous cycle's, so stale price levels pile up
+    // indefinitely instead of tracking the live market.
+    let mut resting_ids: Vec<u32> = Vec::with_capacity(ladder_levels as usize * 2);
+
     let mut interval = tokio::time::interval(requote_interval);
     loop {
         interval.tick().await;
+
+        // Old ids from last cycle, cancelled one-for-one as this cycle's
+        // replacement for that same slot goes live (below), not all
+        // upfront. Cancelling the whole ladder before placing anything
+        // new left this bot's entire side of the book empty for the
+        // full cancel+place round-trip every cycle — visible on a real
+        // running matcher as the book repeatedly clearing and refilling.
+        // Placing first means depth never drops below last cycle's,
+        // only briefly exceeds it.
+        let mut old_resting_ids: VecDeque<u32> = resting_ids.drain(..).collect();
 
         let mid = match oracle::fetch_price(&feed_id).await {
             Ok(p) => oracle::pyth_price_to_tick(p.price, p.expo, oracle::price_scale_for_market(&market_id)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to fetch live mid price, skipping this cycle");
+                // Nothing new is going out this cycle, so the old ids are
+                // still genuinely resting — put them back rather than
+                // silently orphaning them (they'd never be cancelled).
+                resting_ids = old_resting_ids.into();
                 continue;
             }
         };
         if mid == 0 {
             tracing::warn!("live mid price came back zero, skipping this cycle");
+            resting_ids = old_resting_ids.into();
             continue;
         }
 
@@ -318,7 +352,7 @@ async fn main() {
             let ask_size = jittered_size(level_size, size_jitter_pct, &mut rng);
 
             nonce += 1;
-            let bid_ok = post_offer(
+            let bid_id = post_offer(
                 &http,
                 &matcher_url,
                 &enclave_pubkey,
@@ -332,7 +366,7 @@ async fn main() {
             )
             .await;
             nonce += 1;
-            let ask_ok = post_offer(
+            let ask_id = post_offer(
                 &http,
                 &matcher_url,
                 &enclave_pubkey,
@@ -346,6 +380,21 @@ async fn main() {
             )
             .await;
 
+            resting_ids.extend(bid_id);
+            resting_ids.extend(ask_id);
+
+            // This level's replacements are live — now retire this same
+            // slot's old order(s), never before. Old and new both rest
+            // for a moment rather than neither resting at all.
+            if let Some(old_id) = old_resting_ids.pop_front() {
+                nonce += 1;
+                post_cancel(&http, &matcher_url, &enclave_pubkey, &wallet, &market_id, old_id, nonce).await;
+            }
+            if let Some(old_id) = old_resting_ids.pop_front() {
+                nonce += 1;
+                post_cancel(&http, &matcher_url, &enclave_pubkey, &wallet, &market_id, old_id, nonce).await;
+            }
+
             // Only the innermost level (level 0, nearest the touch and
             // most likely to fill first) feeds inventory attribution —
             // see the module doc's "one outstanding bid/ask" assumption.
@@ -354,13 +403,22 @@ async fn main() {
             // exactly the documented, safe fallback (symmetric quoting,
             // never a wrong skew).
             if level == 0 {
-                if bid_ok {
+                if bid_id.is_some() {
                     last_bid = Some((bid_tick, bid_size));
                 }
-                if ask_ok {
+                if ask_id.is_some() {
                     last_ask = Some((ask_tick, ask_size));
                 }
             }
+        }
+
+        // Leftover only if `ladder_levels` shrank since the ids in
+        // `old_resting_ids` were placed (an env change between restarts,
+        // not a normal cycle) — clean those up too rather than leaking
+        // them forever.
+        for old_id in old_resting_ids.drain(..) {
+            nonce += 1;
+            post_cancel(&http, &matcher_url, &enclave_pubkey, &wallet, &market_id, old_id, nonce).await;
         }
 
         tracing::info!(mid, ladder_levels, realized_vol_bps, inventory_estimate, "requoted");
@@ -485,6 +543,11 @@ async fn learn_portfolio_key(
         .expect("malformed portfolio_key")
 }
 
+/// Places one resting offer, returning its `offer_id` on success — the
+/// caller (the requote loop) needs this to actually cancel it next cycle
+/// (see `post_cancel` below and this module's own doc on why a
+/// never-cancelled offer is a real, confirmed bug, not a theoretical
+/// one).
 #[allow(clippy::too_many_arguments)]
 async fn post_offer(
     http: &reqwest::Client,
@@ -497,9 +560,9 @@ async fn post_offer(
     max_size: u64,
     nonce: u64,
     ttl: Duration,
-) -> bool {
+) -> Option<u32> {
     let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-        + ttl.as_secs() * 2; // outlives its own requote cycle, see module doc on cancellation
+        + ttl.as_secs() * 2; // outlives its own requote cycle as a backstop only, see module doc — the requote loop now cancels explicitly instead of relying on this to ever fire in practice
 
     let mut offer = OfferPayload {
         market_id: market_id.to_string(),
@@ -519,12 +582,22 @@ async fn post_offer(
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to encrypt offer");
-            return false;
+            return None;
         }
     };
 
     match http.post(format!("{matcher_url}/offer")).json(&envelope).send().await {
-        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) if resp.status().is_success() => match resp.json::<OfferResponse>().await {
+            Ok(OfferResponse::Resting { offer_id }) => Some(offer_id),
+            Ok(OfferResponse::Rejected { reason }) => {
+                tracing::error!(reason, side = ?side, tick, "offer rejected");
+                None
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "offer response did not parse as OfferResponse");
+                None
+            }
+        },
         // A real, previously-silent bug: this used to be
         // `resp.status().is_success()` with no else branch at all, so a
         // non-2xx response (e.g. the matcher rejecting every offer because
@@ -539,10 +612,63 @@ async fn post_offer(
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             tracing::error!(status = %status, body = %body, side = ?side, tick, "offer rejected");
-            false
+            None
         }
         Err(e) => {
             tracing::error!(error = %e, side = ?side, tick, "offer submission failed");
+            None
+        }
+    }
+}
+
+/// Cancels a still-resting offer this same wallet placed. See this
+/// module's own doc ("Requoting stacks size, it doesn't replace it") for
+/// why every requote cycle now calls this on every id it placed last
+/// cycle, before placing new ones — without it, stale price levels from
+/// old cycles accumulate indefinitely (previously only ever cleared by
+/// GTT expiry, `ttl.as_secs() * 2` after the fact), confirmed live to let
+/// a real trader fill against a many-cycles-stale price far from the
+/// actual market.
+async fn post_cancel(
+    http: &reqwest::Client,
+    matcher_url: &str,
+    enclave_pubkey: &PublicKey,
+    wallet: &PrivateKeySigner,
+    market_id: &str,
+    order_id: u32,
+    nonce: u64,
+) -> bool {
+    let mut cancel = CancelPayload {
+        market_id: market_id.to_string(),
+        order_id,
+        nonce,
+        signature: alloy::primitives::PrimitiveSignature::test_signature(),
+    };
+    let raw = wallet.sign_message_sync(&cancel.signing_bytes()).unwrap();
+    cancel.signature = raw.as_bytes().as_slice().try_into().unwrap();
+
+    let envelope = match decrypt::encrypt_for(enclave_pubkey, &cancel) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, order_id, "failed to encrypt cancel");
+            return false;
+        }
+    };
+
+    match http.post(format!("{matcher_url}/cancel")).json(&envelope).send().await {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Not necessarily a bug: the order may have already filled or
+            // expired since last cycle — logged at debug, not error, same
+            // "already gone is a normal outcome" posture `book.rs`'s own
+            // `cancel` doc takes.
+            tracing::debug!(status = %status, body = %body, order_id, "cancel did not find a live order (likely already filled/expired)");
+            false
+        }
+        Err(e) => {
+            tracing::error!(error = %e, order_id, "cancel submission failed");
             false
         }
     }

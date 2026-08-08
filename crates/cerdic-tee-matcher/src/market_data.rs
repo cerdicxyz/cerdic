@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 /// cost is trivial either way: even at one print/minute across every
 /// market, a week is ~90k `TradeRecord`s total (24 bytes each), not a
 /// real budget concern.
-const WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+const WINDOW_SECONDS: u64 = 14 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct TradeRecord {
@@ -111,21 +111,37 @@ impl TradeTape {
     }
 
     pub fn snapshot(&self) -> MarketSnapshot {
-        let first = self.trades.front();
         let last = self.trades.back();
+
+        // Real, confirmed bug this fixes: these fields are named (and
+        // displayed by the frontend as) "24h" stats, but used to be
+        // computed over the FULL retained window — correct back when that
+        // window genuinely was 24h, silently wrong the moment
+        // `WINDOW_SECONDS` grew past a day for real candle-history depth
+        // (e.g. seeding several days via `/debug/seed-history` for a demo
+        // that shouldn't look dry). A market with a week or two of
+        // retained history would show its ALL-TIME high/low/volume/change
+        // mislabeled as "24H HIGH"/"24H LOW"/"24H VOL". `candles()` and
+        // raw retention still use the full `WINDOW_SECONDS` — only these
+        // specific fields are re-filtered to an actual trailing 24h here.
+        let window_start = last.map(|l| l.timestamp.saturating_sub(24 * 60 * 60)).unwrap_or(0);
+        let mut window = self.trades.iter().filter(|t| t.timestamp >= window_start).peekable();
+        let first = window.peek().copied();
+
         let change_24h_bps = match (first, last) {
             (Some(f), Some(l)) if f.price > 0 && f.timestamp != l.timestamp => {
                 Some(((l.price as i128 - f.price as i128) * 10_000 / f.price as i128) as i64)
             }
             _ => None,
         };
+        let window: Vec<&TradeRecord> = window.collect();
         MarketSnapshot {
             last_price: last.map(|t| t.price),
             last_trade_at: last.map(|t| t.timestamp),
             change_24h_bps,
-            high_24h: self.trades.iter().map(|t| t.price).max(),
-            low_24h: self.trades.iter().map(|t| t.price).min(),
-            volume_24h: self.trades.iter().map(|t| t.qty).sum(),
+            high_24h: window.iter().map(|t| t.price).max(),
+            low_24h: window.iter().map(|t| t.price).min(),
+            volume_24h: window.iter().map(|t| t.qty).sum(),
         }
     }
 

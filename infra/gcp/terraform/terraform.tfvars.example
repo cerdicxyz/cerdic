@@ -1,6 +1,11 @@
 # Copy to terraform.tfvars and fill in.
 
-project_id = "cer-perp-tee"
+# cer-perp-tee (the original test project) is no longer active — the most
+# recent real end-to-end attestation run (docs/gcp-attestation-test-report.md,
+# 2026-08-04 update) used cerdic-504518. Confirm which project you actually
+# want before applying; both names are real prior test runs, neither is a
+# placeholder.
+project_id = "cerdic-504518"
 region     = "us-central1"
 zone       = "us-central1-a"
 

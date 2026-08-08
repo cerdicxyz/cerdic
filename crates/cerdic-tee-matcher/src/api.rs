@@ -229,11 +229,46 @@ impl SignedPayload for OfferPayload {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OfferResponse {
     Resting { offer_id: u32 },
     Rejected { reason: String },
+}
+
+/// A signer cancelling their own still-resting order/offer — see
+/// `post_cancel`'s own doc for why this endpoint exists at all
+/// (`market_maker.rs`'s own module doc names its absence as a real,
+/// confirmed gap: "requoting stacks size, it doesn't replace it").
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CancelPayload {
+    pub market_id: MarketId,
+    pub order_id: u32,
+    pub nonce: u64,
+    pub signature: Signature,
+}
+
+impl SignedPayload for CancelPayload {
+    fn signing_bytes(&self) -> Vec<u8> {
+        format!("cancel|{}|{}|{}", self.market_id, self.order_id, self.nonce).into_bytes()
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CancelResponse {
+    Cancelled {
+        tick: u64,
+        qty: u64,
+    },
+    /// Not an error: the order may have already filled, expired, or been
+    /// cancelled already — same "tell the truth about what happened, not
+    /// what was asked for" posture as everywhere else in this API.
+    NotFound,
 }
 
 /// Plaintext by design, per spec section 2.4: a keeper needs to check
@@ -322,6 +357,25 @@ pub struct OrderBookResponse {
     pub best_ask: Option<u64>,
     pub bids: Vec<crate::book::PriceLevel>,
     pub asks: Vec<crate::book::PriceLevel>,
+    /// A real, book-independent reference price (`BackstopState::reference_price`
+    /// — a rolling mean fed by both real trades and the oracle poll, the
+    /// same center `compute_margin`'s own `live_mark_prices` call trusts
+    /// for actual margin/PnL). `None` only when nothing has ever priced
+    /// this market yet.
+    ///
+    /// Real, confirmed bug this fixes: the frontend used to derive its own
+    /// "mark price" as `(bestBid + bestAsk) / 2` straight from THIS
+    /// response's own `bids`/`asks` — fine on a normal two-sided book, but
+    /// one outsized market order can walk the resting book thin enough
+    /// that the surviving best level on one side sits far from fair value
+    /// (confirmed live: a 100,000-unit order left EURC/USDC's best ask
+    /// resting near 1.7 against a real ~1.16 market), and the naive mid
+    /// inherits that distortion wholesale — a real position's displayed
+    /// PnL/margin swinging over 100% off a single thin quote, not a
+    /// pricing bug in the position itself. `mark_price` gives the
+    /// frontend a source that isn't hostage to whatever the thinnest
+    /// surviving book level happens to be.
+    pub mark_price: Option<u64>,
     #[serde(flatten)]
     pub market: MarketSnapshot,
 }
@@ -439,6 +493,11 @@ pub enum ApiError {
     /// developer.
     #[error("insufficient deposited collateral: need ${required_usd}, have ${available_usd} (deposit more via Account.sol)")]
     InsufficientCollateral { required_usd: String, available_usd: String },
+    /// `post_cancel`'s ownership check: verified against `owner_of`
+    /// BEFORE any mutation, so a signer can never cancel another
+    /// signer's still-resting order/offer just by guessing its id.
+    #[error("order {order_id} does not belong to this signer")]
+    NotOrderOwner { order_id: u32 },
 }
 
 /// Generous headroom over every real market's current tick range (the
@@ -459,6 +518,7 @@ impl IntoResponse for ApiError {
             ApiError::NonceReplay { .. } => StatusCode::CONFLICT,
             ApiError::InvalidTick { .. } => StatusCode::BAD_REQUEST,
             ApiError::InsufficientCollateral { .. } => StatusCode::PAYMENT_REQUIRED,
+            ApiError::NotOrderOwner { .. } => StatusCode::FORBIDDEN,
         };
         // The error's Display text never includes decrypted plaintext or
         // key material, only which check failed, so it's safe to return
@@ -564,6 +624,16 @@ pub struct AppState {
     /// deployment that never wires this up behaves exactly as it always
     /// has, not silently broken.
     collateral_check: Option<(alloy::primitives::Address, alloy::primitives::Address)>,
+    /// Realized close/liquidation PnL, netted per `(trader, asset)`, not
+    /// yet flushed to `Account.settleRealizedPnlBatch`. Reuses
+    /// `collateral_check`'s own `(account, asset)` config rather than a
+    /// separate flag — real settlement only makes sense where the real
+    /// collateral gate already knows the real `Account.sol` address.
+    /// Drained by `main.rs`'s `realized_pnl_flush_loop` on a jittered
+    /// interval, never synchronously — see `Account.settleRealizedPnlBatch`'s
+    /// own doc on why a per-fill call would deanonymize the exact close
+    /// that produced it.
+    pending_realized_pnl: Mutex<HashMap<(Address, Address), I256>>,
     /// `RiskMonitor.sol`'s own address (a single global contract, like
     /// `Account.sol`) — `None` until `configure_risk_monitor` is called,
     /// same "opt-in, not opt-out" posture as `collateral_check`. `None`
@@ -693,6 +763,7 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             collateral_check: None,
+            pending_realized_pnl: Mutex::new(HashMap::new()),
             risk_monitor_contract: None,
             market_id_overrides: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
@@ -730,6 +801,7 @@ impl AppState {
             oracle_feed_mapping: HashMap::new(),
             settlement_contracts: HashMap::new(),
             collateral_check: None,
+            pending_realized_pnl: Mutex::new(HashMap::new()),
             risk_monitor_contract: None,
             market_id_overrides: HashMap::new(),
             trader_volume: Mutex::new(HashMap::new()),
@@ -788,6 +860,60 @@ impl AppState {
         asset: alloy::primitives::Address,
     ) {
         self.collateral_check = Some((account, asset));
+    }
+
+    /// `Account.sol`'s address, if `configure_collateral_check` was ever
+    /// called — `realized_pnl_flush_loop`'s own broadcast target, reusing
+    /// this rather than a second, separately-configured address.
+    pub fn account_contract(&self) -> Option<alloy::primitives::Address> {
+        self.collateral_check.map(|(account, _)| account)
+    }
+
+    /// `main.rs`'s only way to reach the private `settlement_signer`
+    /// field from outside this module — `realized_pnl_flush_loop`'s own
+    /// broadcast needs it, same signer every other settlement call here
+    /// already signs with.
+    pub fn settlement_signer(&self) -> &crate::settle::SettlementSigner {
+        &self.settlement_signer
+    }
+
+    /// Nets `delta` into `pending_realized_pnl` for `(trader, asset)`, a
+    /// no-op if `delta` is zero (the common case: most fills are opening
+    /// or adding, not closing), if `collateral_check` was never
+    /// configured (no known `Account.sol`/asset pair to settle against —
+    /// same opt-in posture as the collateral gate itself), or if `trader`
+    /// is `Address::ZERO` — the synthetic backstop counterparty
+    /// (`BACKSTOP_OWNER_ID` maps to the zero address, see
+    /// `AppState::from_secrets`'s own `owner_addresses` seed), not a real
+    /// account with real custody to settle against. Confirmed live: a
+    /// fill crossing backstop liquidity queued a zero-address entry,
+    /// which then reverted the WHOLE batch it landed in with
+    /// `ZeroAddress()` at flush time — the batching that's supposed to
+    /// protect privacy would have silently dropped every OTHER real
+    /// trader's realized PnL in that same batch along with it. Netting
+    /// here, not just appending, means several closes against the same
+    /// trader within one flush window collapse to one real settlement
+    /// entry, one more layer between a specific fill and a specific
+    /// on-chain delta.
+    pub fn queue_realized_pnl(&self, trader: Address, delta: I256) {
+        if delta == I256::ZERO || trader == Address::ZERO {
+            return;
+        }
+        let Some((_, asset)) = self.collateral_check else {
+            return;
+        };
+        let mut pending = self.pending_realized_pnl.lock().expect("pending_realized_pnl mutex poisoned");
+        *pending.entry((trader, asset)).or_insert(I256::ZERO) += delta;
+    }
+
+    /// Drains every pending realized-PnL entry, returning them as
+    /// `(trader, asset, delta)` triples ready for
+    /// `settle::settle_realized_pnl_batch`. Called only from
+    /// `realized_pnl_flush_loop` — see that function's own doc for why
+    /// this is periodic/jittered rather than per-fill.
+    pub fn drain_realized_pnl(&self) -> Vec<(Address, Address, I256)> {
+        let mut pending = self.pending_realized_pnl.lock().expect("pending_realized_pnl mutex poisoned");
+        pending.drain().map(|((trader, asset), delta)| (trader, asset, delta)).collect()
     }
 
     /// Opts the whole deployment into real portfolio-margin attestation,
@@ -1050,8 +1176,13 @@ impl AppState {
     /// never both compute their `collateral_delta` off the same stale
     /// starting state. Returns the fill's own `collateral_delta`
     /// contribution plus `extra_delta` (the taker's own per-fill fee,
-    /// `I256::ZERO` for a maker leg) — `realized_close_delta`'s
-    /// doc/`PositionFold`'s doc for what the fold itself covers.
+    /// `I256::ZERO` for a maker leg) as `.0`, and the REALIZED-only
+    /// portion (real-money-eligible, `PositionFold::apply_fill`'s own doc)
+    /// as `.1` — `realized_close_delta`'s doc/`PositionFold`'s doc for
+    /// what the fold itself covers. `extra_delta` (the fee) is
+    /// deliberately excluded from `.1`: fees still only affect the
+    /// virtual sealed ledger for now, a real fee-to-treasury bridge is a
+    /// separate, not-yet-built feature.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_and_fold(
         &self,
@@ -1063,7 +1194,7 @@ impl AppState {
         current_funding_index: i128,
         default_leverage: u64,
         extra_delta: I256,
-    ) -> I256 {
+    ) -> (I256, I256) {
         let cache_key = (portfolio_key, market_id.to_string());
         // Held for this whole function: `lock_position`'s own doc on why
         // locking `position_cache` alone, twice, separately, isn't enough.
@@ -1072,7 +1203,9 @@ impl AppState {
         let existing = load_single_market_state_cached(self, portfolio_key, market_id).await;
 
         let mut fold = PositionFold::from_existing(existing.as_ref(), default_leverage);
-        let delta = fold.apply_fill(fill_is_buy, fill_price, fill_qty, current_funding_index) + extra_delta;
+        let (fill_delta, realized_delta) =
+            fold.apply_fill(fill_is_buy, fill_price, fill_qty, current_funding_index);
+        let delta = fill_delta + extra_delta;
         fold.collateral += extra_delta;
 
         let mut cache = self.position_cache.lock().expect("position_cache mutex poisoned");
@@ -1093,7 +1226,7 @@ impl AppState {
                 },
             );
         }
-        delta
+        (delta, realized_delta)
     }
 
     /// Returns (creating on first use) the one `tokio::sync::Mutex` for a
@@ -1192,6 +1325,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(get_health))
         .route("/order", post(post_order))
         .route("/offer", post(post_offer))
+        .route("/cancel", post(post_cancel))
         .route("/portfolio-key", post(post_portfolio_key))
         .route("/liquidation-check", post(post_liquidation_check))
         .route("/liquidate", post(post_liquidate))
@@ -1265,7 +1399,16 @@ async fn post_order(
         return Err(ApiError::InvalidTick { tick: payload.tick });
     }
 
-    check_deposited_collateral(&state, signer, &payload.market_id, payload.tick, payload.qty).await?;
+    check_deposited_collateral(
+        &state,
+        signer,
+        &payload.market_id,
+        payload.side,
+        payload.tick,
+        payload.qty,
+        payload.leverage,
+    )
+    .await?;
 
     let owner = signer_owner_id(signer);
     state.owner_addresses.lock().expect("owner_addresses mutex poisoned").insert(owner, signer);
@@ -1501,7 +1644,7 @@ async fn post_order(
         // flips which direction the delta points.
         let fee =
             I256::try_from(crate::fees::taker_fee(notional, taker_prior_volume)).expect("fee fits in I256");
-        taker_collateral_delta += state
+        let (fold_delta, realized_delta) = state
             .load_and_fold(
                 taker_portfolio_key,
                 &payload.market_id,
@@ -1513,6 +1656,8 @@ async fn post_order(
                 fee,
             )
             .await;
+        taker_collateral_delta += fold_delta;
+        state.queue_realized_pnl(signer, realized_delta_to_usd(realized_delta, &payload.market_id));
         maker_legs.push(maker_leg);
         maker_traders.push(maker_address);
     }
@@ -1739,6 +1884,58 @@ async fn post_offer(
     Ok(Json(OfferResponse::Resting { offer_id }))
 }
 
+/// Cancels a still-resting order/offer this signer owns. Real necessity,
+/// not a nice-to-have: before this existed, the HTTP API had no cancel
+/// route at all (`market_maker.rs`'s own module doc names this exact gap
+/// — "requoting stacks size, it doesn't replace it" — confirmed live to
+/// leave stale price levels resting far from the market indefinitely,
+/// only ever cleaned up by GTT expiry). A real trader hit this directly:
+/// a stale ask several requote-cycles old, never replaced because the
+/// bot had nothing to cancel it with, sat at the top of the book and
+/// filled an order at a wildly wrong price.
+async fn post_cancel(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<Envelope>,
+) -> Result<Json<CancelResponse>, ApiError> {
+    let (payload, signer): (CancelPayload, Address) =
+        decrypt::decrypt_and_authenticate(&state.keystore, &envelope)?;
+
+    {
+        let mut last_nonce = state.last_nonce.lock().expect("last_nonce mutex poisoned");
+        if let Some(&last) = last_nonce.get(&signer) {
+            if payload.nonce <= last {
+                return Err(ApiError::NonceReplay { got: payload.nonce, last });
+            }
+        }
+        last_nonce.insert(signer, payload.nonce);
+    }
+
+    let owner = signer_owner_id(signer);
+    let mut books = state.books.lock().expect("books mutex poisoned");
+    let Some(book) = books.get_mut(&payload.market_id) else {
+        return Ok(Json(CancelResponse::NotFound));
+    };
+
+    match book.owner_of(payload.order_id) {
+        None => Ok(Json(CancelResponse::NotFound)),
+        Some(existing_owner) if existing_owner != owner => {
+            Err(ApiError::NotOrderOwner { order_id: payload.order_id })
+        }
+        Some(_) => {
+            let cancelled = book.cancel(payload.order_id);
+            drop(books);
+            match cancelled {
+                Some((tick, qty)) => {
+                    tracing::info!(signer = %signer, market_id = %payload.market_id, order_id = payload.order_id, "order cancelled");
+                    broadcast_orderbook_update(&state, &payload.market_id);
+                    Ok(Json(CancelResponse::Cancelled { tick, qty }))
+                }
+                None => Ok(Json(CancelResponse::NotFound)),
+            }
+        }
+    }
+}
+
 async fn post_portfolio_key(
     State(state): State<Arc<AppState>>,
     Json(envelope): Json<Envelope>,
@@ -1782,12 +1979,17 @@ fn build_orderbook_response_grouped(
         let market_data = state.market_data.lock().expect("market_data mutex poisoned");
         market_data.get(market_id).map(|tape| tape.snapshot()).unwrap_or_default()
     };
+    let mark_price: Option<u64> = {
+        let backstop = state.backstop.lock().expect("backstop mutex poisoned");
+        backstop.get(market_id).and_then(|b| b.reference_price(&state.backstop_config))
+    };
     OrderBookResponse {
         market_id: market_id.clone(),
         best_bid: snapshot.best_bid,
         best_ask: snapshot.best_ask,
         bids: group_levels(&snapshot.bids, group),
         asks: group_levels(&snapshot.asks, group),
+        mark_price,
         market,
     }
 }
@@ -2070,7 +2272,6 @@ async fn post_debug_seed_history(
     // not cryptographic, this only ever feeds a display-only synthetic
     // walk, nothing security-relevant depends on its randomness.
     let mut rng_state: u64 = now ^ payload.start_tick.wrapping_mul(2_654_435_761);
-    let mut count = 0usize;
 
     let mut market_data = state.market_data.lock().expect("market_data mutex poisoned");
     // Replaces, not appends: `TradeTape::record` documents (and relies on,
@@ -2088,27 +2289,50 @@ async fn post_debug_seed_history(
     market_data.insert(payload.market_id.clone(), TradeTape::default());
     let tape = market_data.get_mut(&payload.market_id).expect("just inserted");
 
-    let mut t = start_time;
-    while t < now {
+    // Real, confirmed bug this fixes: walking FORWARD from `start_tick` with
+    // an unanchored random walk left the newest (most recent) seeded print
+    // wherever 20,160 compounding +-0.2% steps happened to wander — over 14
+    // days that's routinely tens of percent away from `start_tick`, and
+    // since `snapshot().last_price` is exactly "the newest trade in the
+    // tape," a demo's ticker showed a stale, made-up price with no relation
+    // to the real live order book the moment seeding finished (confirmed
+    // live: seeded EURC/USDC at a real 1.15585 start, ended the walk at
+    // 1.34786 — an 18%+ gap from the market makers' own real, oracle-backed
+    // quotes running at the same time). Walking BACKWARD from `now` instead
+    // fixes this structurally: the walk's SEED point (`start_tick`) is
+    // pinned to `now`, the actual present moment, and every step drifts
+    // into the increasingly-fake past instead of away from the present —
+    // so the newest print in the tape is always exactly today's real price,
+    // regardless of how far the walk wanders 14 days back.
+    let mut t = now.saturating_sub(STEP_SECS);
+    let mut backfill: Vec<(u64, u64, u64)> = Vec::with_capacity((span_secs / STEP_SECS) as usize + 1);
+    backfill.push((now, price as u64, 2 + (rng_state % 12)));
+    while t >= start_time {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 7;
         rng_state ^= rng_state << 17;
-        // +-0.2% per 1-minute step — smaller than before (was +-1.0%)
-        // since steps are now 5x more frequent; unchanged compounds to a
-        // similar realistic per-hour range, just spread across more,
-        // smaller candle-visible moves instead of one large jump per bar.
+        // +-0.2% per 1-minute step, same magnitude as before, just applied
+        // walking backward in time from the real present price.
         let step_tenths_pct = (rng_state % 5) as i64 - 2; // -0.2%..=+0.2% per step
         price += price * step_tenths_pct / 1000;
         if price < 1 {
             price = 1;
         }
         let qty = 2 + (rng_state % 12);
-        tape.record(t, price as u64, qty);
-        count += 1;
-        t += STEP_SECS;
+        backfill.push((t, price as u64, qty));
+        if t < STEP_SECS {
+            break;
+        }
+        t -= STEP_SECS;
+    }
+    // `record` requires non-decreasing timestamps (this fn's own doc,
+    // above) — `backfill` was built newest-first, so insert oldest-first.
+    let trades_seeded = backfill.len();
+    for (timestamp, price, qty) in backfill.into_iter().rev() {
+        tape.record(timestamp, price, qty);
     }
 
-    Ok(Json(SeedHistoryResponse { market_id: payload.market_id, trades_seeded: count }))
+    Ok(Json(SeedHistoryResponse { market_id: payload.market_id, trades_seeded }))
 }
 
 async fn ws_orderbook(
@@ -2584,7 +2808,6 @@ fn size_liquidation_legs(
                 let delta = realized_close_delta(
                     m.signed_size,
                     m.entry_price,
-                    m.collateral,
                     m.entry_funding_index,
                     close_size,
                     current_tick,
@@ -2605,7 +2828,6 @@ fn size_liquidation_legs(
                 let delta = realized_close_delta(
                     m.signed_size,
                     m.entry_price,
-                    m.collateral,
                     m.entry_funding_index,
                     close_size,
                     current_tick,
@@ -2623,7 +2845,6 @@ fn size_liquidation_legs(
             let delta = realized_close_delta(
                 m.signed_size,
                 m.entry_price,
-                m.collateral,
                 m.entry_funding_index,
                 close_size as u64,
                 current_tick,
@@ -2850,8 +3071,38 @@ pub const BPS_DENOMINATOR: u128 = 10_000;
 /// TEE's raw order-book units, not the contract's 1e18-scaled USD.
 /// Real deployment needs a shared fixed-point convention between the
 /// TEE and the contract; tracked as a follow-up, not invented here.
-fn required_margin(tick: u64, qty: u64) -> u128 {
-    (tick as u128) * (qty as u128) * IMR_BPS / BPS_DENOMINATOR
+///
+/// `leverage`-aware, NOT a fixed `IMR_BPS` regardless of what the trader
+/// actually selected — real, confirmed bug this replaced: every
+/// position's real locked margin was computed and enforced against a
+/// flat 5% (`IMR_BPS` = 500, a fixed-20x-equivalent), completely
+/// ignoring `OrderPayload.leverage`. A trader choosing a LOWER, safer
+/// leverage (which should require MORE margin per unit, not less) got
+/// exactly the same loose floor as a 20x trader — confirmed live: an
+/// 8898-unit AUD/USD position opened at 5x, needing $1262.64 by its own
+/// selected leverage (`notional / leverage`, matching
+/// `SettlementEngine.sol`'s own `IMR_BPS = BPS_DENOMINATOR /
+/// leverageCeiling_` convention), was accepted and really settled
+/// against only ~$315.66 (the old flat-5% figure) of real enforced
+/// margin. `SettlementEngine.sol`'s own per-market `LEVERAGE_CEILING`
+/// caps this from the other direction on-chain for the plaintext path;
+/// the sealed/private path (`settleMatch`) trusts the TEE's own
+/// `collateralDelta` without re-deriving it (that contract's own doc),
+/// making this the ONLY real enforcement for sealed trades — there is
+/// no on-chain backstop to catch this matcher-side gap for that path.
+/// Blanket safety cap on `leverage`, matching the highest real
+/// `LEVERAGE_CEILING` any deployed market actually uses (`FxPerpMarket`
+/// instances in `DeployLocal.s.sol`/`DeployMoreMarketsLocal.s.sol`, 50x).
+/// Not per-market-accurate — the matcher doesn't track each market's own
+/// ceiling yet, a genuinely separate, larger follow-up — but without SOME
+/// cap here, a crafted payload naming an absurd leverage (1,000,000x)
+/// would make `required_margin` compute a near-zero requirement,
+/// defeating the whole leverage-aware fix this constant is part of.
+const MAX_LEVERAGE: u64 = 50;
+
+fn required_margin(tick: u64, qty: u64, leverage: u64) -> u128 {
+    let imr_bps = BPS_DENOMINATOR / (leverage.clamp(1, MAX_LEVERAGE) as u128);
+    (tick as u128) * (qty as u128) * imr_bps / BPS_DENOMINATOR
 }
 
 /// The bridge `required_margin`'s own doc calls a follow-up — not for
@@ -2870,11 +3121,31 @@ fn required_margin(tick: u64, qty: u64) -> u128 {
 /// `*`: this is a pre-trade risk check, not a settlement path — a
 /// pathological overflow here must degrade to "looks unaffordable"
 /// (rejecting the order), never panic the request handler.
-fn required_margin_usd(tick: u64, qty: u64, market_id: &str) -> u128 {
+fn required_margin_usd(tick: u64, qty: u64, market_id: &str, leverage: u64) -> u128 {
     const USD_SCALE: u128 = 1_000_000_000_000_000_000;
-    let raw = required_margin(tick, qty);
+    let raw = required_margin(tick, qty, leverage);
     let scale = crate::oracle::price_scale_for_market(market_id) as u128;
     raw.saturating_mul(USD_SCALE) / scale
+}
+
+/// Same tick/price-scale bridge as `required_margin_usd`, signed: a
+/// realized PnL delta (`PositionFold::apply_fill`'s own doc — raw
+/// tick-scale units, the same convention `collateral` and
+/// `required_margin` already use) converted to real 1e18-scaled USD,
+/// `Account.settleRealizedPnlBatch`'s own required units. Real, confirmed
+/// bug this session: `queue_realized_pnl` originally queued the raw
+/// tick-scale delta directly, un-converted — for EURC/USDC
+/// (`price_scale_for_market` == 100_000), that understated a real loss
+/// by 5 orders of magnitude, moving a few millionths of a cent onto
+/// `Account.sol` instead of the actual dollar amount. Confirmed live: a
+/// real close at a real loss on a 10,000 USDC deposit moved the account
+/// balance by 0.0000010305 USDC, not the real loss.
+fn realized_delta_to_usd(delta: I256, market_id: &str) -> I256 {
+    const USD_SCALE: i128 = 1_000_000_000_000_000_000;
+    let raw: i128 = i128::try_from(delta).unwrap_or(if delta < I256::ZERO { i128::MIN } else { i128::MAX });
+    let scale = crate::oracle::price_scale_for_market(market_id) as i128;
+    let usd = raw.saturating_mul(USD_SCALE) / scale;
+    I256::try_from(usd).unwrap_or(if usd < 0 { I256::MIN } else { I256::MAX })
 }
 
 /// The real, pre-trade collateral gate: before an order can even touch
@@ -2901,12 +3172,27 @@ fn required_margin_usd(tick: u64, qty: u64, market_id: &str) -> u128 {
 /// gating them here would be a real design change to that path, not this
 /// fix's job. A maker with insufficient real collateral by the time one
 /// of its offers actually fills is a genuine, separate, still-open gap.
+///
+/// Only the portion of `qty` that INCREASES net exposure in `market_id`
+/// needs fresh margin. Before this, `new_order_usd` charged full margin
+/// for the order's whole size regardless of direction, so a close (or
+/// even a partial reduce) against an existing position got double-counted
+/// against `locked_usd` — the same exposure priced once as "already
+/// locked" and again as "this new order" — demanding MORE collateral to
+/// close a position than to open it. Confirmed live: a trader with a real
+/// open position and no free collateral left got their close rejected
+/// with `InsufficientCollateral`, unable to exit a losing position at
+/// exactly the moment they most needed to. Closing/reducing always nets
+/// to zero incremental margin; only a flip past flat (`qty` exceeding the
+/// existing opposite-side size) requires margin, and only for that excess.
 async fn check_deposited_collateral(
     state: &AppState,
     signer: Address,
     market_id: &str,
+    side: OrderSide,
     tick: u64,
     qty: u64,
+    leverage: u64,
 ) -> Result<(), ApiError> {
     let Some((account_contract, asset)) = state.collateral_check else {
         return Ok(());
@@ -2925,7 +3211,37 @@ async fn check_deposited_collateral(
         })
         .sum();
 
-    let new_order_usd = required_margin_usd(tick, qty, market_id);
+    let existing_signed_size =
+        existing.iter().find(|m| m.market_id == market_id).map(|m| m.signed_size).unwrap_or(0);
+    let order_signed: i128 = match side {
+        OrderSide::Buy => qty as i128,
+        OrderSide::Sell => -(qty as i128),
+    };
+    let closing_qty = if existing_signed_size != 0 && existing_signed_size.signum() != order_signed.signum() {
+        qty.min(existing_signed_size.unsigned_abs() as u64)
+    } else {
+        0
+    };
+    let opening_qty = qty.saturating_sub(closing_qty);
+
+    // A pure close/reduce (nothing beyond the existing opposite-side size)
+    // needs no deposited collateral at all, not even `locked_usd` — that
+    // margin is already committed, not new money this order is asking
+    // for. Comparing `deposited_usd` against `locked_usd` here anyway was
+    // a REAL, confirmed bug: `locked_usd` can drift above what's actually
+    // deposited over time (funding accrual folded into a position's
+    // tracked collateral, see `PositionFold`/funding checkpointing), and
+    // once it does, EVERY future order — including a pure close — got
+    // rejected with `InsufficientCollateral`, trapping a trader in a
+    // losing position exactly when they most needed to exit. Confirmed
+    // live: a full-size close on an existing position was rejected
+    // needing $1002.06 with only $1000.00 deposited, despite the close
+    // itself opening zero new size.
+    if opening_qty == 0 {
+        return Ok(());
+    }
+
+    let new_order_usd = required_margin_usd(tick, opening_qty, market_id, leverage);
     let required_usd = locked_usd.saturating_add(new_order_usd);
 
     let deposited_usd = match crate::settle::load_deposited_collateral(signer, asset, account_contract).await
@@ -2955,8 +3271,30 @@ fn format_usd(amount_1e18: u128) -> String {
 
 /// The `collateral_delta` for closing `close_size` (magnitude, <=
 /// `existing.signed_size.unsigned_abs()`) of an already-open position:
-/// proportional margin release plus realized spot + funding PnL on the
-/// closed portion, all in this crate's own raw tick-scale units.
+/// realized spot + funding PnL on the closed portion, all in this
+/// crate's own raw tick-scale units.
+///
+/// `collateral` (the position's existing tracked value) is deliberately
+/// left untouched by the closed portion's ORIGINAL margin — that margin
+/// is already part of `collateral` and stays there; a close only ever
+/// adds this closed portion's realized PnL on top of it. There is no
+/// separate "freed margin" ledger anywhere this could move to (the
+/// caller applies this delta straight onto the same `collateral` field,
+/// see `PositionFold::apply_fill`), so subtracting a proportional share
+/// of margin here — a REAL, confirmed bug this function shipped with —
+/// made that margin evaporate from the accounting entirely: a fully
+/// profitable close returned only the profit and silently discarded the
+/// original margin, and a full 100%-of-margin loss computed a NEGATIVE
+/// resulting collateral (reverting on-chain with
+/// `InsufficientSealedCollateral`, blocking the trader from closing a
+/// losing position exactly when they most needed to) instead of
+/// correctly flooring at zero. Confirmed live via a direct probe of this
+/// function before the fix: `realized_close_delta(10, 100, 100, 0, 10,
+/// 110, 0)` (a full close, 100% profit) returned a delta of `0`
+/// (collateral staying at 100, not correctly becoming 200), and the same
+/// call with `current_tick=90` (a full 100%-of-margin loss) returned
+/// `-200` (collateral going to -100 and reverting, not correctly
+/// flooring at 0).
 ///
 /// Deliberately does NOT go through `SettlementEngine.sol`'s separate
 /// 1e18-scaled `fundingIndex`/`getPnL` — `required_margin`'s own doc
@@ -2968,16 +3306,10 @@ fn format_usd(amount_1e18: u128) -> String {
 /// (`AppState::funding_index_native`'s doc), so `signed_close * (delta)`
 /// lands directly in the units `collateral_delta` already uses — no
 /// scaling step needed.
-///
-/// Before this existed, every close (voluntary or liquidation) just
-/// released a straight proportional share of locked margin with no PnL
-/// at all — this is the one place that behavior changes into something
-/// that actually reflects the market having moved.
 #[allow(clippy::too_many_arguments)]
 fn realized_close_delta(
     signed_size: i128,
     entry_price: u64,
-    collateral: I256,
     entry_funding_index: i128,
     close_size: u64,
     current_tick: u64,
@@ -2989,17 +3321,12 @@ fn realized_close_delta(
     }
     let close_size = close_size.min(size_abs as u64);
 
-    let collateral_u128 = i128::try_from(collateral).unwrap_or(0).max(0) as u128;
-    let freed_collateral = collateral_u128 * close_size as u128 / size_abs;
-
     let signed_close: i128 = if signed_size >= 0 { close_size as i128 } else { -(close_size as i128) };
     let spot_pnl = signed_close * (current_tick as i128 - entry_price as i128);
     let funding_pnl = signed_close * (current_funding_index - entry_funding_index);
     let pnl = spot_pnl + funding_pnl;
 
-    let pnl_i256 = I256::try_from(pnl).unwrap_or(if pnl < 0 { I256::MIN } else { I256::MAX });
-    let freed_i256 = I256::try_from(freed_collateral).unwrap_or(I256::MAX);
-    pnl_i256 - freed_i256
+    I256::try_from(pnl).unwrap_or(if pnl < 0 { I256::MIN } else { I256::MAX })
 }
 
 /// A running position in one market, folded fill-by-fill across a sweep —
@@ -3069,17 +3396,31 @@ impl PositionFold {
     /// proportional `freed` share is computed against the REAL remaining
     /// collateral after the first close's realized PnL, not against a
     /// stale pre-PnL figure.
+    ///
+    /// Returns `(total_delta, realized_delta)`: `total_delta` is what
+    /// always applied to `self.collateral` (unchanged behavior — margin
+    /// lock on an add, PnL-adjusted release on a close/flip). `realized_delta`
+    /// is the strictly-narrower REALIZED portion only (`close_delta` above,
+    /// zero on a pure add) — the part that represents an actual
+    /// close/flip's spot+funding PnL rather than a fresh margin lock.
+    /// Callers use this second value to queue a REAL money settlement
+    /// (`AppState::queue_realized_pnl`) — see that function's own doc, and
+    /// `Account.settleRealizedPnlBatch`'s doc, for why only the realized
+    /// portion should ever move real custody: an opening margin lock is
+    /// still virtual/internal, exactly as `SealedPosition.collateral`
+    /// itself always has been, only a REALIZED close/flip is new money
+    /// actually changing hands.
     fn apply_fill(
         &mut self,
         fill_is_buy: bool,
         fill_price: u64,
         fill_qty: u64,
         current_funding_index: i128,
-    ) -> I256 {
+    ) -> (I256, I256) {
         let fill_signed: i128 = if fill_is_buy { fill_qty as i128 } else { -(fill_qty as i128) };
         let same_direction = self.signed_size == 0 || (self.signed_size > 0) == (fill_signed > 0);
 
-        let delta = if same_direction {
+        let (delta, realized) = if same_direction {
             let old_abs = self.signed_size.unsigned_abs();
             let new_abs = old_abs + fill_qty as u128;
             self.entry_price = ((old_abs * self.entry_price as u128 + fill_qty as u128 * fill_price as u128)
@@ -3088,7 +3429,11 @@ impl PositionFold {
                 + current_funding_index * fill_qty as i128)
                 / new_abs as i128;
             self.signed_size += fill_signed;
-            I256::try_from(required_margin(fill_price, fill_qty)).expect("margin fits in I256")
+            (
+                I256::try_from(required_margin(fill_price, fill_qty, self.leverage))
+                    .expect("margin fits in I256"),
+                I256::ZERO,
+            )
         } else {
             let existing_abs = self.signed_size.unsigned_abs();
             let close_size = (fill_qty as u128).min(existing_abs) as u64;
@@ -3096,7 +3441,6 @@ impl PositionFold {
             let close_delta = realized_close_delta(
                 self.signed_size,
                 self.entry_price,
-                self.collateral,
                 self.entry_funding_index,
                 close_size,
                 fill_price,
@@ -3108,7 +3452,7 @@ impl PositionFold {
 
             let flip_qty = fill_qty - close_size;
             if flip_qty == 0 {
-                close_delta
+                (close_delta, close_delta)
             } else {
                 // The close above fully unwound the old side (close_size ==
                 // existing_abs); open the remainder fresh on the fill's side.
@@ -3117,14 +3461,14 @@ impl PositionFold {
                 self.entry_funding_index = current_funding_index;
                 self.take_profit = None;
                 self.stop_loss = None;
-                let open_delta =
-                    I256::try_from(required_margin(fill_price, flip_qty)).expect("margin fits in I256");
-                close_delta + open_delta
+                let open_delta = I256::try_from(required_margin(fill_price, flip_qty, self.leverage))
+                    .expect("margin fits in I256");
+                (close_delta + open_delta, close_delta)
             }
         };
 
         self.collateral += delta;
-        delta
+        (delta, realized)
     }
 }
 
@@ -3179,10 +3523,17 @@ async fn build_maker_leg(
     let maker_portfolio_key = portfolio_key(&state.portfolio_key_secret, maker_address);
     // Makers rest via `OfferPayload`, which (unlike `OrderPayload`) has no
     // leverage field yet — a real, stated gap, not an oversight — so a
-    // fresh open defaults to 1x; an add to an existing position keeps that
-    // position's own leverage instead (`PositionFold::from_existing`).
+    // fresh open defaults to 20x; an add to an existing position keeps
+    // that position's own leverage instead (`PositionFold::from_existing`).
+    // 20x specifically, not 1x: `required_margin` is now genuinely
+    // leverage-aware (see that function's own doc on the real bug this
+    // fixed), and 20x is exactly what the OLD fixed `IMR_BPS = 500`
+    // (`BPS_DENOMINATOR / 20`) always meant — this keeps every already-
+    // running market maker's real collateral usage identical to before,
+    // rather than suddenly requiring ~20x more margin (a 1x-equivalent
+    // 100% notional lock) for every resting offer the moment this landed.
     // Makers never pay a fee (`taker_fee`'s own naming), hence `I256::ZERO`.
-    let collateral_delta = state
+    let (collateral_delta, realized_delta) = state
         .load_and_fold(
             maker_portfolio_key,
             market_id,
@@ -3190,10 +3541,11 @@ async fn build_maker_leg(
             tick,
             qty,
             current_funding_index,
-            1,
+            20,
             I256::ZERO,
         )
         .await;
+    state.queue_realized_pnl(maker_address, realized_delta_to_usd(realized_delta, market_id));
     let sealed_params = match state.cached_sealed_params(maker_portfolio_key, market_id) {
         Some(params) => Bytes::from(state.sealed_key.seal(&params)),
         None => Bytes::new(),
@@ -3217,6 +3569,152 @@ mod tests {
 
     fn wallet() -> PrivateKeySigner {
         PrivateKeySigner::random()
+    }
+
+    /// Real, confirmed bug this session: `required_margin` used to ignore
+    /// `leverage` entirely, always charging the flat `IMR_BPS` (5%,
+    /// fixed-20x-equivalent) regardless of what the trader actually
+    /// selected. Reproduces the exact live scenario: 8898 units of
+    /// AUD/USD at tick 70950 (price_scale 100_000, so real price
+    /// 0.7095), 5x leverage — the trader's OWN selected leverage implies
+    /// a $1262.64 requirement (`notional / leverage`), not the old flat
+    /// formula's ~$315.66.
+    #[test]
+    fn required_margin_scales_with_the_traders_own_selected_leverage_not_a_flat_rate() {
+        let tick = 70_950u64;
+        let qty = 8898u64;
+        let raw_at_5x = required_margin(tick, qty, 5);
+        // notional / leverage, in the same tick-scale raw units
+        // required_margin_usd later divides by price_scale to recover:
+        // tick*qty/leverage == 70950*8898/5.
+        let expected_raw = (tick as u128) * (qty as u128) / 5;
+        assert_eq!(raw_at_5x, expected_raw);
+
+        // The old flat-5% formula for comparison — confirms the fix
+        // actually changed the number, not just accepted a coincidence.
+        let raw_at_old_flat_rate = (tick as u128) * (qty as u128) * 500 / 10_000;
+        assert!(
+            raw_at_5x > raw_at_old_flat_rate * 3,
+            "5x leverage must require meaningfully more margin than the old flat 5% rate"
+        );
+    }
+
+    /// A crafted absurd leverage (far past any real market's ceiling)
+    /// must not be able to make `required_margin` collapse toward zero —
+    /// `MAX_LEVERAGE`'s own doc on why this cap exists at all.
+    #[test]
+    fn required_margin_clamps_an_absurd_leverage_to_max_leverage() {
+        let at_cap = required_margin(100_000, 1000, MAX_LEVERAGE);
+        let absurd = required_margin(100_000, 1000, 1_000_000);
+        assert_eq!(absurd, at_cap);
+    }
+
+    /// Real, confirmed bug this session: `realized_close_delta` used to
+    /// subtract a proportional share of margin from the delta on top of
+    /// applying PnL, with nothing anywhere to credit that subtracted
+    /// share back to — it just evaporated from the accounting. entry=100,
+    /// size=10, 10x leverage => collateral=100 (required_margin's own
+    /// formula). A full close at +10 (a real, unleveraged $100 profit on
+    /// a $1000 notional position) must return the trader's original $100
+    /// margin PLUS the $100 profit: collateral_after == 200, not 100.
+    #[test]
+    fn full_close_at_a_profit_returns_margin_plus_pnl_not_just_pnl() {
+        let collateral = I256::try_from(100i64).unwrap();
+        let delta = realized_close_delta(10, 100, 0, 10, 110, 0);
+        assert_eq!(collateral + delta, I256::try_from(200i64).unwrap());
+    }
+
+    /// Same setup, full close at -10 (a 100%-of-margin loss, exactly the
+    /// liquidation boundary): must floor at exactly zero, not go negative.
+    /// The pre-fix formula computed -100 here, which `_applySealedLeg`'s
+    /// `newCollateral < 0` check would revert on-chain — a trader could
+    /// not close a position that lost exactly its margin.
+    #[test]
+    fn full_close_at_total_loss_floors_at_zero_not_negative() {
+        let collateral = I256::try_from(100i64).unwrap();
+        let delta = realized_close_delta(10, 100, 0, 10, 90, 0);
+        assert_eq!(collateral + delta, I256::ZERO);
+    }
+
+    /// Real, confirmed bug: `queue_realized_pnl` originally queued the
+    /// raw tick-scale delta straight into `Account.settleRealizedPnlBatch`
+    /// without converting it to real 1e18-scaled USD first — see
+    /// `realized_delta_to_usd`'s own doc. EURC/USDC's price_scale is
+    /// 100_000, so a raw delta of 100_000 (tick*qty units) must become
+    /// exactly 1 real USD (1e18), not 100_000 raw units misread as
+    /// "wei" of USDC (a few hundred-thousandths of a cent).
+    #[test]
+    fn realized_delta_to_usd_applies_the_market_price_scale() {
+        let delta = I256::try_from(100_000i64).unwrap();
+        let usd = realized_delta_to_usd(delta, "EURC/USDC");
+        assert_eq!(usd, I256::try_from(1_000_000_000_000_000_000i128).unwrap());
+    }
+
+    #[test]
+    fn realized_delta_to_usd_preserves_sign_on_a_loss() {
+        let delta = I256::try_from(-100_000i64).unwrap();
+        let usd = realized_delta_to_usd(delta, "EURC/USDC");
+        assert_eq!(usd, I256::try_from(-1_000_000_000_000_000_000i128).unwrap());
+    }
+
+    /// Real, confirmed bug: a fill crossing the synthetic backstop
+    /// counterparty (`BACKSTOP_OWNER_ID` maps to `Address::ZERO`, see
+    /// `AppState::new`'s own `owner_addresses` seed) queued a
+    /// zero-address entry, which reverted `settleRealizedPnlBatch`'s
+    /// WHOLE call with `ZeroAddress()` at flush time — silently dropping
+    /// every OTHER real trader's realized PnL batched into the same
+    /// flush along with it, not just the backstop leg's own (nonexistent)
+    /// settlement. `queue_realized_pnl` must treat the zero address as a
+    /// no-op, same as a zero delta.
+    #[test]
+    fn queue_realized_pnl_ignores_the_zero_address_backstop_counterparty() {
+        let mut state = AppState::new();
+        state.configure_collateral_check(Address::from([0x11; 20]), Address::from([0x22; 20]));
+        state.queue_realized_pnl(Address::ZERO, I256::try_from(50i64).unwrap());
+        assert!(state.drain_realized_pnl().is_empty());
+    }
+
+    #[test]
+    fn queue_realized_pnl_nets_several_deltas_for_the_same_trader_into_one_entry() {
+        let mut state = AppState::new();
+        let asset = Address::from([0x22; 20]);
+        state.configure_collateral_check(Address::from([0x11; 20]), asset);
+        let trader = Address::from([0x33; 20]);
+        state.queue_realized_pnl(trader, I256::try_from(50i64).unwrap());
+        state.queue_realized_pnl(trader, I256::try_from(-20i64).unwrap());
+        let pending = state.drain_realized_pnl();
+        assert_eq!(pending, vec![(trader, asset, I256::try_from(30i64).unwrap())]);
+    }
+
+    #[test]
+    fn full_close_at_breakeven_leaves_collateral_unchanged() {
+        let collateral = I256::try_from(100i64).unwrap();
+        let delta = realized_close_delta(10, 100, 0, 10, 100, 0);
+        assert_eq!(collateral + delta, collateral);
+    }
+
+    /// Partial close: half the position (5 of 10 units) at +10. The
+    /// closed half's own PnL is 5*10=50; the pre-fix formula's
+    /// proportional-margin subtraction (freed=50) would have cancelled
+    /// this out to a delta of 0, silently discarding the closed half's
+    /// unlocked margin. Correct: collateral grows by exactly the closed
+    /// portion's PnL (50), nothing more, nothing less — the remaining
+    /// open position's own margin was never touched by this call at all.
+    #[test]
+    fn partial_close_credits_only_the_closed_portions_pnl() {
+        let collateral = I256::try_from(100i64).unwrap();
+        let delta = realized_close_delta(10, 100, 0, 5, 110, 0);
+        assert_eq!(delta, I256::try_from(50i64).unwrap());
+        assert_eq!(collateral + delta, I256::try_from(150i64).unwrap());
+    }
+
+    #[test]
+    fn short_position_profits_when_price_falls() {
+        // A short's PnL direction is inverted: signed_size negative,
+        // price dropping is a profit.
+        let collateral = I256::try_from(100i64).unwrap();
+        let delta = realized_close_delta(-10, 100, 0, 10, 90, 0);
+        assert_eq!(collateral + delta, I256::try_from(200i64).unwrap());
     }
 
     #[test]
@@ -4000,6 +4498,112 @@ mod tests {
         assert_eq!(body["status"], "rejected");
     }
 
+    fn cancel_payload(market_id: &str, order_id: u32, nonce: u64) -> CancelPayload {
+        CancelPayload {
+            market_id: market_id.to_string(),
+            order_id,
+            nonce,
+            signature: Signature::test_signature(),
+        }
+    }
+
+    fn sign_cancel(cancel: &mut CancelPayload, wallet: &PrivateKeySigner) {
+        let raw = wallet.sign_message_sync(&cancel.signing_bytes()).unwrap();
+        cancel.signature = raw.as_bytes().as_slice().try_into().unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_can_cancel_their_own_resting_offer() {
+        let state = Arc::new(AppState::new());
+        let wallet = wallet();
+        let mut o = offer("0xEURCUSDC", OrderSide::Buy, 100, 10, 1);
+        sign_offer(&mut o, &wallet);
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &o).unwrap();
+        let app = router(state.clone());
+        let (_, body) = post_json(app.clone(), "/offer", &envelope).await;
+        let offer_id = body["offer_id"].as_u64().unwrap() as u32;
+
+        assert_eq!(
+            state.books.lock().unwrap().get("0xEURCUSDC").unwrap().depth_at(common::types::Side::Long, 100),
+            10,
+            "setup: resting before cancel"
+        );
+
+        let mut cancel = cancel_payload("0xEURCUSDC", offer_id, 2);
+        sign_cancel(&mut cancel, &wallet);
+        let cancel_envelope = decrypt::encrypt_for(state.keystore.public_key(), &cancel).unwrap();
+        let (status, body) = post_json(app, "/cancel", &cancel_envelope).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "cancelled");
+        assert_eq!(body["qty"], 10);
+
+        assert_eq!(
+            state.books.lock().unwrap().get("0xEURCUSDC").unwrap().depth_at(common::types::Side::Long, 100),
+            0,
+            "the order must actually be gone from the book, not just report success"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_someone_elses_order_is_forbidden_and_does_not_cancel_it() {
+        let state = Arc::new(AppState::new());
+        let owner = wallet();
+        let stranger = wallet();
+        let mut o = offer("0xEURCUSDC", OrderSide::Buy, 100, 10, 1);
+        sign_offer(&mut o, &owner);
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &o).unwrap();
+        let app = router(state.clone());
+        let (_, body) = post_json(app.clone(), "/offer", &envelope).await;
+        let offer_id = body["offer_id"].as_u64().unwrap() as u32;
+
+        let mut cancel = cancel_payload("0xEURCUSDC", offer_id, 1);
+        sign_cancel(&mut cancel, &stranger);
+        let cancel_envelope = decrypt::encrypt_for(state.keystore.public_key(), &cancel).unwrap();
+        let (status, _) = post_json(app, "/cancel", &cancel_envelope).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        assert_eq!(
+            state.books.lock().unwrap().get("0xEURCUSDC").unwrap().depth_at(common::types::Side::Long, 100),
+            10,
+            "a forbidden cancel attempt must not have touched the resting order"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_already_filled_order_reports_not_found() {
+        let state = Arc::new(AppState::new());
+        let maker = wallet();
+        let mut o = offer("0xEURCUSDC", OrderSide::Buy, 100, 10, 1);
+        sign_offer(&mut o, &maker);
+        let envelope = decrypt::encrypt_for(state.keystore.public_key(), &o).unwrap();
+        let app = router(state.clone());
+        let (_, body) = post_json(app.clone(), "/offer", &envelope).await;
+        let offer_id = body["offer_id"].as_u64().unwrap() as u32;
+
+        // Fully consume it with a crossing taker order.
+        let taker = wallet();
+        let mut taking = OrderPayload {
+            market_id: "0xEURCUSDC".to_string(),
+            side: OrderSide::Sell,
+            tick: 100,
+            qty: 10,
+            tif: TimeInForce::GoodTilCancel,
+            post_only: false,
+            nonce: 1,
+            leverage: 1,
+            signature: Signature::test_signature(),
+        };
+        sign(&mut taking, &taker);
+        post_json(app.clone(), "/order", &envelope_for(taking, &state)).await;
+
+        let mut cancel = cancel_payload("0xEURCUSDC", offer_id, 2);
+        sign_cancel(&mut cancel, &maker);
+        let cancel_envelope = decrypt::encrypt_for(state.keystore.public_key(), &cancel).unwrap();
+        let (status, body) = post_json(app, "/cancel", &cancel_envelope).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "not_found");
+    }
+
     #[tokio::test]
     async fn portfolio_key_lookup_matches_what_a_real_trade_settles_under() {
         let state = Arc::new(AppState::new());
@@ -4259,8 +4863,13 @@ mod tests {
         assert_eq!(reopened.stop_loss, Some(50));
         assert!(reopened.side_is_buy);
 
-        // 30% of the 80 collateral, floored.
-        assert_eq!(leg.collateral_delta, -I256::try_from(24i64).unwrap());
+        // entry_price == the fallback "current" price (no live price
+        // configured for this market), so this is a breakeven close: PnL is
+        // zero, and realized_close_delta's fixed formula (see that
+        // function's own doc on the real bug this corrected) correctly
+        // leaves collateral untouched rather than draining a proportional
+        // share regardless of PnL.
+        assert_eq!(leg.collateral_delta, I256::ZERO);
     }
 
     #[test]
@@ -4293,7 +4902,10 @@ mod tests {
         assert_eq!(close_bps, 10_000);
         assert_eq!(legs.len(), 1);
         assert!(legs[0].sealed_params.is_empty());
-        assert_eq!(legs[0].collateral_delta, -I256::try_from(50i64).unwrap());
+        // Breakeven full close (no live price configured, falls back to
+        // entry_price) — zero PnL correctly leaves collateral untouched,
+        // see realized_close_delta's own doc.
+        assert_eq!(legs[0].collateral_delta, I256::ZERO);
     }
 
     #[test]
@@ -4373,7 +4985,10 @@ mod tests {
 
         assert_eq!(legs.len(), 1);
         assert!(legs[0].sealed_params.is_empty());
-        assert_eq!(legs[0].collateral_delta, -I256::try_from(10i64).unwrap());
+        // Breakeven full close (no live price configured, falls back to
+        // entry_price) — zero PnL correctly leaves collateral untouched,
+        // see realized_close_delta's own doc.
+        assert_eq!(legs[0].collateral_delta, I256::ZERO);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useSendTransaction } from '@privy-io/react-auth';
 import { encodeFunctionData, parseAbi, parseUnits, formatUnits, type Address } from 'viem';
 import { toast } from '../toast/toast-context';
+import { describeError } from '../lib/describeError';
 import { useWallet } from '../wallet/wallet-context';
 import { publicClient } from '../wallet/publicClient';
 import { activeChain } from '../wallet/privy';
@@ -121,17 +122,8 @@ export function WithdrawModal({ open, onClose }: { open: boolean; onClose: () =>
       setAmount('');
       onClose();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'submission failed';
-      const marginBlocked = message.includes('InsufficientMarginForWithdraw');
-      toast.update(progressId, {
-        type: 'error',
-        title: 'Withdraw failed',
-        description: marginBlocked
-          ? "Withdrawing this much would leave your open positions under-margined."
-          : message,
-        progress: undefined,
-        duration: 6000,
-      });
+      const { title, description, action } = describeError(error);
+      toast.update(progressId, { type: 'error', title, description, progress: undefined, duration: 6000, action });
     } finally {
       setSubmitting(false);
     }
@@ -202,7 +194,7 @@ export function WithdrawModal({ open, onClose }: { open: boolean; onClose: () =>
               ? 'Connect a wallet to withdraw.'
               : !configured
                 ? "USDC isn't configured on this chain yet."
-                : "Account.sol.withdraw() — reverts on-chain if this would under-margin an open position."}
+                : "You can't withdraw an amount that would leave an open position under-margined."}
           </p>
         </div>
       </div>

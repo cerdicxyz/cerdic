@@ -2,6 +2,7 @@
 pragma solidity 0.8.35;
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {ERC20Permit} from "openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {IAccessControl} from "openzeppelin-contracts/contracts/access/IAccessControl.sol";
 
 import {Account as ClearingAccount} from "../src/clearing/Account.sol";
@@ -10,6 +11,17 @@ import {Account as ClearingAccount} from "../src/clearing/Account.sol";
 ///      MVP stablecoin basket (USDC/EURC/USYC are all 1e18-scaled).
 contract MockERC20 is ERC20 {
     constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/// @dev Same as MockERC20 but EIP-2612-capable, real `TestUSDC.sol`'s own
+///      shape — needed to test `depositWithPermit` for real, not just
+///      that it compiles.
+contract MockERC20Permit is ERC20, ERC20Permit {
+    constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) ERC20Permit(name_) {}
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
@@ -226,5 +238,90 @@ contract AccountTest is Test {
         vm.prank(trader);
         bytes memory position = account.getPosition(MARKET_ID);
         assertEq(position.length, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // depositWithPermit — the approve+deposit batching fix.
+    // ---------------------------------------------------------------------
+
+    /// @notice One real EIP-712 signature, zero prior `approve` call: the
+    ///         whole point of `depositWithPermit` — proves it actually
+    ///         moves real tokens and credits the real balance, not just
+    ///         that the function compiles.
+    function test_DepositWithPermitMovesFundsWithNoPriorApproval() public {
+        uint256 permitPk = 0xA11CE;
+        address permitTrader = vm.addr(permitPk);
+        MockERC20Permit permitAsset = new MockERC20Permit("Cerdic Test USDC", "tUSDC");
+        permitAsset.mint(permitTrader, MINT_AMOUNT);
+
+        // Deliberately no `permitAsset.approve(...)` anywhere — the whole
+        // claim under test is that none is needed.
+        assertEq(permitAsset.allowance(permitTrader, address(account)), 0);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                permitTrader,
+                address(account),
+                DEPOSIT_AMOUNT,
+                permitAsset.nonces(permitTrader),
+                deadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", permitAsset.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(permitPk, digest);
+
+        vm.expectEmit(true, true, false, true, address(account));
+        emit ClearingAccount.CollateralDeposited(permitTrader, address(permitAsset), DEPOSIT_AMOUNT);
+
+        vm.prank(permitTrader);
+        account.depositWithPermit(address(permitAsset), DEPOSIT_AMOUNT, deadline, v, r, s);
+
+        assertEq(account.collateralBalanceOf(permitTrader, address(permitAsset)), DEPOSIT_AMOUNT);
+        assertEq(permitAsset.balanceOf(address(account)), DEPOSIT_AMOUNT);
+        assertEq(permitAsset.balanceOf(permitTrader), MINT_AMOUNT - DEPOSIT_AMOUNT);
+    }
+
+    /// @notice A front-run permit (someone else broadcasts the exact same
+    ///         signature first, consuming the nonce) must not fail the
+    ///         real depositor's own call — `depositWithPermit`'s own doc
+    ///         on why `permit` is wrapped in try/catch. The allowance the
+    ///         front-run already set is enough for `transferFrom` to
+    ///         still succeed.
+    function test_DepositWithPermitSucceedsEvenIfPermitWasFrontRun() public {
+        uint256 permitPk = 0xB0B;
+        address permitTrader = vm.addr(permitPk);
+        MockERC20Permit permitAsset = new MockERC20Permit("Cerdic Test USDC", "tUSDC");
+        permitAsset.mint(permitTrader, MINT_AMOUNT);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                permitTrader,
+                address(account),
+                DEPOSIT_AMOUNT,
+                permitAsset.nonces(permitTrader),
+                deadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", permitAsset.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(permitPk, digest);
+
+        // The "front-run": someone else submits the exact same signed
+        // permit first, straight against the token, before the real
+        // depositor's own `depositWithPermit` transaction lands.
+        permitAsset.permit(permitTrader, address(account), DEPOSIT_AMOUNT, deadline, v, r, s);
+        assertEq(permitAsset.allowance(permitTrader, address(account)), DEPOSIT_AMOUNT);
+
+        // The real depositor's own transaction still succeeds — its own
+        // `permit` call reverts internally (nonce already consumed), the
+        // try/catch swallows that, and `transferFrom` spends the
+        // allowance the front-run already set.
+        vm.prank(permitTrader);
+        account.depositWithPermit(address(permitAsset), DEPOSIT_AMOUNT, deadline, v, r, s);
+
+        assertEq(account.collateralBalanceOf(permitTrader, address(permitAsset)), DEPOSIT_AMOUNT);
     }
 }

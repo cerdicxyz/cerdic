@@ -3,7 +3,7 @@ import type { Market } from './MarketDropdown';
 import { MarketDropdown } from './MarketDropdown';
 import { useFunding } from '../hooks/useFunding';
 import { useOpenInterest } from '../hooks/useOpenInterest';
-import { useOrderBook } from '../hooks/useOrderBook';
+import { useOrderBook, markPriceFromBook } from '../hooks/useOrderBook';
 import { formatMarketPrice } from '../lib/priceScale';
 
 // Minutes:seconds until the top of the next hour — not a fabricated
@@ -60,11 +60,20 @@ export function MarketBar({ market, onSelect }: { market: Market; onSelect: (mar
   const funding = useFunding(market.id);
   const oi = useOpenInterest(market.id);
   const minutesUntilNextHour = useMinutesUntilNextHour();
+  // Bid/ask mid, not the last TRADE print — lastPrice only updates when a
+  // trade actually happens, so a market that's gone quiet (or whose last
+  // print was a stale/bad fill) reads as a frozen, wrong mark price even
+  // while the book itself has moved on. Same fix PositionsPanel.tsx's own
+  // mark price already got; this stat was the one place that fix never
+  // reached, confirmed live: a real position showed a materially
+  // different (correct) mark price here than this stat did, off the same
+  // book, at the same instant.
+  const markTick = markPriceFromBook(liveBook);
 
   return (
     <div className="flex items-center gap-[var(--space-6)] overflow-x-auto border-b border-border-subtle px-[var(--space-4)] py-[var(--space-2)]">
       <MarketDropdown selected={market} onSelect={onSelect} />
-      <Stat label="Mark" value={liveBook.lastPrice !== null ? formatMarketPrice(liveBook.lastPrice, market.id) : '—'} />
+      <Stat label="Mark" value={markTick !== null ? formatMarketPrice(markTick, market.id) : '—'} />
       <Stat
         label="24h"
         value={liveBook.change24hBps !== null ? `${(liveBook.change24hBps / 100).toFixed(2)}%` : '—'}

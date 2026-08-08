@@ -43,14 +43,34 @@ resource "google_compute_instance" "tee_match" {
     enable_integrity_monitoring = true
   }
 
-  metadata = {
-    tee-image-reference         = var.container_image
-    tee-restart-policy          = "Always"
-    tee-container-log-redirect  = "false" # true only on confidential-space-debug for one-off debugging
-    tee-env-CERDIC_KMS_KEY_NAME = google_kms_crypto_key.tee_secrets.id
-    tee-env-CERDIC_STATE_BUCKET = google_storage_bucket.tee_state.name
-    tee-env-CERDIC_STATE_OBJECT = "enclave-secrets.bin"
-  }
+  metadata = merge(
+    {
+      tee-image-reference         = var.container_image
+      tee-restart-policy          = "Always"
+      tee-container-log-redirect  = "false" # true only on confidential-space-debug for one-off debugging
+      tee-env-CERDIC_KMS_KEY_NAME = google_kms_crypto_key.tee_secrets.id
+      tee-env-CERDIC_STATE_BUCKET = google_storage_bucket.tee_state.name
+      tee-env-CERDIC_STATE_OBJECT = "enclave-secrets.bin"
+      tee-env-CERDIC_DB_PATH      = var.db_path
+    },
+    # Every one of these is genuinely optional (main.rs's own configure_*
+    # functions log-and-skip when unset) — only set the ones you have real
+    # values for. Map-shaped config joins to the "k=v,k=v" string
+    # main.rs's own parser expects.
+    var.settlement_rpc_url == "" ? {} : { tee-env-SETTLEMENT_RPC_URL = var.settlement_rpc_url },
+    var.account_contract == "" ? {} : { tee-env-CERDIC_ACCOUNT_CONTRACT = var.account_contract },
+    var.collateral_asset == "" ? {} : { tee-env-CERDIC_COLLATERAL_ASSET = var.collateral_asset },
+    var.risk_monitor_contract == "" ? {} : { tee-env-CERDIC_RISK_MONITOR_CONTRACT = var.risk_monitor_contract },
+    length(var.settlement_contracts) == 0 ? {} : {
+      tee-env-CERDIC_SETTLEMENT_CONTRACTS = join(",", [for k, v in var.settlement_contracts : "${k}=${v}"])
+    },
+    length(var.market_id_overrides) == 0 ? {} : {
+      tee-env-CERDIC_MARKET_ID_OVERRIDES = join(",", [for k, v in var.market_id_overrides : "${k}=${v}"])
+    },
+    length(var.oracle_feeds) == 0 ? {} : {
+      tee-env-CERDIC_ORACLE_FEEDS = join(",", [for k, v in var.oracle_feeds : "${k}=${v}"])
+    },
+  )
 
   lifecycle {
     precondition {

@@ -2,6 +2,7 @@
 pragma solidity 0.8.35;
 import {Script, console} from "forge-std/Script.sol";
 import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {ERC20Permit} from "openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {MockPyth} from "pyth-sdk-solidity/MockPyth.sol";
 
 import {Account as AccountContract} from "../src/clearing/Account.sol";
@@ -20,8 +21,16 @@ import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 ///      CollateralEngine.t.sol's MockStablecoin — a real local stand-in for
 ///      USDC/EURC, not a fabricated balance (every unit is actually minted
 ///      on this chain by this script, no numbers are just asserted).
-contract LocalStablecoin is ERC20 {
-    constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) {}
+/// @dev Also `ERC20Permit` — `Account.depositWithPermit`'s own doc on why:
+///      collapses the old approve-then-deposit two-transaction flow into
+///      one off-chain signature plus one on-chain call. Real, testnet
+///      `TestUSDC.sol` has this too (separate contract, separate deploy
+///      path via `DeployTestUSDC.s.sol`, not used by local_dev) — kept
+///      as two contracts rather than merging them since this one is
+///      also EURC's type (no faucet, no cooldown, admin mints freely),
+///      a genuinely different shape than the self-serve testnet faucet.
+contract LocalStablecoin is ERC20, ERC20Permit {
+    constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) ERC20Permit(name_) {}
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
@@ -123,6 +132,11 @@ contract DeployLocal is Script {
         c.riskMonitor.setAttestationRouter(address(c.attestationRouter));
         c.riskMonitor.registerMarket(t.feedId);
         c.account.setRiskMonitor(address(c.riskMonitor));
+        // Lets the TEE settle realized close/liquidation PnL into real
+        // custody balances via Account.settleRealizedPnl — see that
+        // function's own doc for why this is the bridge SettlementEngine's
+        // sealed collateral never had.
+        c.account.setAttestationRouter(address(c.attestationRouter));
 
         // Previously missing entirely: without this, CollateralEngine.effectiveCollateral
         // reverts BalanceSourceNotSet on every call, which means RiskMonitor.isWithdrawSafe

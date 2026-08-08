@@ -56,6 +56,8 @@ async fn main() {
     tokio::spawn(funding_poll_loop(state.clone()));
     tokio::spawn(oi_poll_loop(state.clone()));
     tokio::spawn(persist_loop(state.clone(), db.clone()));
+    let (pnl_flush_base, pnl_flush_jitter_secs) = configure_realized_pnl_flush_interval();
+    tokio::spawn(realized_pnl_flush_loop(state.clone(), pnl_flush_base, pnl_flush_jitter_secs));
 
     // Permissive by design, not an oversight: every mutating endpoint here
     // is authenticated by a signed payload (decrypt::decrypt_and_authenticate),
@@ -134,6 +136,72 @@ async fn persist_loop(state: Arc<api::AppState>, db: Arc<redb::Database>) {
             tracing::error!(error = %e, "periodic state persist failed");
         }
     }
+}
+
+/// Default base cadence for `realized_pnl_flush_loop`, jittered up to
+/// `DEFAULT_REALIZED_PNL_FLUSH_JITTER_SECS` on top — see that function's
+/// own doc for why a fixed cadence alone wouldn't be enough. Both are
+/// overridable via `CERDIC_PNL_FLUSH_BASE_SECS`/`CERDIC_PNL_FLUSH_JITTER_SECS`
+/// (`configure_realized_pnl_flush_interval`'s own doc): the privacy
+/// benefit of batching comes from however many OTHER real trades land in
+/// the same window, not from the specific number of seconds, so a real
+/// deployment with real concurrent volume can run this tighter than 20-30s
+/// and still batch meaningfully, while a quiet local/testnet run can
+/// widen it back out if it wants a bigger batch. 20s/10s stays the
+/// default because it's a reasonable floor with no real traffic data to
+/// tune against yet, not because faster is unsafe by construction.
+const DEFAULT_REALIZED_PNL_FLUSH_BASE_SECS: u64 = 20;
+const DEFAULT_REALIZED_PNL_FLUSH_JITTER_SECS: u64 = 10;
+
+/// Periodically drains `AppState::drain_realized_pnl` and broadcasts one
+/// `Account.settleRealizedPnlBatch` call for whatever accumulated — the
+/// real-money bridge for closed/liquidated positions' PnL, see
+/// `Account.sol`'s own doc on that function for the full design.
+///
+/// Deliberately NOT per-fill: `AppState::queue_realized_pnl` just nets
+/// deltas into memory, this loop is the only thing that ever actually
+/// broadcasts them, on a jittered (not fixed) interval — a perfectly
+/// regular cadence would still let an observer narrow down which trade
+/// in a short window before each flush produced a given batch entry;
+/// randomizing the exact flush moment removes that extra signal. A quiet
+/// deployment (few concurrent traders) still sometimes flushes a
+/// batch of one — jitter reduces correlation, it can't manufacture
+/// counterparties that don't exist, an honest limit, not a promise this
+/// loop can't keep.
+async fn realized_pnl_flush_loop(state: Arc<api::AppState>, base: Duration, jitter_secs: u64) {
+    use rand::Rng;
+    loop {
+        let jitter = if jitter_secs == 0 { 0 } else { rand::thread_rng().gen_range(0..=jitter_secs) };
+        tokio::time::sleep(base + Duration::from_secs(jitter)).await;
+
+        let items = state.drain_realized_pnl();
+        if items.is_empty() {
+            continue;
+        }
+        let contract = state.account_contract();
+        let batch_size = items.len();
+        cerdic_tee_matcher::settle::settle_realized_pnl_batch(state.settlement_signer(), &items, contract)
+            .await;
+        tracing::info!(batch_size, "realized PnL batch flushed");
+    }
+}
+
+/// Reads `CERDIC_PNL_FLUSH_BASE_SECS`/`CERDIC_PNL_FLUSH_JITTER_SECS`,
+/// falling back to `DEFAULT_REALIZED_PNL_FLUSH_BASE_SECS`/
+/// `DEFAULT_REALIZED_PNL_FLUSH_JITTER_SECS` for either that's unset or
+/// fails to parse — same "malformed degrades to the safe default, never
+/// fatal" posture every other env-driven config in this file has.
+fn configure_realized_pnl_flush_interval() -> (Duration, u64) {
+    let base_secs = std::env::var("CERDIC_PNL_FLUSH_BASE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REALIZED_PNL_FLUSH_BASE_SECS);
+    let jitter_secs = std::env::var("CERDIC_PNL_FLUSH_JITTER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REALIZED_PNL_FLUSH_JITTER_SECS);
+    tracing::info!(base_secs, jitter_secs, "realized PnL flush cadence configured");
+    (Duration::from_secs(base_secs), jitter_secs)
 }
 
 /// Reads `CERDIC_ORACLE_FEEDS`, a comma-separated list of

@@ -27,10 +27,15 @@ import {ProtocolConstants} from "../src/lib/ProtocolConstants.sol";
 ///         that's how the deployer/admin key mismatch below was actually caught.
 ///         Required env vars: PRIVATE_KEY (deployer key, also becomes every
 ///         contract's admin — see the comment in run()), ARC_USDC_ADDRESS,
-///         ARC_EURC_ADDRESS, ARC_PYTH_CONTRACT, EURC_USDC_PYTH_FEED_ID. These are
-///         real, network-specific values this script does not fabricate — unset,
-///         the run reverts with a clear error instead of silently deploying
-///         against zero addresses.
+///         ARC_PYTH_CONTRACT, EURC_USDC_PYTH_FEED_ID. These are real,
+///         network-specific values this script does not fabricate — unset, the
+///         run reverts with a clear error instead of silently deploying against
+///         zero addresses.
+///         No `ARC_EURC_ADDRESS`: this is a cash-settled perp — EURC/USDC is the
+///         market's price PAIR (what `FxPerpMarket` quotes), not a token that
+///         ever moves. Collateral is USDC only, same as every other market this
+///         kernel runs; registering a real EURC token as a second accepted
+///         collateral asset was scope this deploy never actually needed.
 contract Deploy is Script {
     function run() external {
         // The deploying key doubles as `admin` on every contract below — every
@@ -43,7 +48,6 @@ contract Deploy is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address admin = vm.addr(deployerKey);
         address usdcToken = vm.envAddress("ARC_USDC_ADDRESS");
-        address eurcToken = vm.envAddress("ARC_EURC_ADDRESS");
         address pythContract = vm.envAddress("ARC_PYTH_CONTRACT");
         bytes32 eurcUsdcFeedId = vm.envBytes32("EURC_USDC_PYTH_FEED_ID");
 
@@ -99,7 +103,6 @@ contract Deploy is Script {
 
         ProtocolConstants constants = new ProtocolConstants();
         collateralEngine.registerAsset(usdcToken, 1, uint16(constants.t1HaircutBps()));
-        collateralEngine.registerAsset(eurcToken, 1, uint16(constants.t1HaircutBps()));
 
         vm.stopBroadcast();
 
