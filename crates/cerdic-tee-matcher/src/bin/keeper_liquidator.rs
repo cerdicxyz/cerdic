@@ -46,6 +46,15 @@ use std::{
 const SEALED_POSITION_TOUCHED_TOPIC0: &str =
     "0x1f16c731e33d2533304f572c425ef0fd6d5f718a330bffdf684a11e89d5b5734";
 
+/// The narrowest known `eth_getLogs` block-range cap among providers this
+/// keeper has actually hit in practice (a free-tier Alchemy Arc testnet
+/// endpoint, confirmed live: "up to a 10 block range"). Conservative on
+/// purpose — a provider with a wider real cap just means this keeper
+/// catches up a little slower than it strictly needs to, not an error;
+/// a provider with a NARROWER cap than this would still fail, same as
+/// before this constant existed.
+const MAX_GET_LOGS_BLOCK_RANGE: u64 = 10;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -170,12 +179,29 @@ where
         return Ok((Vec::new(), from_block));
     }
 
+    // Real, confirmed limit this hit against a free-tier Alchemy Arc
+    // testnet RPC: `eth_getLogs` rejects any request spanning more than
+    // 10 blocks outright ("Under the Free tier plan, you can make
+    // eth_getLogs requests with up to a 10 block range"). A keeper that
+    // fell behind (a slow poll cycle, a restart after the chain moved on)
+    // would ask for the WHOLE gap in one call and fail forever, never
+    // catching up. Capping each call's own window and returning that
+    // capped `to_block` (not `latest`) as the new `last_scanned` lets the
+    // next poll pick up right after this one, catching up gradually
+    // instead of erroring on every single tick.
+    // `from_block..=to_block` is an INCLUSIVE range: capping to
+    // `from_block + MAX_GET_LOGS_BLOCK_RANGE` would actually span
+    // `MAX_GET_LOGS_BLOCK_RANGE + 1` blocks (confirmed live: the exact
+    // off-by-one this constant exists to avoid, still rejected as an
+    // 11-block request against the provider's real 10-block cap).
+    let to_block = latest.min(from_block.saturating_add(MAX_GET_LOGS_BLOCK_RANGE - 1));
+
     let topic0: FixedBytes<32> = SEALED_POSITION_TOUCHED_TOPIC0.parse().expect("valid constant topic0");
     let filter = Filter::new()
         .address(contracts.iter().copied().collect::<Vec<_>>())
         .event_signature(topic0)
         .from_block(from_block)
-        .to_block(latest);
+        .to_block(to_block);
 
     let logs = provider.get_logs(&filter).await.map_err(|e| format!("get_logs failed: {e}"))?;
     let mut touches = Vec::with_capacity(logs.len());
@@ -194,7 +220,7 @@ where
         // in practice, keccak256 preimage resistance) a collision -- not
         // an error, just outside this keeper's scope.
     }
-    Ok((touches, latest + 1))
+    Ok((touches, to_block + 1))
 }
 
 /// Returns `Ok(Some(tx_hashes))` if a liquidation was executed,

@@ -36,9 +36,8 @@ use crypto_box::PublicKey;
 use std::process::Command;
 use std::str::FromStr;
 
-const SERVER: &str = "http://localhost:8787";
-
 fn main() {
+    let server = std::env::var("DEMO_CLIENT_SERVER").unwrap_or_else(|_| "http://localhost:8787".to_string());
     let mut args = std::env::args().skip(1);
     let side = match args.next().as_deref() {
         Some("sell") => OrderSide::Sell,
@@ -54,8 +53,8 @@ fn main() {
         _ => TimeInForce::GoodTilCancel,
     };
 
-    println!("Fetching enclave public key from {SERVER}/pubkey ...");
-    let pubkey_json = curl_get(&format!("{SERVER}/pubkey"));
+    println!("Fetching enclave public key from {server}/pubkey ...");
+    let pubkey_json = curl_get(&format!("{server}/pubkey"));
     let pubkey_b64 =
         extract_json_string(&pubkey_json, "pubkey_b64").expect("server response did not contain pubkey_b64");
     let pubkey_bytes: [u8; 32] =
@@ -90,7 +89,7 @@ fn main() {
         side = order.side,
         market = order.market_id
     );
-    let response = curl_post_json(&format!("{SERVER}/order"), &envelope_json);
+    let response = curl_post_json(&format!("{server}/order"), &envelope_json);
     println!("Server response: {response}");
 }
 

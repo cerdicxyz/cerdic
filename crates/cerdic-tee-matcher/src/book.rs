@@ -704,6 +704,19 @@ impl OrderBook {
         }
     }
 
+    /// The owner of a still-live resting order, `None` if it was never
+    /// live or has already been cancelled/fully filled/expired. Read-only
+    /// counterpart to `cancel` — a caller (the `/cancel` HTTP handler)
+    /// needs this to verify ownership BEFORE actually cancelling, since
+    /// `cancel` itself has no notion of "who's asking."
+    pub fn owner_of(&self, id: OrderId) -> Option<OwnerId> {
+        let idx = id as usize;
+        if idx >= self.arena.len() {
+            return None;
+        }
+        self.arena[idx].as_ref().map(|node| node.owner)
+    }
+
     /// Cancels a live resting order in O(1). Returns its remaining
     /// quantity and price if it was still live.
     pub fn cancel(&mut self, id: OrderId) -> Option<(Tick, Qty)> {

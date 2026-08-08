@@ -19,3 +19,4 @@ app/vite.config.js
 *.out
 *.toc
 __pycache__/
+.vercel

@@ -192,6 +192,17 @@ impl BackstopState {
         }
     }
 
+    /// The center price `quote` builds its bid/ask off of — real trades
+    /// AND the oracle poll both feed `record_price` (this module's own
+    /// doc), so this stays a fair, book-independent reference even when
+    /// the real resting order book has been walked thin or lopsided by
+    /// one outsized trade. Meant for display (a frontend's "mark price"),
+    /// not matching: `quote`/`quote_and_check` remain the only price this
+    /// module actually trades against.
+    pub fn reference_price(&self, cfg: &BackstopConfig) -> Option<Tick> {
+        self.trailing_mean(cfg.quote_twap_window)
+    }
+
     /// The maker's current quote price for `side` (the TAKER's side: a
     /// taker `Long` order lifts the maker's ask, `Short` hits the bid).
     /// `None` if no price has ever been recorded (a market with zero

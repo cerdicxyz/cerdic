@@ -9,40 +9,8 @@ import { recordFill, useLocalPositions } from '../hooks/useLocalPositions';
 import { useDepositedCollateral } from '../hooks/useDepositedCollateral';
 import type { Market } from './MarketDropdown';
 import { formatMarketPrice, tickToPrice } from '../lib/priceScale';
-import { toast, type ToastAction } from '../toast/toast-context';
-
-// Turns a raw thrown error's `.message` into what a trader actually
-// needs to read, not the wire-format string useSubmitOrder.ts's
-// `order submission failed: ${status} ${body}` produces (the matcher's
-// real error Display text, forwarded as-is — see api.rs's own
-// IntoResponse impl on why that's honest, not a bug, just not written
-// for a toast). Known shapes get a real title + a plain-English
-// description (still the real numbers, just not "order submission
-// failed: 402" boilerplate in front of them); anything unrecognized
-// falls back to the raw message rather than hiding it.
-function describeOrderError(
-  message: string,
-  onDeposit: () => void,
-): { title: string; description: string; action?: ToastAction } {
-  const collateral = message.match(/insufficient deposited collateral: need \$([\d.]+), have \$([\d.]+)/);
-  if (collateral) {
-    const [, need, have] = collateral;
-    return {
-      title: 'Not enough collateral',
-      description:
-        have === '0.00'
-          ? `This order needs $${need} deposited, and you haven't deposited anything yet.`
-          : `This order needs $${need} deposited — you have $${have}.`,
-      action: { label: 'Deposit', onClick: onDeposit },
-    };
-  }
-  // Strips useSubmitOrder.ts's own "order submission failed: NNN "
-  // prefix for every other real backend error — the status code is
-  // useful in a log, not in a toast a trader has to read in half a
-  // second.
-  const stripped = message.match(/^order submission failed: \d+ (.+)$/);
-  return { title: 'Order failed', description: stripped ? stripped[1] : message };
-}
+import { toast } from '../toast/toast-context';
+import { describeError } from '../lib/describeError';
 
 // Order ticket, laid out like Ostium's compact single-column form (buy/sell
 // rate row, type + leverage on one line, one amount field, collapsible
@@ -56,10 +24,10 @@ function describeOrderError(
 // - Leverage caps at the selected market's own ceiling
 //   (SettlementEngine.LEVERAGE_CEILING — genuinely per-market now, 50x for
 //   FX majors, 30x for everything else, see MarketDropdown.tsx's MARKETS).
-//   The matcher itself doesn't enforce or validate leverage (a deliberate
-//   simplicity choice — it forwards whatever a signed order carries
-//   straight into SealedParams), so this cap is purely what the contract
-//   side will actually accept.
+//   The matcher itself enforces this too now: `required_margin` computes
+//   real margin as notional/leverage, matching this exact figure — a
+//   trader can't just pick a lower leverage in this slider and have the
+//   real, settled requirement stay the old flat-rate minimum.
 // - "Exit Strategy" is Ostium's name for the same thing our SealedParams
 //   already models: take_profit/stop_loss.
 // - Margin Requirement is computed live from the trader's own Price ×
@@ -105,7 +73,9 @@ export function TradePanel({ market }: { market: Market }) {
   const [takeProfit, setTakeProfit] = useState('');
   const [stopLoss, setStopLoss] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState<{ kind: 'ok' | 'error'; message: string } | null>(null);
+  // Success only — errors/warnings surface exclusively through the toast
+  // (see `describeError`), not a second, previously-raw inline copy here.
+  const [submitStatus, setSubmitStatus] = useState<string | null>(null);
   const [depositOpen, setDepositOpen] = useState(false);
   const positions = useLocalPositions();
   const deposited = useDepositedCollateral(wallet.status === 'connected' ? wallet.address : undefined);
@@ -219,17 +189,20 @@ export function TradePanel({ market }: { market: Market }) {
       );
 
       if (result.status === 'rejected') {
-        setSubmitStatus({ kind: 'error', message: result.reason });
+        const { title, description, action } = describeError(new Error(result.reason), {
+          onDeposit: () => setDepositOpen(true),
+        });
         toast.update(progressId, {
           type: 'error',
-          title: 'Order rejected',
-          description: result.reason,
+          title,
+          description,
           progress: undefined,
-          duration: 6000,
+          duration: action ? 10000 : 6000,
+          action,
         });
       } else if (result.status === 'filled') {
         const message = `Filled (${result.fills} fill${result.fills === 1 ? '' : 's'})`;
-        setSubmitStatus({ kind: 'ok', message });
+        setSubmitStatus(message);
         if (wallet.address) {
           recordFill(wallet.address, market.id, side, qty, tickToPrice(tick, market.id), leverage);
         }
@@ -272,7 +245,7 @@ export function TradePanel({ market }: { market: Market }) {
         }
       } else {
         const message = `Resting (order #${result.order_id})`;
-        setSubmitStatus({ kind: 'ok', message });
+        setSubmitStatus(message);
         toast.update(progressId, {
           type: 'info',
           title: 'Order resting',
@@ -282,9 +255,7 @@ export function TradePanel({ market }: { market: Market }) {
         });
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'submission failed';
-      setSubmitStatus({ kind: 'error', message });
-      const { title, description, action } = describeOrderError(message, () => setDepositOpen(true));
+      const { title, description, action } = describeError(error, { onDeposit: () => setDepositOpen(true) });
       toast.update(progressId, {
         type: 'error',
         title,
@@ -474,7 +445,7 @@ export function TradePanel({ market }: { market: Market }) {
             disabled={!canSubmit}
             title={
               orderType === 'offer'
-                ? 'Offer submission (POST /offer) is a separate, not-yet-wired flow'
+                ? 'Resting offers are coming soon — use Market or Limit for now.'
                 : undefined
             }
             className={`rounded-md px-[var(--space-4)] py-[var(--space-3)] text-sm font-semibold transition-opacity duration-150 ${
@@ -489,13 +460,9 @@ export function TradePanel({ market }: { market: Market }) {
                     : 'cursor-not-allowed bg-short/10 text-short opacity-50'
             }`}
           >
-            {submitting ? 'Submitting…' : orderType === 'offer' ? 'Offers not wired up yet' : `${side === 'long' ? 'Buy' : 'Sell'} ${market.label}`}
+            {submitting ? 'Submitting…' : orderType === 'offer' ? 'Coming soon' : `${side === 'long' ? 'Buy' : 'Sell'} ${market.label}`}
           </button>
-          {submitStatus && (
-            <p className={`text-xs ${submitStatus.kind === 'ok' ? 'text-long' : 'text-short'}`}>
-              {submitStatus.message}
-            </p>
-          )}
+          {submitStatus && <p className="text-xs text-long">{submitStatus}</p>}
         </div>
       ) : (
         <ConnectWallet variant="panel" />
@@ -519,8 +486,13 @@ export function TradePanel({ market }: { market: Market }) {
           <span className="text-text-secondary">Portfolio (cross)</span>
         </div>
         <div className="flex items-center justify-between">
-          <span className="text-text-tertiary">Privacy</span>
-          <span className="font-medium text-privacy">Private (shielded)</span>
+          <span
+            className="text-text-tertiary underline decoration-dotted decoration-text-quaternary underline-offset-2"
+            title="Side, size, and price are sealed on-chain and never touch this order's calldata. Not yet fully private end to end: docs/security-audit-tee-contracts.md tracks the remaining gaps (a public per-position collateral trajectory, an unauthenticated matcher API tape, and attestation that doesn't yet bind the encryption key)."
+          >
+            Privacy
+          </span>
+          <span className="font-medium text-privacy">Sealed (partial)</span>
         </div>
       </div>
 

@@ -33,5 +33,21 @@ COPY --from=builder /tmp/cerdic-tee-matcher /usr/local/bin/cerdic-tee-matcher
 # `infra/gcp/confidential-space/workload-metadata.yaml`. Outside
 # Confidential Space (local `docker run`) they're simply unset and
 # `kms::recover_or_generate` falls back to ephemeral secrets.
+#
+# Real, confirmed gap this label fixes: the hardened `confidential-space`
+# image family rejects EVERY `tee-env-*` metadata override by default
+# ("env var ... is not allowed to be overridden on this image; allowed
+# envs to be overridden: []", confirmed live trying to launch this exact
+# image with no label at all) — a genuine security feature, not a bug: the
+# MEASURED IMAGE decides what an operator's VM metadata is allowed to
+# inject, not the other way around, so a compromised/malicious VM operator
+# can't silently redirect a workload's config. This allow-list is
+# deliberately just the deploy-time config this binary's own main.rs
+# already treats as ordinary, non-secret operator input (RPC URL, contract
+# addresses, KMS/GCS coordinates) — never a workload behavior flag, and
+# never anything that could substitute for the real secrets KMS/GCS
+# themselves gate.
+LABEL "tee.launch_policy.allow_env_override"="CERDIC_KMS_KEY_NAME,CERDIC_STATE_BUCKET,CERDIC_STATE_OBJECT,CERDIC_DB_PATH,SETTLEMENT_RPC_URL,CERDIC_ACCOUNT_CONTRACT,CERDIC_COLLATERAL_ASSET,CERDIC_RISK_MONITOR_CONTRACT,CERDIC_SETTLEMENT_CONTRACTS,CERDIC_MARKET_ID_OVERRIDES,CERDIC_ORACLE_FEEDS,CERDIC_LOG,CERDIC_HTTP_PORT"
+
 EXPOSE 8787
 CMD ["cerdic-tee-matcher"]

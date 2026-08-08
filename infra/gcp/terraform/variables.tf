@@ -76,3 +76,56 @@ variable "container_image" {
   type        = string
   default     = ""
 }
+
+# --- Trading config, all optional (empty default = matcher behaves exactly
+#     like an unconfigured local dev instance, see main.rs's own configure_*
+#     doc for each). Fill these in once Deploy.s.sol has actually run against
+#     Arc and printed real contract addresses — see docs/arc-testnet-deploy.md.
+
+variable "settlement_rpc_url" {
+  description = "Arc testnet RPC URL. Required for any settlement broadcasting, funding checkpoints, or margin attestation to happen at all."
+  type        = string
+  default     = ""
+}
+
+variable "account_contract" {
+  description = "Account.sol address from Deploy.s.sol's output."
+  type        = string
+  default     = ""
+}
+
+variable "collateral_asset" {
+  description = "ARC_USDC_ADDRESS — the one collateral asset the pre-trade gate checks against."
+  type        = string
+  default     = ""
+}
+
+variable "risk_monitor_contract" {
+  description = "RiskMonitor.sol address from Deploy.s.sol's output."
+  type        = string
+  default     = ""
+}
+
+variable "settlement_contracts" {
+  description = "marketId => SettlementEngine/FxPerpMarket contract address, e.g. { \"EURC/USDC\" = \"0x...\" }."
+  type        = map(string)
+  default     = {}
+}
+
+variable "market_id_overrides" {
+  description = "marketId => real on-chain bytes32 id (Pyth feed id) — required on a real deployment, see api::AppState::onchain_market_id's own doc for why. Same keys as settlement_contracts."
+  type        = map(string)
+  default     = {}
+}
+
+variable "oracle_feeds" {
+  description = "marketId => Pyth feed id for this process's own price fetching (oracle.rs) — same values as market_id_overrides today, kept as a separate map since they're conceptually different config."
+  type        = map(string)
+  default     = {}
+}
+
+variable "db_path" {
+  description = "Where the matcher persists candle history, nonces, etc. across a process restart (persistence.rs). Boot-disk-local by default (does NOT survive a VM replace/redeploy, only a process restart within the same VM) — see this repo's docs/arc-testnet-deploy.md for the tradeoff; a real persistent-disk mount isn't wired here yet."
+  type        = string
+  default     = "/tmp/cerdic-state.redb"
+}

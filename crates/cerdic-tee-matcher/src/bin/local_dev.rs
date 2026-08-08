@@ -95,6 +95,46 @@ sol! {
 }
 
 const ANVIL_RPC: &str = "http://127.0.0.1:8545";
+// A fixed, deterministic `CERDIC_DEV_SECRETS_SEED` (`kms.rs`'s own doc on
+// why this env var exists at all) rather than leaving the matcher on its
+// ephemeral-random default. Real, confirmed bug this fixes: restarting
+// just the matcher binary (not a full `up`, e.g. to deploy a Rust-only
+// fix against an already-live chain, exactly what `CERDIC_DB_PATH`'s own
+// doc above says this setup is for) used to mint a brand new random
+// sealing key every time, silently breaking decryption of every
+// already-sealed position from before the restart — every market's
+// positions, both real traders' and the market makers' own inventory,
+// went "AEAD open failed: wrong key or corrupted blob" and got skipped
+// as if they no longer existed. That corrupted close/margin math (a
+// close miscounted as a fresh open, since the existing position vanished
+// from the matcher's view) and market maker inventory tracking (skewed
+// quoting from a maker that thinks its own position reset to flat)
+// simultaneously, confirmed live across EURC/USDC, AUD/USD, GBP/USD,
+// HYPE/USD, USD/JPY, and XAU/USD after one such restart. A fixed seed
+// means the sealing key — and therefore every previously-sealed
+// position — survives any matcher-only restart, exactly the "ordinary
+// local multi-session testing" case `CERDIC_DEV_SECRETS_SEED` was built
+// for. Never valid outside local dev (kms.rs's own doc), and this value
+// is not a secret worth protecting: real, both are true and unrelated.
+const DEV_SECRETS_SEED: &str = "0x1c4e3a8f295d6b71092ea4c8f0d3b657a1928e4dcf30b67158a9d2c4e6f1a3b7";
+
+// Real, confirmed bug this fixes: `BackstopConfig::default().notional_cap`
+// is `Qty::MAX` (`backstop.rs`'s own doc: "unset... keeps the backstop's
+// own unbounded default"), and local_dev never overrode it, so the
+// synthetic backstop counterparty had literally no limit on how much of
+// any single order it would silently absorb. A trader with enough real
+// deposited collateral could submit (and did, live: a 100,000-unit
+// EURC/USDC market order) an order dwarfing the real resting book — each
+// maker wave's own ladder here totals roughly `MM_QUOTE_SIZE * ladder
+// levels` per side (200*14 + 150*12 = 4,600) — and have nearly all of it
+// filled by the backstop at a fair TWAP price with zero real price
+// impact, not the "did not fill, skipping" a real thin book should have
+// produced. 2,000 (well under one side's real ladder total, above any
+// ordinary single trade) caps how much of one order the backstop alone
+// will ever cover; the rest is real resting depth or goes unfilled
+// (`TimeInForce::ImmediateOrCancel`'s own semantics), same as any order
+// genuinely too large for the book that exists.
+const BACKSTOP_NOTIONAL_CAP: &str = "2000";
 const MATCHER_URL: &str = "http://127.0.0.1:8787";
 const MARKETS: [&str; 9] = [
     "EURC/USDC",
@@ -366,6 +406,8 @@ async fn cmd_up() {
         .env("CERDIC_RISK_MONITOR_CONTRACT", &risk_monitor)
         .env("CERDIC_ENABLE_DEBUG_SEED", "1")
         .env("CERDIC_LOG", "info")
+        .env("CERDIC_DEV_SECRETS_SEED", DEV_SECRETS_SEED)
+        .env("CERDIC_BACKSTOP_NOTIONAL_CAP", BACKSTOP_NOTIONAL_CAP)
         // Same state dir every other local_dev artifact (logs, pids) lives
         // in — a real file, survives this one matcher process restarting.
         // NOT survived by a fresh `local_dev up`, which always starts
@@ -389,7 +431,7 @@ async fn cmd_up() {
     let pubkey_resp =
         wait_pubkey(MATCHER_URL, 180).await.unwrap_or_else(|| die("matcher never came up, see matcher.log"));
     log(format!(
-        "matcher settlement signer: {} (ephemeral — regenerated every restart, re-run `local_dev up` rather than hand-funding)",
+        "matcher settlement signer: {} (stable across matcher-only restarts now, via DEV_SECRETS_SEED — only a full `local_dev up` mints a new one)",
         pubkey_resp.settlement_address
     ));
 

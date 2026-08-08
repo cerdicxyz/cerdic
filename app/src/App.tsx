@@ -8,6 +8,7 @@ import { TradePage } from './pages/TradePage';
 import { AgentsPage } from './pages/AgentsPage';
 import { LandingPage } from './pages/LandingPage';
 import { PortfolioModal } from './components/PortfolioModal';
+import { OnboardingModal } from './components/OnboardingModal';
 import { ToastProvider } from './toast/toast-context';
 import { ToastContainer } from './toast/toast-container';
 import { WalletProvider } from './wallet/wallet-context';
@@ -44,6 +45,7 @@ function AppShell({ portfolioOpen, setPortfolioOpen }: { portfolioOpen: boolean;
             </Routes>
           </div>
           <PortfolioModal open={portfolioOpen} onClose={() => setPortfolioOpen(false)} />
+          <OnboardingModal />
         </div>
       </WalletProvider>
     </ToastProvider>

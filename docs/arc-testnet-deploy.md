@@ -103,6 +103,27 @@ trading path at all today.
 
 ## Deploy sequence
 
+### 0. Test collateral token
+
+This deployment deliberately does NOT use Arc's real Circle-issued USDC as
+the collateral asset (Arc's real USDC is the network's native gas currency
+instead, unrelated to CollateralEngine's registered assets) — it uses a
+self-deployed, self-serve-mintable `TestUSDC.sol`
+(`packages/contracts/src/testnet/TestUSDC.sol`) instead, so onboarding a new
+trader never depends on sourcing real testnet USDC from anywhere.
+
+```bash
+cd packages/contracts
+PRIVATE_KEY=<deployer key, becomes admin/bulk-minter>
+forge script script/DeployTestUSDC.s.sol:DeployTestUSDC --rpc-url <arc-testnet-rpc> --broadcast
+```
+
+Prints the `TestUSDC` address — that's what `ARC_USDC_ADDRESS` below means
+for this deployment. New traders get their own starting balance via the
+contract's own `claimFaucet()` (10,000 tUSDC, 24h cooldown, called directly
+from their wallet — wired into the frontend's AccountPanel as "Get test
+USDC"); `adminMint(to, amount)` bulk-seeds market makers/backstop liquidity.
+
 ### 1. Contracts
 
 Required env vars for `Deploy.s.sol` (real, external, Arc-specific — this
@@ -110,11 +131,28 @@ script does not fabricate them, and neither can this doc):
 
 ```bash
 PRIVATE_KEY=<deployer key, becomes admin on every contract>
-ARC_USDC_ADDRESS=<real USDC (or equivalent) token address on Arc>
-ARC_EURC_ADDRESS=<real EURC (or equivalent) token address on Arc>
-ARC_PYTH_CONTRACT=<real Pyth receiver contract address on Arc>
-EURC_USDC_PYTH_FEED_ID=<real Pyth feed id for EUR/USD on Arc>
+ARC_USDC_ADDRESS=<TestUSDC address from step 0>
+ARC_PYTH_CONTRACT=0x2880aB155794e7179c9eE2e38200202908C17B43
+EURC_USDC_PYTH_FEED_ID=0xa995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b
 ```
+
+`ARC_PYTH_CONTRACT` above is Pyth's own documented Arc Testnet receiver
+address (`docs.pyth.network/price-feeds/core/contract-addresses/evm`,
+"Arc Network Testnet" row) — confirmed live, not just copied: `eth_getCode`
+against Arc's own RPC returns real deployed bytecode at this address (an
+EIP-1967-style proxy pattern, consistent with how Pyth deploys), not an
+empty account.
+
+No `ARC_EURC_ADDRESS`: this is cash-settled — EURC/USDC is the market's price
+pair, not a token that ever moves. Collateral is USDC only.
+
+`EURC_USDC_PYTH_FEED_ID` is not actually chain-specific and was never a real
+unknown — Pyth feed IDs are one global identifier per price series (the value
+above is confirmed live against Hermes' own public registry,
+`https://hermes.pyth.network/v2/price_feeds?query=EUR/USD&asset_type=fx`),
+identical across every chain a Pyth receiver reads it on. Only
+`ARC_PYTH_CONTRACT` (the receiver contract's own deployed address) is
+genuinely Arc-specific and still needs a real lookup.
 
 Dry-run first (no `--broadcast`), exactly per the script's own doc:
 
@@ -224,16 +262,35 @@ cargo run --release --bin keeper_liquidator
 `keeper-fx-rate.sh` for funding, per `docs/keepers.md`'s own section —
 unaffected by the marketId fix, it already used real feed ids directly.
 
-### 5. Set discovery bounds (weekend/closed-market FX gap protection)
+### 5. Set discovery bounds — REQUIRED, not just weekend gap protection
 
-Per `docs/keepers.md`'s own note — do this before real trading starts, not
-after:
+`docs/keepers.md` frames this as weekend/closed-market FX gap protection,
+which undersold it: confirmed live deploying to Arc — `OracleHub.markPrice`
+(without bounds enabled) needs BOTH a live Pyth read AND a live Chainlink
+read to succeed (`_fetchPrices`), and `Deploy.s.sol` never wires a Chainlink
+FX aggregator (there is no real Arc-deployed Chainlink EUR/USD feed this
+session had access to). Left unset, `markPrice` reverts `AggregatorNotSet`
+on every single call — not degraded, completely unusable, which means every
+funding checkpoint and every margin read through `RiskMonitor` breaks too.
+Enabling discovery bounds is what makes `markPrice` fall back to the
+reference price instead of reverting when the Chainlink leg is missing
+(`_tryFetchPrices`'s non-reverting `ok=false` path) — do this immediately
+after step 1, before starting the matcher, not as a later hardening pass:
 
 ```bash
 cast send <OracleHub address> \
   "setDiscoveryBounds(bytes32,bool,uint256,uint16,uint8)" \
   <EURC_USDC_PYTH_FEED_ID> true <initial reference price, 1e18-scaled> 500 2 \
   --rpc-url <arc-testnet-rpc> --private-key <admin key>
+```
+
+Get a real current reference price from Hermes directly, don't guess it:
+`curl "https://hermes.pyth.network/v2/updates/price/latest?ids[]=<feed_id>&parsed=true"`,
+then `price * 10^expo * 1e18`. Verify it actually worked before moving on —
+`markPrice` should return a real, non-reverting value:
+
+```bash
+cast call <OracleHub address> "markPrice(bytes32)(uint256)" <EURC_USDC_PYTH_FEED_ID> --rpc-url <arc-testnet-rpc>
 ```
 
 ### 6. Frontend env vars (`app/.env`)

@@ -73,13 +73,6 @@ const BID_HEAT_HIGH: [number, number, number] = [80, 217, 155];
 const ASK_HEAT_EXTREME: [number, number, number] = [255, 110, 130];
 const BID_HEAT_EXTREME: [number, number, number] = [150, 255, 210];
 
-// Size at which a row's heat maxes out against HEAT_HIGH — same scale
-// the chip already used, now driving the bar fill too. Sizes beyond
-// this ramp on toward HEAT_EXTREME instead of just staying capped at
-// HEAT_HIGH (see colorForSize).
-const HEAT_MAX_SIZE = 20;
-// Size at which a row reaches the fully saturated extreme color.
-const HEAT_EXTREME_SIZE = 40;
 const BAR_FILL_ALPHA = 0.75;
 // Deliberately faint — this layer's job is to build up gradually where
 // many rows' cumulative rects overlap, not to read as a solid color on
@@ -97,20 +90,14 @@ function lerpColor(low: [number, number, number], high: [number, number, number]
   return rgba([r, g, b], alpha);
 }
 
-// Two-stage: low→high up to HEAT_MAX_SIZE, then high→extreme up to
-// HEAT_EXTREME_SIZE — one continuous ramp across three color stops
-// instead of capping flat at `high` the way a single lerp would.
-function colorForSize(
-  low: [number, number, number],
-  high: [number, number, number],
-  extreme: [number, number, number],
-  size: number,
-  alpha: number,
-) {
-  if (size <= HEAT_MAX_SIZE) return lerpColor(low, high, size / HEAT_MAX_SIZE, alpha);
-  const t = Math.min(1, (size - HEAT_MAX_SIZE) / (HEAT_EXTREME_SIZE - HEAT_MAX_SIZE));
-  return lerpColor(high, extreme, t, alpha);
-}
+// Two-stage: low→high up to a side's own heatMaxSize, then high→extreme
+// up to heatExtremeSize — one continuous ramp across three color stops
+// instead of capping flat at `high` the way a single lerp would. Both
+// thresholds are computed per `drawSide` call, from that side's own real
+// current `maxSize` (see `colorFor`, defined inside `drawSide` below) —
+// deliberately NOT fixed absolute sizes, see that function's own doc for
+// the real, confirmed bug fixed sizes caused (every row on a
+// normal-volume book maxing out to the same flat extreme color).
 
 const COLORS = {
   // Same hex as --color-short / PriceChart.tsx's downColor and upColor —
@@ -399,6 +386,25 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
     ) {
       if (!ctx || levels.length === 0) return;
 
+      // Real, confirmed bug: HEAT_MAX_SIZE/HEAT_EXTREME_SIZE (20/40) were
+      // fixed absolute sizes, tuned for a scale this book doesn't
+      // actually have — a real live book's typical row size (market
+      // makers quoting 60-200+ units per level) clears both thresholds
+      // on nearly every row, so colorForSize returned the SAME maxed-out
+      // extreme color for almost the whole ladder: a flat, undifferentiated
+      // solid strip instead of a real per-row heat signal. Bar WIDTH
+      // already scales against this side's own real `maxSize` (see
+      // `xForSize` below); color now uses the same real scale instead of
+      // a second, disconnected fixed one, so a genuinely huge row still
+      // reads as genuinely different from an average one, on any book.
+      const heatMaxSize = Math.max(1e-9, maxSize * 0.5);
+      const heatExtremeSize = Math.max(heatMaxSize + 1e-9, maxSize);
+      const colorFor = (size: number, alpha: number) => {
+        if (size <= heatMaxSize) return lerpColor(heatLow, heatHigh, size / heatMaxSize, alpha);
+        const t = Math.min(1, (size - heatMaxSize) / (heatExtremeSize - heatMaxSize));
+        return lerpColor(heatHigh, heatExtreme, t, alpha);
+      };
+
       // The range of rows between the spread and the hovered row, i.e.
       // "how much you'd sweep through to fill at the hovered level" —
       // asks are drawn farthest-first (spread-adjacent = last index), bids
@@ -443,7 +449,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
           // shared gradient (that was the earlier, wrong approach).
           const hazeGradient = ctx.createLinearGradient(CONTENT_START, 0, hazeX, 0);
           hazeGradient.addColorStop(0, rgba(heatLow, HAZE_ALPHA * 0.5));
-          hazeGradient.addColorStop(1, colorForSize(heatLow, heatHigh, heatExtreme, level.size, HAZE_ALPHA));
+          hazeGradient.addColorStop(1, colorFor(level.size, HAZE_ALPHA));
           ctx.fillStyle = hazeGradient;
           ctx.fillRect(CONTENT_START, y, hazeWidth, ROW_HEIGHT);
         }
@@ -474,7 +480,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         if (fillWidth > 0) {
           const barGradient = ctx.createLinearGradient(CONTENT_START, 0, fillX, 0);
           barGradient.addColorStop(0, rgba(heatLow, BAR_FILL_ALPHA * 0.5));
-          barGradient.addColorStop(1, colorForSize(heatLow, heatHigh, heatExtreme, level.size, BAR_FILL_ALPHA));
+          barGradient.addColorStop(1, colorFor(level.size, BAR_FILL_ALPHA));
           ctx.fillStyle = barGradient;
           ctx.fillRect(CONTENT_START, y, fillWidth, ROW_HEIGHT);
         }
@@ -496,7 +502,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         // Heat chip: a fixed-width column between price and bar, full
         // row height, no gap above/below, so the column reads as one
         // continuous strip.
-        ctx.fillStyle = colorForSize(heatLow, heatHigh, heatExtreme, level.size, 1);
+        ctx.fillStyle = colorFor(level.size, 1);
         ctx.fillRect(PRICE_COL_WIDTH + CHIP_GAP, y, CHIP_SIZE, ROW_HEIGHT);
       });
 
@@ -542,7 +548,7 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
         ctx.textBaseline = 'middle';
         ctx.fillText(formatMarketPrice(level.price, marketId), PADDING_X, y + ROW_HEIGHT / 2 + 0.5);
 
-        ctx.font = level.size > HEAT_MAX_SIZE ? FONT_BOLD : FONT;
+        ctx.font = level.size > heatMaxSize ? FONT_BOLD : FONT;
         ctx.fillStyle = COLORS.textPrimary;
         ctx.textAlign = 'left';
         ctx.fillText(formatSize(level.size), CONTENT_START + 6, y + ROW_HEIGHT / 2 + 0.5);
@@ -847,20 +853,33 @@ export function OrderBookDepth({ marketId }: { marketId: string }) {
   const showSkeleton = asks.length === 0 && bids.length === 0;
 
   return (
-    <div ref={containerRef} className="relative h-full w-full">
-      <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
-      {showSkeleton && <OrderBookSkeleton />}
-      {hoverCard && <OrderBookHoverCard state={hoverCard} marketId={marketId} />}
-      <GroupingSelector
-        options={groupOptions}
-        selectedIndex={groupIndex}
-        open={groupMenuOpen}
-        onToggle={() => setGroupMenuOpen((v) => !v)}
-        onSelect={(i) => {
-          setGroupIndex(i);
-          setGroupMenuOpen(false);
-        }}
-      />
+    <div className="flex h-full w-full flex-col">
+      {/* Column header, ported from cer-perp's order book: labels the two
+          real regions this file's own canvas layout has (a price column,
+          then the depth/size bar past CONTENT_START) — everything else
+          about the rendering below is unchanged. */}
+      <div
+        className="flex shrink-0 items-center border-b border-border-subtle px-2 text-[9px] uppercase tracking-widest text-text-quaternary"
+        style={{ height: 18 }}
+      >
+        <span style={{ width: PRICE_COL_WIDTH }}>Price</span>
+        <span>Depth</span>
+      </div>
+      <div ref={containerRef} className="relative min-h-0 flex-1">
+        <canvas ref={canvasRef} aria-label="Order book depth" role="img" />
+        {showSkeleton && <OrderBookSkeleton />}
+        {hoverCard && <OrderBookHoverCard state={hoverCard} marketId={marketId} />}
+        <GroupingSelector
+          options={groupOptions}
+          selectedIndex={groupIndex}
+          open={groupMenuOpen}
+          onToggle={() => setGroupMenuOpen((v) => !v)}
+          onSelect={(i) => {
+            setGroupIndex(i);
+            setGroupMenuOpen(false);
+          }}
+        />
+      </div>
     </div>
   );
 }

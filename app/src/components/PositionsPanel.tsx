@@ -7,6 +7,7 @@ import { useSubmitOrder } from '../hooks/useSubmitOrder';
 import { useWallet } from '../wallet/wallet-context';
 import { tickToPrice } from '../lib/priceScale';
 import { toast } from '../toast/toast-context';
+import { describeError } from '../lib/describeError';
 
 // Open positions, in both a List (table rows) and Box (card grid) mode —
 // a view toggle, not two different data sources.
@@ -92,6 +93,29 @@ function computePnl(position: LocalPosition, markPrice: number | null) {
   return { pnl, pnlPct };
 }
 
+// Mirrors RiskMonitor.sol's real on-chain maintenance margin rate (see
+// cerdicxyz.github.io/reference/risk-parameters), same MMR_BPS this app
+// already assumes elsewhere (AccountPanel.tsx's own maintenance-margin
+// sum). Solving "equity == maintenance margin" for price, using
+// margin = entryPrice * size / leverage (this app's own margin
+// convention, same as computePnl above):
+//   long:  liqPrice = entry * (1 - 1 / (leverage * (1 - MMR)))
+//   short: liqPrice = entry * (1 + 1 / (leverage * (1 + MMR)))
+// A long's liquidation price can't be negative (leverage <= ~33x at
+// MMR=3% keeps it positive on its own; floored at 0 as a last resort for
+// a pathological leverage value rather than showing a nonsensical
+// negative price).
+const MMR = 300 / 10_000;
+
+function computeLiquidationPrice(position: LocalPosition): number | null {
+  if (position.leverage <= 0) return null;
+  const denom = position.leverage * (position.side === 'long' ? 1 - MMR : 1 + MMR);
+  if (denom === 0) return null;
+  const liqPrice =
+    position.side === 'long' ? position.entryPrice * (1 - 1 / denom) : position.entryPrice * (1 + 1 / denom);
+  return Math.max(liqPrice, 0);
+}
+
 /** Closing a position is nothing special on the backend — it's the same
  *  `/order` submission path opening one uses, just the opposite side at
  *  this position's own size: `SettlementEngine.sol`'s own doc calls out
@@ -146,24 +170,21 @@ function useClosePosition(position: LocalPosition, book: LiveOrderBook) {
           progress: undefined,
           duration: 6000,
         });
+      } else if (result.status === 'rejected') {
+        const { title, description } = describeError(new Error(result.reason));
+        toast.update(progressId, { type: 'error', title, description, progress: undefined, duration: 6000 });
       } else {
-        const reason = result.status === 'rejected' ? result.reason : 'Not enough resting liquidity to cross.';
         toast.update(progressId, {
           type: 'error',
           title: 'Close did not fill',
-          description: reason,
+          description: 'Not enough resting liquidity to cross.',
           progress: undefined,
           duration: 6000,
         });
       }
     } catch (error) {
-      toast.update(progressId, {
-        type: 'error',
-        title: 'Close failed',
-        description: error instanceof Error ? error.message : 'submission failed',
-        progress: undefined,
-        duration: 6000,
-      });
+      const { title, description } = describeError(error);
+      toast.update(progressId, { type: 'error', title, description, progress: undefined, duration: 6000 });
     } finally {
       setClosing(false);
     }
@@ -210,6 +231,7 @@ function PositionRow({ position }: { position: LocalPosition }) {
   const { pnl, pnlPct } = computePnl(position, markPrice) ?? { pnl: null, pnlPct: null };
   const pnlColor = pnl === null ? 'text-text-quaternary' : pnl >= 0 ? 'text-long' : 'text-short';
   const margin = (position.entryPrice * position.size) / position.leverage;
+  const liqPrice = computeLiquidationPrice(position);
   const { close, closing } = useClosePosition(position, book);
 
   return (
@@ -234,9 +256,9 @@ function PositionRow({ position }: { position: LocalPosition }) {
       </td>
       <td
         className="px-[var(--space-4)] py-[var(--space-3)] text-text-quaternary"
-        title="Needs real margin/liquidation-risk math this frontend doesn't have wired up yet"
+        title="Isolated maintenance-margin math (MMR_BPS=300, mirrors RiskMonitor.sol) — the same real rate the on-chain check uses, not portfolio-margin-adjusted"
       >
-        —
+        {liqPrice !== null ? liqPrice.toFixed(4) : '—'}
       </td>
       <td className="px-[var(--space-4)] py-[var(--space-3)] text-text-secondary">{margin.toFixed(2)}</td>
       <td className={`px-[var(--space-4)] py-[var(--space-3)] ${pnlColor}`}>{pnl !== null ? pnl.toFixed(2) : '—'}</td>

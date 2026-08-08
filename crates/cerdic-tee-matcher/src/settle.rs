@@ -126,6 +126,7 @@ sol! {
     /// `Account.sol` for anything else.
     interface IAccount {
         function collateralBalanceOf(address trader, address asset) external view returns (uint256);
+        function settleRealizedPnlBatch(address[] calldata traders, address[] calldata assets, int256[] calldata pnlDeltas) external;
     }
 }
 
@@ -627,6 +628,36 @@ pub async fn submit_portfolio_margin(
     let calldata = Bytes::from(call.abi_encode());
     if let Err(e) = broadcast(signer, &rpc_url, contract, calldata).await {
         tracing::warn!(error = %e, trader = %trader, "portfolio margin attestation failed");
+    }
+}
+
+/// Flushes one batch of `(trader, asset, pnlDelta)` triples to
+/// `Account.settleRealizedPnlBatch` — the real-money bridge
+/// `SettlementEngine.sol`'s sealed `collateral` never had, see that
+/// function's own Solidity doc for the full design (why batched, why a
+/// real trader address rather than a `portfolioKey`, why it floors
+/// instead of reverting). Called only from `main.rs`'s
+/// `realized_pnl_flush_loop`, never per-fill — `AppState::queue_realized_pnl`'s
+/// own doc on why. A no-op when broadcasting isn't configured or `items`
+/// is empty, same posture as every other optional broadcast in this file.
+pub async fn settle_realized_pnl_batch(
+    signer: &SettlementSigner,
+    items: &[(Address, Address, I256)],
+    contract: Option<Address>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let Some((rpc_url, contract)) = broadcast_config(contract) else {
+        return;
+    };
+    let traders: Vec<Address> = items.iter().map(|(trader, _, _)| *trader).collect();
+    let assets: Vec<Address> = items.iter().map(|(_, asset, _)| *asset).collect();
+    let pnl_deltas: Vec<I256> = items.iter().map(|(_, _, delta)| *delta).collect();
+    let call = IAccount::settleRealizedPnlBatchCall { traders, assets, pnlDeltas: pnl_deltas };
+    let calldata = Bytes::from(call.abi_encode());
+    if let Err(e) = broadcast(signer, &rpc_url, contract, calldata).await {
+        tracing::warn!(error = %e, batch_size = items.len(), "realized PnL batch settlement failed");
     }
 }
 

@@ -1,11 +1,12 @@
 import { useCallback, useMemo, useState } from 'react';
-import { IconArrowDownRight, IconArrowUpRight, IconPlus } from '@tabler/icons-react';
+import { IconArrowDownRight, IconArrowUpRight, IconDroplet, IconPlus } from '@tabler/icons-react';
 import { DepositModal } from './DepositModal';
 import { WithdrawModal } from './WithdrawModal';
 import { LoginModal } from './LoginModal';
 import { useWallet } from '../wallet/wallet-context';
-import { useLocalPositions, type LocalPosition } from '../hooks/useLocalPositions';
+import { useLocalPositions, useSettlementPending, type LocalPosition } from '../hooks/useLocalPositions';
 import { useDepositedCollateral } from '../hooks/useDepositedCollateral';
+import { useFaucet } from '../hooks/useFaucet';
 import { useOrderBook, markPriceFromBook } from '../hooks/useOrderBook';
 import { tickToPrice } from '../lib/priceScale';
 
@@ -111,10 +112,28 @@ export function AccountPanel() {
   const [loginOpen, setLoginOpen] = useState(false);
 
   const deposited = useDepositedCollateral(address);
+  const faucet = useFaucet(address);
   const positions = useLocalPositions();
   const { unrealizedPnl, maintenanceMargin, notional, ready, listeners } = usePositionMetrics(positions);
+  const { pending: settlementPending, optimisticPnl } = useSettlementPending();
 
-  const totalEquity = deposited !== null ? deposited + (ready ? unrealizedPnl : 0) : null;
+  // While a close's real settlement is still in flight, `deposited` (the
+  // real, polled on-chain balance) hasn't caught up to it yet, but the
+  // position that would have shown it as unrealized PnL is already gone
+  // locally — without `optimisticPnl`, Total Equity would sit frozen at
+  // its pre-close value for the whole settlement window, reading as
+  // "the trade's PnL just vanished" rather than "still settling." See
+  // `useSettlementPending`'s own doc for why this estimate is close but
+  // not funding-exact, and why that's fine here.
+  // `Number.isFinite`, not just `!== null`: confirmed live (Total Equity
+  // showing "$NaN") that a bad upstream value — a malformed
+  // localStorage entry, in that case — can turn this whole sum into
+  // NaN even though every individual `!== null` check upstream passed.
+  // An honest "—" for a value that's wrong is strictly better than
+  // rendering NaN as if it were a real number a trader might act on.
+  const rawTotalEquity =
+    deposited !== null ? deposited + (ready ? unrealizedPnl : 0) + (settlementPending ? optimisticPnl : 0) : null;
+  const totalEquity = rawTotalEquity !== null && Number.isFinite(rawTotalEquity) ? rawTotalEquity : null;
   const equityPct = deposited !== null && deposited > 0 && ready ? (unrealizedPnl / deposited) * 100 : null;
   const crossLeverage = deposited !== null && deposited > 0 && ready ? notional / deposited : null;
 
@@ -149,7 +168,11 @@ export function AccountPanel() {
         </div>
         <p
           className="mt-px text-xl font-semibold text-text-primary"
-          title="Account.sol collateralBalanceOf + unrealized PNL across open positions — live on-chain read"
+          title={
+            settlementPending
+              ? "Includes an estimate of your last close's realized PnL, still settling into real custody — this figure may shift slightly once that lands."
+              : 'Account.sol collateralBalanceOf + unrealized PNL across open positions — live on-chain read'
+          }
         >
           {totalEquity !== null ? `$${totalEquity.toFixed(2)}` : '—'}
         </p>
@@ -173,6 +196,19 @@ export function AccountPanel() {
           Withdraw
         </button>
       </div>
+
+      {wallet.status === 'connected' && faucet.configured && faucet.canClaim && (
+        <button
+          type="button"
+          onClick={() => void faucet.claim()}
+          disabled={faucet.claiming}
+          className="flex items-center justify-center gap-[var(--space-1)] rounded-md border border-dashed border-border-subtle py-[var(--space-2)] text-xs font-medium text-text-tertiary transition-colors duration-150 hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+          title="TestUSDC.sol's own faucet — mints test collateral straight to your wallet, no backend involved"
+        >
+          <IconDroplet size={13} stroke={2.25} />
+          {faucet.claiming ? 'Claiming…' : 'Get test USDC'}
+        </button>
+      )}
 
       <div className="flex flex-col gap-px">
         <Row label="Spot" value="—" hint="This protocol has no spot product — nothing to show here, not a wiring gap" tone="muted" />

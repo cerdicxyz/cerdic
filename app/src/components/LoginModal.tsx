@@ -9,7 +9,8 @@ import {
 } from '@privy-io/react-auth';
 import { toast } from '../toast/toast-context';
 import { useWallet } from '../wallet/wallet-context';
-import { privyConfigured } from '../wallet/privy';
+import { activeChain, privyConfigured } from '../wallet/privy';
+import { describeError } from '../lib/describeError';
 
 // Same overlay shell as PortfolioModal.tsx/DepositModal.tsx (solid
 // --color-surface-overlay, backdrop click + Escape dismissal).
@@ -104,7 +105,8 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
       setOtpError(null);
       setView('otp');
     } catch (error) {
-      toast.error('Could not send code', error instanceof Error ? error.message : String(error));
+      const { title, description } = describeError(error);
+      toast.error(title === 'Something went wrong' ? 'Could not send code' : title, description);
     } finally {
       setPending(null);
     }
@@ -157,7 +159,8 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
     try {
       await initOAuth({ provider: 'google' });
     } catch (error) {
-      toast.error('Google login failed', error instanceof Error ? error.message : String(error));
+      const { title, description } = describeError(error);
+      toast.error(title === 'Something went wrong' ? 'Google login failed' : title, description);
       setPending(null);
     }
   };
@@ -187,7 +190,17 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
       const accounts = await ethereum.request({ method: 'eth_requestAccounts' });
       const address = accounts[0];
       if (!address) throw new Error('No account returned by the wallet.');
-      const message = await generateSiweMessage({ address, chainId: 'eip155:5042002' });
+      // Real, confirmed bug: this used to hardcode `eip155:5042002` (Arc
+      // Testnet) regardless of which chain is actually active — every
+      // OTHER chain-aware call site in this app (DepositModal,
+      // WithdrawModal, useFaucet) reads `activeChain.id` instead, this
+      // one didn't. On local dev (`activeChain` = anvil, 31337) the
+      // injected wallet's own EIP-1193 provider correctly rejects the
+      // mismatch between what this message claimed and the wallet's
+      // actual active network — confirmed live via Trust Wallet's own
+      // "Provided chainId does not match the currently active chain"
+      // error, not a wallet-side misconfiguration.
+      const message = await generateSiweMessage({ address, chainId: `eip155:${activeChain.id}` });
       const signature = await ethereum.request({ method: 'personal_sign', params: [message, address] });
       await loginWithSiwe({ signature, message, walletClientType: 'injected', connectorType: 'injected' });
       // loginWithSiwe resolving successfully IS the confirmation this
@@ -196,7 +209,8 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
       // usePrivy().user.wallet.address to update reactively.
       wallet.reportConnectedWallet(address as `0x${string}`);
     } catch (error) {
-      toast.error('Wallet connection failed', error instanceof Error ? error.message : String(error));
+      const { title, description } = describeError(error);
+      toast.error(title === 'Something went wrong' ? 'Wallet connection failed' : title, description);
     } finally {
       setPending(null);
     }
@@ -212,7 +226,8 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
       try {
         await signupWithPasskey();
       } catch (error) {
-        toast.error('Passkey failed', error instanceof Error ? error.message : String(error));
+        const { title, description } = describeError(error);
+        toast.error(title === 'Something went wrong' ? 'Passkey failed' : title, description);
       }
     } finally {
       setPending(null);
@@ -298,7 +313,7 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
             <OptionButton
               icon={<IconBrandGoogle size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />}
               label="Continue with Google"
-              description={privyConfigured ? 'Sign in with your Google account' : 'Not configured yet'}
+              description={privyConfigured ? 'Sign in with your Google account' : 'Not available right now'}
               onClick={handleGoogle}
               disabled={pending !== null || !privyConfigured}
               busy={pending === 'google'}
@@ -306,7 +321,7 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
             <OptionButton
               icon={<IconWallet size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />}
               label="Connect Wallet"
-              description={privyConfigured ? 'MetaMask or another browser wallet' : 'Not configured yet'}
+              description={privyConfigured ? 'MetaMask or another browser wallet' : 'Not available right now'}
               onClick={handleWallet}
               disabled={pending !== null || !privyConfigured}
               busy={pending === 'wallet'}
@@ -314,7 +329,7 @@ export function LoginModal({ open, onClose }: { open: boolean; onClose: () => vo
             <OptionButton
               icon={<IconFingerprint size={ICON_SIZE} stroke={ICON_STROKE} aria-hidden="true" />}
               label="Continue with Passkey"
-              description={privyConfigured ? 'Face ID, Touch ID, or a security key' : 'Not configured yet'}
+              description={privyConfigured ? 'Face ID, Touch ID, or a security key' : 'Not available right now'}
               onClick={handlePasskey}
               disabled={pending !== null || !privyConfigured}
               busy={pending === 'passkey'}
