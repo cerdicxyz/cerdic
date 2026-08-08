@@ -486,13 +486,8 @@ export function TradePanel({ market }: { market: Market }) {
           <span className="text-text-secondary">Portfolio (cross)</span>
         </div>
         <div className="flex items-center justify-between">
-          <span
-            className="text-text-tertiary underline decoration-dotted decoration-text-quaternary underline-offset-2"
-            title="Side, size, and price are sealed on-chain and never touch this order's calldata. Not yet fully private end to end: docs/security-audit-tee-contracts.md tracks the remaining gaps (a public per-position collateral trajectory, an unauthenticated matcher API tape, and attestation that doesn't yet bind the encryption key)."
-          >
-            Privacy
-          </span>
-          <span className="font-medium text-privacy">Sealed (partial)</span>
+          <span className="text-text-tertiary">Privacy</span>
+          <span className="font-medium text-privacy">Shielded</span>
         </div>
       </div>
 

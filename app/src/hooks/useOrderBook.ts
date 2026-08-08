@@ -126,7 +126,23 @@ export function useOrderBook(marketId: string, group: number = 1): LiveOrderBook
     function connect() {
       if (cancelled) return;
       const groupParam = group > 1 ? `?group=${group}` : '';
-      socket = new WebSocket(`${matcherWsUrl}/ws/orderbook/${encodeURIComponent(marketId)}${groupParam}`);
+      try {
+        // Real, confirmed bug this try/catch fixes: the WebSocket
+        // constructor throws SYNCHRONOUSLY (SecurityError) when the
+        // browser blocks the connection outright — e.g. mixed content,
+        // an https:// page whose matcher URL is still ws:// — and an
+        // uncaught throw here happens during render/effect setup, with
+        // no error boundary catching it, which blanked the entire app
+        // (confirmed live: cerdic.xyz went fully blank the moment
+        // VITE_MATCHER_URL pointed at a plain-http matcher). A network
+        // failure should degrade this one hook to "disconnected," never
+        // take down the page.
+        socket = new WebSocket(`${matcherWsUrl}/ws/orderbook/${encodeURIComponent(marketId)}${groupParam}`);
+      } catch {
+        setBook((prev) => ({ ...prev, connected: false }));
+        reconnectTimer = window.setTimeout(connect, RECONNECT_DELAY_MS);
+        return;
+      }
 
       socket.onmessage = (event) => {
         try {
